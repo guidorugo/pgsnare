@@ -9,6 +9,8 @@
 #   make lint     check formatting and run clippy with warnings denied
 #   make deny     check advisories, licences and sources of every dependency
 #   make scan     scan for secrets and private network addresses
+#   make fuzz     run every fuzz target for FUZZ_SECONDS each
+#   make bench    run the benchmarks
 #   make shell    open a shell in the development image (commands can be piped in)
 #
 # Variables:
@@ -17,6 +19,9 @@
 #   LOCKED        `--locked` by default, so a build never changes Cargo.lock.
 #                 After changing a dependency, run `make build LOCKED=` once
 #                 and commit the updated Cargo.lock.
+#   FUZZ_SECONDS  time to fuzz each target (default 30). FUZZ_CRATE and
+#                 FUZZ_TARGET narrow the run to one crate or one target.
+#   BENCH_ARGS    extra arguments for `cargo bench`
 
 DOCKER ?= docker
 JOBS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)
@@ -49,7 +54,7 @@ RUN = $(DOCKER) run --rm --init \
 GIT_COMMON_DIR := $(shell git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
 GIT_HISTORY := $(if $(GIT_COMMON_DIR),--volume "$(GIT_COMMON_DIR):$(GIT_COMMON_DIR):ro")
 
-.PHONY: image build test lint deny scan shell cargo-cache
+.PHONY: image build test lint deny scan fuzz bench shell cargo-cache
 
 image:
 	@$(DOCKER) image inspect $(DEV_IMAGE) >/dev/null 2>&1 \
@@ -75,6 +80,12 @@ deny: image cargo-cache
 scan: image cargo-cache
 	$(RUN) $(DEV_IMAGE) scripts/scan/selftest.sh
 	$(RUN) $(GIT_HISTORY) --env SCAN_REQUIRE_HISTORY $(DEV_IMAGE) scripts/scan/run.sh
+
+fuzz: image cargo-cache
+	$(RUN) --env FUZZ_SECONDS --env FUZZ_CRATE --env FUZZ_TARGET $(DEV_IMAGE) scripts/fuzz.sh
+
+bench: image cargo-cache
+	$(RUN) $(DEV_IMAGE) cargo bench --workspace $(LOCKED) $(BENCH_ARGS)
 
 shell: image cargo-cache
 	$(RUN) --interactive $(TTY) $(DEV_IMAGE) bash
