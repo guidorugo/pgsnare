@@ -519,6 +519,18 @@ fn missed_where_a_control_character_or_markup_was_escaped() {
 }
 
 #[test]
+fn missed_where_a_query_escaped_a_single_quote() {
+    let quoted = "it's-a-quoted-value";
+    // The value as a result prints it.
+    assert_found(quoted, "it's-a-quoted-value", 1);
+    // SELECT format('%L', 'it''s-a-quoted-value'): the value as a string
+    // literal, which is how it appears in the text of a query.
+    assert_missed(quoted, "'it''s-a-quoted-value'");
+    // A value without such a character is found in a literal.
+    assert_found(VALUE, "'svc.backup.8f3k2q@mail.example'", 1);
+}
+
+#[test]
 fn missed_in_the_binary_form_of_a_type_that_is_not_text() {
     // A number is its digits in text format and something else in binary.
     let card = "4929000000000017";

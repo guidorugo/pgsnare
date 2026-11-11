@@ -55,9 +55,9 @@
 //! # Values and patterns
 //!
 //! A value must be ASCII and at least [`MIN_VALUE_LEN`] bytes long. ASCII
-//! bytes are the same in every character encoding PostgreSQL supports for
-//! clients, so matching does not depend on `client_encoding`. The minimum
-//! length makes an accidental match implausible.
+//! characters are the same bytes in every character encoding PostgreSQL
+//! supports for clients, so matching does not depend on `client_encoding`.
+//! The minimum length makes an accidental match implausible.
 //!
 //! Each value is compiled into these patterns:
 //!
@@ -101,7 +101,8 @@
 //! The last two rules guarantee that data matching one value never sets off
 //! another. They cover every text the matcher accepts for a value: the value
 //! as configured, its hex form, and, for a case-insensitive token, the value
-//! in any letter case.
+//! in any letter case. A value is therefore also refused if, for example, it
+//! contains the hex form of another value.
 //!
 //! All problems are reported together, as a [`ValidationErrors`] list.
 //!
@@ -124,14 +125,25 @@
 //! forms above.
 //!
 //! - **Escaped characters.** Text formats change some characters when they
-//!   print a value. A double quote or a backslash is escaped or doubled in
-//!   JSON, arrays, composite rows, CSV and COPY text output. Control
-//!   characters are escaped in JSON and COPY text output. A value that
-//!   contains such a character is found where it is printed as it is, and
-//!   missed where it was escaped. Values made of letters, digits and
-//!   punctuation such as `.`, `-`, `_`, `@` and `:` are not affected.
+//!   print a value:
+//!
+//!   | Character | Escaped or doubled in |
+//!   |---|---|
+//!   | Double quote | JSON, arrays, composite rows, CSV |
+//!   | Backslash | JSON, arrays, composite rows, COPY text output |
+//!   | Control characters, such as a tab | JSON, COPY text output |
+//!   | `<`, `>` and `&` | XML |
+//!   | Single quote | A string literal in a query |
+//!
+//!   A value that contains such a character is found where it is printed as
+//!   it is, and missed where it was escaped. Values made of letters, digits
+//!   and punctuation such as `.`, `-`, `_`, `@` and `:` are not affected.
 //! - **Hexadecimal.** Only lowercase digits are looked for, and only for the
 //!   value in its configured letter case.
+//! - **Binary results.** In the binary result format a text, `bytea` or JSON
+//!   value is sent as its bytes and is found. A number, a date or a `uuid`
+//!   is sent in another encoding, so a value kept in such a column is missed
+//!   there.
 //! - **Other transformations.** A value that was hashed, cut, encoded in
 //!   another way or encrypted before it was sent does not match.
 //! - **Split values.** A scanner finds a value split across the chunks it is
