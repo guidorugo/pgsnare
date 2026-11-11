@@ -1,0 +1,12 @@
+listeners:
+  - name: main
+    listen: 0.0.0.0:5432
+    upstream: db.example.com:5432
+    client_tls: { mode: disable }
+    upstream_tls: { mode: verify-full }
+    Zq7honeytokenValue9xK: 1
+events:
+  sinks: [{ type: stdout, Zq7honeytokenValue9xK: true }]
+tokens:
+  - id: Zq7honeytokenValue9xK
+    values: Zq7honeytokenValue9xK

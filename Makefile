@@ -78,14 +78,22 @@ test: image cargo-cache
 	$(RUN) $(DEV_IMAGE) cargo test --workspace $(LOCKED)
 	$(RUN) $(DEV_IMAGE) cargo test --workspace --no-default-features $(LOCKED)
 
+# The fuzz crates are outside the workspace, so they are named one by one.
+FOR_EACH_FUZZ_CRATE = for manifest in crates/*/fuzz/Cargo.toml; do \
+	test -f "$$manifest" || continue; \
+	cargo fmt --manifest-path "$$manifest" $(1) || exit 1; \
+	done
+
 lint: image cargo-cache
 	$(RUN) $(DEV_IMAGE) scripts/check-repo.sh
 	$(RUN) $(DEV_IMAGE) cargo fmt --all --check
+	$(RUN) $(DEV_IMAGE) sh -c '$(call FOR_EACH_FUZZ_CRATE,--check)'
 	$(RUN) $(DEV_IMAGE) cargo clippy --workspace --all-targets $(LOCKED) -- -D warnings
 	$(RUN) $(DEV_IMAGE) cargo clippy --workspace --all-targets --no-default-features $(LOCKED) -- -D warnings
 
 fmt: image cargo-cache
 	$(RUN) $(DEV_IMAGE) cargo fmt --all
+	$(RUN) $(DEV_IMAGE) sh -c '$(call FOR_EACH_FUZZ_CRATE,)'
 
 deny: image cargo-cache
 	$(RUN) $(DEV_IMAGE) scripts/deny.sh

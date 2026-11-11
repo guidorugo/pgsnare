@@ -1,0 +1,8 @@
+listeners:
+  - name: main
+    listen: 0.0.0.0:5432
+    upstream: db.example.com:5432
+    client_tls: { mode: disable }
+    upstream_tls: { mode: verify-full }
+events:
+  sinks: [{ type: stdout }]

@@ -34,6 +34,16 @@ allow = [
 confidence-threshold = 0.93
 # The list above is the policy, not an inventory of what is in use today.
 unused-allowed-license = "allow"
+# The exception below applies to the fuzz crates only, so the check of the
+# workspace does not meet it.
+unused-license-exception = "allow"
+
+# libfuzzer-sys bundles libFuzzer, which carries the University of
+# Illinois/NCSA licence, a permissive licence in the style of MIT and BSD.
+# The crate is linked into fuzz targets only, never into pgsnare itself.
+[[licenses.exceptions]]
+crate = "libfuzzer-sys"
+allow = ["NCSA"]
 
 [bans]
 multiple-versions = "warn"
