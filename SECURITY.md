@@ -1,6 +1,6 @@
 # Security policy
 
-pgsnare sits in front of production databases, so security reports are handled privately and with priority.
+pgsnare sits in front of production databases, so security reports are handled privately.
 
 ## Reporting a vulnerability
 

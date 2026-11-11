@@ -8,6 +8,7 @@
 #   make test     run the unit tests
 #   make lint     check the repository rules and formatting, and run clippy
 #                 with warnings denied
+#   make fmt      format the code
 #   make deny     check advisories, licences and sources of every dependency
 #   make scan     scan for secrets and private network addresses
 #   make itest    run the integration tests against PostgreSQL 15 to 18
@@ -59,7 +60,7 @@ RUN = $(DOCKER) run --rm --init \
 GIT_COMMON_DIR := $(shell git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
 GIT_HISTORY := $(if $(GIT_COMMON_DIR),--volume "$(GIT_COMMON_DIR):$(GIT_COMMON_DIR):ro")
 
-.PHONY: image build test lint deny scan itest fuzz bench shell cargo-cache
+.PHONY: image build test lint fmt deny scan itest fuzz bench shell cargo-cache
 
 image:
 	@$(DOCKER) image inspect $(DEV_IMAGE) >/dev/null 2>&1 \
@@ -79,6 +80,10 @@ lint: image cargo-cache
 	$(RUN) $(DEV_IMAGE) scripts/check-repo.sh
 	$(RUN) $(DEV_IMAGE) cargo fmt --all --check
 	$(RUN) $(DEV_IMAGE) cargo clippy --workspace --all-targets $(LOCKED) -- -D warnings
+	$(RUN) $(DEV_IMAGE) cargo clippy --workspace --all-targets --no-default-features $(LOCKED) -- -D warnings
+
+fmt: image cargo-cache
+	$(RUN) $(DEV_IMAGE) cargo fmt --all
 
 deny: image cargo-cache
 	$(RUN) $(DEV_IMAGE) scripts/deny.sh
