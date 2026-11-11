@@ -12,17 +12,16 @@ use std::process::ExitCode;
 
 pub mod admin;
 pub mod builder;
+pub mod cli;
 pub mod config;
 pub mod reload;
 pub mod runtime;
 pub mod sinks;
 pub mod tls;
 
-/// Entry point of the `pgsnare` binary.
-///
-/// Nothing is implemented yet, so this reports that and fails. It never
-/// exits successfully without having done what was asked.
+/// Entry point of the `pgsnare` binary: runs the command line of this
+/// process.
+#[must_use]
 pub fn main() -> ExitCode {
-    eprintln!("pgsnare: not implemented yet");
-    ExitCode::FAILURE
+    cli::main()
 }

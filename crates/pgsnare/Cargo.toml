@@ -17,6 +17,7 @@ default = ["rules"]
 rules = ["pgsnare-core/rules"]
 
 [dependencies]
+clap.workspace = true
 pgsnare-core.workspace = true
 serde.workspace = true
 serde-saphyr.workspace = true
