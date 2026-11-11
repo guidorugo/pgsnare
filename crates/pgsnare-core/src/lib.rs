@@ -23,6 +23,7 @@ pub mod actions;
 pub mod bait;
 pub mod detect;
 pub mod event;
+pub mod extension;
 pub mod policy;
 #[cfg(feature = "rules")]
 pub mod rules;
