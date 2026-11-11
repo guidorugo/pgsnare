@@ -10,6 +10,7 @@
 #                 with warnings denied
 #   make deny     check advisories, licences and sources of every dependency
 #   make scan     scan for secrets and private network addresses
+#   make itest    run the integration tests against PostgreSQL 15 to 18
 #   make fuzz     run every fuzz target for FUZZ_SECONDS each
 #   make bench    run the benchmarks
 #   make shell    open a shell in the development image (commands can be piped in)
@@ -23,11 +24,14 @@
 #   FUZZ_SECONDS  time to fuzz each target (default 30). FUZZ_CRATE and
 #                 FUZZ_TARGET narrow the run to one crate or one target.
 #   BENCH_ARGS    extra arguments for `cargo bench`
+#   ITEST_PROJECT the Compose project name of the integration tests
+#                 (default pgsnare-itest)
 
 DOCKER ?= docker
 JOBS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)
 CARGO_CACHE ?= $(HOME)/.cache/pgsnare/cargo
 LOCKED ?= --locked
+ITEST_PROJECT ?= pgsnare-itest
 
 # The tag follows the content of Dockerfile.dev, so changing the Dockerfile
 # yields a new image instead of silently reusing a stale one.
@@ -55,7 +59,7 @@ RUN = $(DOCKER) run --rm --init \
 GIT_COMMON_DIR := $(shell git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
 GIT_HISTORY := $(if $(GIT_COMMON_DIR),--volume "$(GIT_COMMON_DIR):$(GIT_COMMON_DIR):ro")
 
-.PHONY: image build test lint deny scan fuzz bench shell cargo-cache
+.PHONY: image build test lint deny scan itest fuzz bench shell cargo-cache
 
 image:
 	@$(DOCKER) image inspect $(DEV_IMAGE) >/dev/null 2>&1 \
@@ -82,6 +86,11 @@ deny: image cargo-cache
 scan: image cargo-cache
 	$(RUN) $(DEV_IMAGE) scripts/scan/selftest.sh
 	$(RUN) $(GIT_HISTORY) --env SCAN_REQUIRE_HISTORY $(DEV_IMAGE) scripts/scan/run.sh
+
+# The databases and the test client are containers of their own, started
+# with Docker Compose. Nothing publishes a host port.
+itest:
+	DOCKER="$(DOCKER)" ITEST_PROJECT="$(ITEST_PROJECT)" tests/itest.sh
 
 fuzz: image cargo-cache
 	$(RUN) --env FUZZ_SECONDS --env FUZZ_CRATE --env FUZZ_TARGET $(DEV_IMAGE) scripts/fuzz.sh
