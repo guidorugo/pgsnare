@@ -18,6 +18,8 @@
 //!   header first, then its body in chunks.
 //! - **Views.** The [`backend`] and [`frontend`] modules read a frame as a
 //!   particular message and hand out its fields without copying them.
+//! - **Encoders.** The [`encode`] module writes the few messages pgsnare
+//!   injects or rewrites.
 //!
 //! # Guarantees
 //!
@@ -84,6 +86,7 @@
 #![warn(missing_docs)]
 
 pub mod backend;
+pub mod encode;
 mod error;
 mod frame;
 pub mod frontend;
