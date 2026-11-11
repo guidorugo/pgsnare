@@ -9,6 +9,8 @@
 
 use std::process::ExitCode;
 
+pub mod config;
+
 /// Entry point of the `pgsnare` binary.
 ///
 /// Nothing is implemented yet, so this reports that and fails. It never

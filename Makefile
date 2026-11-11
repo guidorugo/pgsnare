@@ -5,7 +5,7 @@
 #
 #   make image    build the development image, unless it already exists
 #   make build    build the workspace
-#   make test     run the unit tests
+#   make test     run the unit tests, with and without the default features
 #   make lint     check the repository rules and formatting, and run clippy
 #                 with warnings denied
 #   make fmt      format the code
@@ -73,8 +73,10 @@ cargo-cache:
 build: image cargo-cache
 	$(RUN) $(DEV_IMAGE) cargo build --workspace $(LOCKED)
 
+# Twice: with the default features, and without the optional SQL rules.
 test: image cargo-cache
 	$(RUN) $(DEV_IMAGE) cargo test --workspace $(LOCKED)
+	$(RUN) $(DEV_IMAGE) cargo test --workspace --no-default-features $(LOCKED)
 
 lint: image cargo-cache
 	$(RUN) $(DEV_IMAGE) scripts/check-repo.sh

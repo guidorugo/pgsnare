@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# A token file: honeytokens and nothing else, in the same form as the
+# `tokens` section of the main configuration. In Kubernetes this file is a
+# Secret, mounted read-only.
+#
+# These values are examples. Generate your own.
+
+tokens:
+  - id: api-key-reporting
+    values: ["pgsn_rpt_4Jq8Zt1Lw0Xe7Rb2Ks9"]
+    scope: { database: app, table: public.api_keys, column: key }
+    actions: [alert]
+
+  - id: card-test-0002
+    values:
+      - "4000 0000 0000 0002"
+      - "4000000000000002"
+    scope: { database: shop, table: public.cards, column: number }
+    actions: [alert, fake_data]
