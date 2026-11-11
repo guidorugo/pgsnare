@@ -21,3 +21,9 @@ aho-corasick.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+
+# Scan throughput of the detect module. A plain program that needs only the
+# standard library: `cargo bench -p pgsnare-core --bench detect_scan`.
+[[bench]]
+name = "detect_scan"
+harness = false
