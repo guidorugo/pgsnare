@@ -63,7 +63,7 @@ for file in .github/workflows/*.yml .github/workflows/*.yaml .github/actions/**/
             continue
         fi
         owner="${BASH_REMATCH[1]}"
-        if ! grep -qw -- "$owner" <<<"$allowed_owners"; then
+        if ! grep -qwF -- "$owner" <<<"$allowed_owners"; then
             fail "$file:$number: actions from '$owner' are not on the allowed list"
         fi
     done < <(grep -nE '^[[:space:]]*(-[[:space:]]+)?uses:' "$file" || true)
