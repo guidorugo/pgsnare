@@ -15,7 +15,8 @@
 //! - **Framing.** A [`Framer`] locates the messages of one direction in a
 //!   byte buffer. A [`Frame`] borrows from that buffer and can be forwarded
 //!   as the identical bytes. A frame too large to hold is streamed: its
-//!   header first, then its body in chunks.
+//!   header first, then its body in chunks. A streamed frame never exists
+//!   in one piece, so it has no view.
 //! - **Views.** The [`backend`] and [`frontend`] modules read a frame as a
 //!   particular message and hand out its fields without copying them.
 //! - **Encoders.** The [`encode`] module writes the few messages pgsnare
@@ -83,7 +84,21 @@
         clippy::arithmetic_side_effects
     )
 )]
-#![warn(missing_docs)]
+// Beyond the lints every pgsnare crate shares: no other way to panic, and
+// no cast that could silently change a size read from the wire.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::panic_in_result_fn,
+        clippy::get_unwrap,
+        clippy::string_slice,
+        clippy::as_conversions
+    )
+)]
+#![warn(missing_docs, missing_debug_implementations)]
 
 pub mod backend;
 pub mod encode;

@@ -10,6 +10,19 @@
 //! - what a view accepts re-encodes to the identical bytes
 //! - bytes that follow a frame or a packet never change how it is read
 //! - the startup parser accepts nothing PostgreSQL would reject
+//!
+//! # Running
+//!
+//! From this directory, inside the development image:
+//!
+//! ```sh
+//! cargo +"$PGSNARE_FUZZ_TOOLCHAIN" fuzz run framer_server -- -max_total_time=60
+//! ```
+//!
+//! The targets are `framer_client`, `framer_server`, `startup`,
+//! `frontend_views` and `backend_views`. The captured streams under
+//! `../tests/fixtures/pg*/` are good seeds for the first three: name the
+//! corpus directory, then the seed directories, before the `--`.
 
 use pgsnare_proto::backend::{self, Authentication};
 use pgsnare_proto::startup::{self, Classification, StartupPacket};
