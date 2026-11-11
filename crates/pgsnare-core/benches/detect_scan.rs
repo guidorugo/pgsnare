@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Micro-benchmarks for honeytoken detection: how fast a matcher scans rows
-//! of typical sizes with 100 and with 10,000 tokens loaded.
+//! of typical sizes with a hundred and with ten thousand patterns loaded.
 //!
-//! Run them with
+//! A token value is compiled into two patterns, or three if its token
+//! ignores letter case. The benchmark therefore loads 50 and 100 tokens, and
+//! 5,000 and 10,000 tokens: one of each pair has the stated number of
+//! patterns, the other the stated number of tokens.
+//!
+//! Run it with
 //!
 //! ```text
 //! cargo bench -p pgsnare-core --bench detect_scan
@@ -26,8 +31,16 @@ use std::time::{Duration, Instant};
 
 use pgsnare_core::detect::{Matcher, TokenSpec};
 
-/// How many tokens are loaded.
-const TOKEN_COUNTS: [usize; 2] = [100, 10_000];
+/// The token lists that are loaded: how many tokens, and whether they ignore
+/// letter case.
+const LOADS: [(usize, bool); 6] = [
+    (50, false),
+    (100, false),
+    (100, true),
+    (5_000, false),
+    (10_000, false),
+    (10_000, true),
+];
 
 /// Typical sizes of a row, in bytes.
 const ROW_SIZES: [usize; 4] = [64, 256, 1024, 8192];
@@ -281,15 +294,13 @@ fn main() {
         println!("quick check only; run with `cargo bench` for figures");
     }
 
-    for token_count in TOKEN_COUNTS {
-        // A quick check does not need the large token list.
+    for (token_count, case_insensitive) in LOADS {
+        // A quick check does not need the long token lists.
         let token_count = if full {
             token_count
         } else {
             token_count.min(300)
         };
-        for case_insensitive in [false, true] {
-            run(full, token_count, case_insensitive);
-        }
+        run(full, token_count, case_insensitive);
     }
 }
