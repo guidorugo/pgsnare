@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Secret scanning for this repository: the default gitleaks rules.
+#
+# `make scan` uses this file, locally and in CI. Private network addresses
+# are checked separately, by scripts/scan/private-addresses.toml.
+#
+# A false positive is silenced on its own line with a `gitleaks:allow`
+# comment, or by fingerprint in `.gitleaksignore`. Both show up in review.
+
+title = "pgsnare secret scan"
+
+[extend]
+useDefault = true

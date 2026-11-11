@@ -7,6 +7,8 @@
 #   make build    build the workspace
 #   make test     run the unit tests
 #   make lint     check formatting and run clippy with warnings denied
+#   make deny     check advisories, licences and sources of every dependency
+#   make scan     scan for secrets and private network addresses
 #   make shell    open a shell in the development image (commands can be piped in)
 #
 # Variables:
@@ -41,7 +43,13 @@ RUN = $(DOCKER) run --rm --init \
 	--volume "$(CURDIR):/work" \
 	--workdir /work
 
-.PHONY: image build test lint shell cargo-cache
+# `make scan` reads the git history. In a linked git worktree the history
+# lives outside the source tree, so it is mounted too, read-only and at the
+# path git expects. Without git on the host, the history is not scanned.
+GIT_COMMON_DIR := $(shell git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+GIT_HISTORY := $(if $(GIT_COMMON_DIR),--volume "$(GIT_COMMON_DIR):$(GIT_COMMON_DIR):ro")
+
+.PHONY: image build test lint deny scan shell cargo-cache
 
 image:
 	@$(DOCKER) image inspect $(DEV_IMAGE) >/dev/null 2>&1 \
@@ -60,6 +68,13 @@ test: image cargo-cache
 lint: image cargo-cache
 	$(RUN) $(DEV_IMAGE) cargo fmt --all --check
 	$(RUN) $(DEV_IMAGE) cargo clippy --workspace --all-targets $(LOCKED) -- -D warnings
+
+deny: image cargo-cache
+	$(RUN) $(DEV_IMAGE) scripts/deny.sh
+
+scan: image cargo-cache
+	$(RUN) $(DEV_IMAGE) scripts/scan/selftest.sh
+	$(RUN) $(GIT_HISTORY) --env SCAN_REQUIRE_HISTORY $(DEV_IMAGE) scripts/scan/run.sh
 
 shell: image cargo-cache
 	$(RUN) --interactive $(TTY) $(DEV_IMAGE) bash
