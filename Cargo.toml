@@ -21,9 +21,16 @@ repository = "https://github.com/guidorugo/pgsnare"
 publish = false
 
 [workspace.dependencies]
+pgsnare-core = { path = "crates/pgsnare-core", version = "0.0.0", default-features = false }
+pgsnare-proto = { path = "crates/pgsnare-proto", version = "0.0.0" }
+
 aho-corasick = "1.1.5"
 bytes = "1.12.1"
+clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 proptest = "1.12.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde-saphyr = { version = "2.1.1", default-features = false, features = ["deserialize"] }
+serde_json = "1.0.154"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
