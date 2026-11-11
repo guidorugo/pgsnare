@@ -6,7 +6,8 @@
 #   make image    build the development image, unless it already exists
 #   make build    build the workspace
 #   make test     run the unit tests
-#   make lint     check formatting and run clippy with warnings denied
+#   make lint     check the repository rules and formatting, and run clippy
+#                 with warnings denied
 #   make deny     check advisories, licences and sources of every dependency
 #   make scan     scan for secrets and private network addresses
 #   make fuzz     run every fuzz target for FUZZ_SECONDS each
@@ -71,6 +72,7 @@ test: image cargo-cache
 	$(RUN) $(DEV_IMAGE) cargo test --workspace $(LOCKED)
 
 lint: image cargo-cache
+	$(RUN) $(DEV_IMAGE) scripts/check-repo.sh
 	$(RUN) $(DEV_IMAGE) cargo fmt --all --check
 	$(RUN) $(DEV_IMAGE) cargo clippy --workspace --all-targets $(LOCKED) -- -D warnings
 
