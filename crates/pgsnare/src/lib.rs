@@ -3,13 +3,20 @@
 //! The pgsnare runtime as a library: listeners, TLS, configuration and
 //! reload, sinks, the admin and metrics listeners, and the command line.
 //!
-//! The `pgsnare` binary is a thin wrapper around [`main`].
+//! The `pgsnare` binary is a thin wrapper around [`main`]. Another build can
+//! assemble its own proxy from the same parts with the [`builder`].
 
 #![forbid(unsafe_code)]
 
 use std::process::ExitCode;
 
+pub mod admin;
+pub mod builder;
 pub mod config;
+pub mod reload;
+pub mod runtime;
+pub mod sinks;
+pub mod tls;
 
 /// Entry point of the `pgsnare` binary.
 ///
