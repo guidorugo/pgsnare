@@ -38,13 +38,14 @@ This document sets out the design at the level needed to build it: the parts, ho
 2. **Detection on data.** A honeytoken value is detected in any message, in either direction, however the query that produced it was written.
 3. **Configurable response.** Each token decides what happens on a hit: alert, kill, tarpit, fake data, or a combination.
 4. **No added risk.** pgsnare holds no database credentials, fails closed, and cannot be crashed or bypassed by malformed input.
-5. **PostgreSQL 13 to 18.** Wire protocol 3.0 and 3.2, and direct TLS.
+5. **Supported PostgreSQL versions.** pgsnare targets the versions supported upstream, 15 to 18 today, with wire protocol 3.0 and 3.2 and direct TLS.
 6. **Container-native.** It runs as a standalone container or in Kubernetes, without needing exceptions from a locked-down platform.
 7. **Low overhead.** The targets are in [section 16](#16-quality-targets).
 
 ### Non-goals for the first version
 
 - Databases other than PostgreSQL.
+- PostgreSQL versions that are no longer supported upstream.
 - Encryption, masking or any other change to real data.
 - Connection pooling or load balancing.
 - A user interface. Events go to existing tools.
@@ -559,7 +560,7 @@ These are design targets, not measurements.
 
 | Area | Target |
 |---|---|
-| Compatibility | PostgreSQL 13 to 18. Clients: psql and libpq 16 to 18, pgjdbc, node-postgres, psycopg 3, pgx, asyncpg and tokio-postgres. Every supported TLS setup. Protocol 3.0 and 3.2. |
+| Compatibility | PostgreSQL 15 to 18. Clients: psql and libpq 15 to 18, pgjdbc, node-postgres, psycopg 3, pgx, asyncpg and tokio-postgres. Every supported TLS setup. Protocol 3.0 and 3.2. |
 | Added latency | At most 0.5 ms at the median and 2 ms at the 99th percentile, for queries that trigger nothing |
 | Throughput | At least 90% of a direct connection in a select-only benchmark with 64 clients and 100 tokens loaded |
 | Memory | At most 50 MB baseline plus 64 KB per idle connection |
@@ -582,4 +583,3 @@ These are design targets, not measurements.
 ## 18. Open points
 
 - Whether the reference benchmark on a 16-core machine is a release gate, or a scaled-down run is accepted.
-- Which PostgreSQL versions the first release supports. The range is 13 to 18 for now, but 13 left upstream support in November 2025 and 14 leaves it in November 2026.
