@@ -172,20 +172,44 @@ impl fmt::Debug for StreamScanner {
 
 #[cfg(test)]
 mod tests {
+    use aho_corasick::AhoCorasickKind;
+
     use super::*;
+    use crate::detect::matcher::Plan;
     use crate::detect::{Match, PatternForm, TokenSpec};
 
     const EMAIL: &str = "svc.backup.8f3k2q@mail.example";
     const EMAIL_HEX: &str = "7376632e6261636b75702e3866336b3271406d61696c2e6578616d706c65";
     const INVOICE: &str = "Canary.Invoice.000417";
 
-    fn matcher() -> Matcher {
-        Matcher::build(&[
+    fn tokens() -> [TokenSpec; 3] {
+        [
             TokenSpec::new("users-admin-backup", [EMAIL]),
             TokenSpec::new("billing-canary", [INVOICE]).case_insensitive(true),
             TokenSpec::new("repeating", ["abababababab"]),
-        ])
-        .expect("the token list is valid")
+        ]
+    }
+
+    fn matcher() -> Matcher {
+        Matcher::build(&tokens()).expect("the token list is valid")
+    }
+
+    /// The same tokens compiled into each kind of automaton.
+    fn matchers() -> Vec<Matcher> {
+        [
+            AhoCorasickKind::DFA,
+            AhoCorasickKind::ContiguousNFA,
+            AhoCorasickKind::NoncontiguousNFA,
+        ]
+        .into_iter()
+        .map(|kind| {
+            let plan = Plan {
+                kinds: &[kind],
+                dfa_memory_limit: usize::MAX,
+            };
+            Matcher::build_with(&tokens(), plan).expect("the token list is valid")
+        })
+        .collect()
     }
 
     /// A message with every form in it, values next to each other, and an
@@ -252,12 +276,18 @@ mod tests {
 
     #[test]
     fn a_split_at_any_position_changes_nothing() {
-        let matcher = matcher();
         let message = message();
-        let expected = whole(&matcher, &message);
-        for cut in 0..=message.len() {
-            let (head, tail) = message.split_at(cut);
-            assert_eq!(streamed(&matcher, [head, tail]), expected, "cut at {cut}");
+        let expected = whole(&matcher(), &message);
+        for matcher in matchers() {
+            assert_eq!(whole(&matcher, &message), expected, "{matcher:?}");
+            for cut in 0..=message.len() {
+                let (head, tail) = message.split_at(cut);
+                assert_eq!(
+                    streamed(&matcher, [head, tail]),
+                    expected,
+                    "cut at {cut} with {matcher:?}"
+                );
+            }
         }
     }
 
@@ -286,17 +316,18 @@ mod tests {
 
     #[test]
     fn chunks_of_any_fixed_size_change_nothing() {
-        let matcher = matcher();
         let message = message();
-        let expected = whole(&matcher, &message);
-        // From one byte at a time to sizes around the carried length and
-        // beyond the longest pattern.
-        for size in 1..=(matcher.max_pattern_len() + 3) {
-            assert_eq!(
-                streamed(&matcher, message.chunks(size)),
-                expected,
-                "chunks of {size}"
-            );
+        let expected = whole(&matcher(), &message);
+        for matcher in matchers() {
+            // From one byte at a time to sizes around the carried length
+            // and beyond the longest pattern.
+            for size in 1..=(matcher.max_pattern_len() + 3) {
+                assert_eq!(
+                    streamed(&matcher, message.chunks(size)),
+                    expected,
+                    "chunks of {size} with {matcher:?}"
+                );
+            }
         }
     }
 

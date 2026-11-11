@@ -6,6 +6,7 @@
 //! written here, on generated token lists and generated input.
 
 use std::collections::BTreeSet;
+use std::sync::OnceLock;
 
 use pgsnare_core::detect::{
     BuildError, MIN_VALUE_LEN, Match, Matcher, PatternForm, TokenSpec, ValidationError,
@@ -401,6 +402,91 @@ proptest! {
         }
         streamed.sort();
         prop_assert_eq!(streamed, expected);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A long token list
+// ---------------------------------------------------------------------------
+
+/// A token list long enough that the matcher compiles it into its compact
+/// kind of automaton instead of the DFA that the short lists above get.
+///
+/// It is the same for every case and built once: 1,200 tokens with one
+/// value each, most of them case-insensitive.
+fn long_token_list() -> &'static (Vec<TokenDef>, Matcher) {
+    static LIST: OnceLock<(Vec<TokenDef>, Matcher)> = OnceLock::new();
+    LIST.get_or_init(|| {
+        // A fixed sequence of numbers (a linear congruential generator), so
+        // that the list is the same in every run.
+        let mut state = 0x5eed_u64;
+        let mut next = move |limit: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as usize % limit
+        };
+        let defs: Vec<TokenDef> = (0..1200)
+            .map(|index| {
+                let len = 16 + next(9);
+                let value = (0..len).map(|_| ALPHABET[next(ALPHABET.len())]).collect();
+                TokenDef {
+                    values: vec![value],
+                    case_insensitive: index % 6 != 0,
+                }
+            })
+            .collect();
+        let matcher = Matcher::build(&specs(&defs)).expect("the long token list is valid");
+        (defs, matcher)
+    })
+}
+
+#[test]
+fn the_long_token_list_is_not_compiled_into_a_dfa() {
+    let (_, matcher) = long_token_list();
+    let debug = format!("{matcher:?}");
+    assert!(
+        debug.contains("exact: Some(ContiguousNFA), case_insensitive: Some(ContiguousNFA)"),
+        "{debug}"
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// With a long token list, a whole-buffer scan still finds exactly what
+    /// the plain search finds, and a streaming scan finds the same, each
+    /// match in the chunk where it ends.
+    #[test]
+    fn a_long_token_list_is_scanned_just_the_same(
+        pieces in vec(piece(), 0..10),
+        cuts in vec(any::<Index>(), 0..8),
+    ) {
+        let (defs, matcher) = long_token_list();
+        let haystack = render(&pieces, defs);
+        let expected = whole_scan(matcher, &haystack);
+
+        let actual: Vec<Found> = expected.iter().map(found).collect();
+        prop_assert_eq!(actual, plain_search(defs, &haystack));
+
+        let mut scanner = matcher.stream();
+        let mut fed = 0;
+        for chunk in chunks(&haystack, &cuts) {
+            let mut in_chunk = scanner
+                .feed(chunk)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("a scan does not fail");
+            in_chunk.sort();
+
+            let chunk_start = fed as u64;
+            fed += chunk.len();
+            let ending_here: Vec<Match> = expected
+                .iter()
+                .filter(|matched| matched.end() > chunk_start && matched.end() <= fed as u64)
+                .cloned()
+                .collect();
+            prop_assert_eq!(in_chunk, ending_here);
+        }
     }
 }
 

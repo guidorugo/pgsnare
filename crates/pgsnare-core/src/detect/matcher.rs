@@ -9,7 +9,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use aho_corasick::automaton::OverlappingState;
-use aho_corasick::{AhoCorasick, MatchKind};
+use aho_corasick::{AhoCorasick, AhoCorasickKind, MatchKind};
 
 use super::error::{BuildError, ScanError, ValidationErrors};
 use super::pattern::PatternForm;
@@ -113,6 +113,43 @@ pub(crate) struct Region<'a> {
     pub(crate) straddling: Option<usize>,
 }
 
+/// The kinds of automaton a pattern set can be compiled into, fastest first.
+const KINDS: [AhoCorasickKind; 3] = [
+    AhoCorasickKind::DFA,
+    AhoCorasickKind::ContiguousNFA,
+    AhoCorasickKind::NoncontiguousNFA,
+];
+
+/// The most heap memory one DFA may use, in bytes.
+///
+/// A DFA scans about twice as fast as the other kinds, but it keeps a full
+/// row of transitions for every state, so its size grows with the total
+/// length of the patterns times the size of their alphabet. A hundred tokens
+/// of thirty bytes need a few MiB; ten thousand would need hundreds. Past
+/// this limit the patterns are compiled into a contiguous NFA instead, which
+/// takes a small fraction of the memory.
+const DFA_MEMORY_LIMIT: usize = 8 * 1024 * 1024;
+
+/// What a DFA typically needs per byte of pattern: one state with a row of
+/// 128 transitions of four bytes each. A DFA is not even built if, by this
+/// measure, it would end up over the limit.
+const DFA_BYTES_PER_PATTERN_BYTE: usize = 512;
+
+/// Which kinds of automaton to try, in order, and how large a DFA may get.
+#[derive(Clone, Copy)]
+pub(crate) struct Plan<'k> {
+    pub(crate) kinds: &'k [AhoCorasickKind],
+    pub(crate) dfa_memory_limit: usize,
+}
+
+impl Plan<'static> {
+    /// The fastest automaton that fits.
+    pub(crate) const DEFAULT: Self = Self {
+        kinds: &KINDS,
+        dfa_memory_limit: DFA_MEMORY_LIMIT,
+    };
+}
+
 /// One automaton and the patterns compiled into it.
 struct PatternSet {
     automaton: AhoCorasick,
@@ -126,31 +163,54 @@ impl PatternSet {
     fn compile(
         entries: Vec<(PatternInfo, &[u8])>,
         ignore_case: bool,
+        plan: Plan<'_>,
     ) -> Result<Option<Self>, BuildError> {
         if entries.is_empty() {
             return Ok(None);
         }
+        let pattern_bytes = entries
+            .iter()
+            .map(|(_, bytes)| bytes.len())
+            .fold(0, usize::saturating_add);
 
-        let automaton = AhoCorasick::builder()
-            // Standard semantics are what allow an overlapping search, which
-            // reports every occurrence of every pattern.
-            .match_kind(MatchKind::Standard)
-            .ascii_case_insensitive(ignore_case)
-            .build(entries.iter().map(|(_, bytes)| bytes))
-            .map_err(|_| BuildError::TooLarge)?;
+        for &kind in plan.kinds {
+            let is_dfa = kind == AhoCorasickKind::DFA;
+            if is_dfa
+                && pattern_bytes.saturating_mul(DFA_BYTES_PER_PATTERN_BYTE) > plan.dfa_memory_limit
+            {
+                continue;
+            }
 
-        // Whether an automaton supports the search does not depend on the
-        // input, so asking once here keeps a misconfiguration from showing
-        // up later as a failure of every scan.
-        let searchable = automaton.try_find_overlapping_iter(b"").is_ok();
-        if !searchable || automaton.patterns_len() != entries.len() {
-            return Err(BuildError::SearchUnavailable);
+            let built = AhoCorasick::builder()
+                // Standard semantics are what allow an overlapping search,
+                // which reports every occurrence of every pattern.
+                .match_kind(MatchKind::Standard)
+                .ascii_case_insensitive(ignore_case)
+                .kind(Some(kind))
+                .build(entries.iter().map(|(_, bytes)| bytes));
+            let Ok(automaton) = built else {
+                // This kind cannot hold the patterns. A later one may.
+                continue;
+            };
+            if is_dfa && automaton.memory_usage() > plan.dfa_memory_limit {
+                continue;
+            }
+
+            // Whether an automaton supports the search does not depend on
+            // the input, so asking once here keeps a misconfiguration from
+            // showing up later as a failure of every scan.
+            let searchable = automaton.try_find_overlapping_iter(b"").is_ok();
+            if !searchable || automaton.patterns_len() != entries.len() {
+                return Err(BuildError::SearchUnavailable);
+            }
+
+            return Ok(Some(Self {
+                automaton,
+                patterns: entries.into_iter().map(|(info, _)| info).collect(),
+            }));
         }
 
-        Ok(Some(Self {
-            automaton,
-            patterns: entries.into_iter().map(|(info, _)| info).collect(),
-        }))
+        Err(BuildError::TooLarge)
     }
 
     /// Finds the next match in `region`, continuing from `state`.
@@ -252,6 +312,15 @@ pub(crate) struct Inner {
 /// assert_eq!(hits[0].start(), 20);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
+///
+/// # Speed and memory
+///
+/// The patterns are compiled into the fastest kind of automaton that stays
+/// small. While the values add up to about 5 KiB or less, which is some 180
+/// tokens of 30 bytes, that is a DFA of at most 8 MiB. A longer list gets an
+/// automaton that scans at about half the speed and needs a small fraction
+/// of the memory per pattern. [`Matcher::memory_usage`] reports what a
+/// matcher holds.
 #[derive(Clone)]
 pub struct Matcher {
     inner: Arc<Inner>,
@@ -281,6 +350,11 @@ impl Matcher {
     /// [`BuildError::TooLarge`] is returned if the values are too many or
     /// too long to compile.
     pub fn build(tokens: &[TokenSpec]) -> Result<Self, BuildError> {
+        Self::build_with(tokens, Plan::DEFAULT)
+    }
+
+    /// Like [`Matcher::build`], with a say in which automaton is used.
+    pub(crate) fn build_with(tokens: &[TokenSpec], plan: Plan<'_>) -> Result<Self, BuildError> {
         let mut errors = ValidationErrors::new();
         let slots = validate::check_tokens(tokens, &mut errors);
         let conflicts = validate::check_conflicts(&slots, &mut errors);
@@ -307,9 +381,9 @@ impl Matcher {
             }
         }
 
-        let exact = PatternSet::compile(exact, false)?;
+        let exact = PatternSet::compile(exact, false, plan)?;
         // The second automaton exists only if a token needs it.
-        let folded = PatternSet::compile(folded, true)?;
+        let folded = PatternSet::compile(folded, true, plan)?;
         let max_pattern_len = [&exact, &folded]
             .into_iter()
             .flatten()
@@ -788,6 +862,159 @@ mod tests {
         matches.sort();
         let starts: Vec<u64> = matches.iter().map(Match::start).collect();
         assert_eq!(starts, [0, 18, 34]);
+    }
+
+    /// `count` tokens with one value of 31 bytes each.
+    fn many_tokens(count: usize) -> Vec<TokenSpec> {
+        (0..count)
+            .map(|index| {
+                TokenSpec::new(
+                    format!("token-{index}"),
+                    [format!("canary.{index:06}.user@mail.example")],
+                )
+            })
+            .collect()
+    }
+
+    fn kinds(matcher: &Matcher) -> Vec<AhoCorasickKind> {
+        matcher.sets().map(|set| set.automaton.kind()).collect()
+    }
+
+    #[test]
+    fn a_short_list_is_compiled_into_a_dfa_within_the_limit() {
+        let matcher = build(&many_tokens(100));
+        assert_eq!(kinds(&matcher), [AhoCorasickKind::DFA]);
+        assert!(matcher.memory_usage() <= DFA_MEMORY_LIMIT);
+
+        let both = build(&[
+            TokenSpec::new("users-admin-backup", [EMAIL]),
+            TokenSpec::new("billing-canary", [INVOICE]).case_insensitive(true),
+        ]);
+        assert_eq!(kinds(&both), [AhoCorasickKind::DFA, AhoCorasickKind::DFA]);
+    }
+
+    #[test]
+    fn a_long_list_is_compiled_into_a_compact_automaton() {
+        let tokens = many_tokens(1000);
+        let matcher = build(&tokens);
+        assert_eq!(kinds(&matcher), [AhoCorasickKind::ContiguousNFA]);
+        // A DFA for this list would take several times the limit.
+        assert!(matcher.memory_usage() < DFA_MEMORY_LIMIT / 4);
+
+        // It finds the same things.
+        assert_eq!(
+            scan(&matcher, b"<canary.000999.user@mail.example>"),
+            [hit("token-999", 0, PatternForm::Raw, 1..32)]
+        );
+    }
+
+    #[test]
+    fn a_few_very_long_values_do_not_get_a_huge_dfa() {
+        // Only two patterns, but 60,000 bytes of them. The number of
+        // patterns says nothing about the size of a DFA; their length does.
+        let long_value: String = (0..20_000)
+            .map(|index| char::from(b'a' + (index % 23) as u8 + (index / 23 % 3) as u8))
+            .collect();
+        let matcher = build(&[TokenSpec::new("long", [long_value.as_str()])]);
+        assert_eq!(kinds(&matcher), [AhoCorasickKind::ContiguousNFA]);
+        assert!(matcher.memory_usage() < DFA_MEMORY_LIMIT);
+        assert_eq!(matcher.max_pattern_len(), 40_000);
+
+        let haystack = format!("..{long_value}..");
+        assert_eq!(
+            scan(&matcher, haystack.as_bytes()),
+            [hit("long", 0, PatternForm::Raw, 2..20_002)]
+        );
+    }
+
+    #[test]
+    fn a_dfa_is_not_built_when_it_cannot_fit() {
+        let plan = Plan {
+            kinds: &KINDS,
+            dfa_memory_limit: 0,
+        };
+        let matcher =
+            Matcher::build_with(&many_tokens(100), plan).expect("the token list is valid");
+        assert_eq!(kinds(&matcher), [AhoCorasickKind::ContiguousNFA]);
+    }
+
+    #[test]
+    fn a_dfa_that_turns_out_too_large_is_dropped() {
+        // Eight values that together use every ASCII byte. That many
+        // different bytes make the rows of the DFA twice as wide as the
+        // estimate assumes, so the DFA is built, measured and dropped.
+        let tokens: Vec<TokenSpec> = (0..8u8)
+            .map(|token| {
+                let value: Vec<u8> = (0..16).map(|byte| token * 16 + byte).collect();
+                TokenSpec::new(format!("token-{token}"), [value])
+            })
+            .collect();
+        let pattern_bytes = 8 * (16 + 32);
+        let tight = Plan {
+            kinds: &KINDS,
+            dfa_memory_limit: pattern_bytes * DFA_BYTES_PER_PATTERN_BYTE,
+        };
+        let matcher = Matcher::build_with(&tokens, tight).expect("the token list is valid");
+        assert_eq!(kinds(&matcher), [AhoCorasickKind::ContiguousNFA]);
+
+        // With a higher limit the same list gets its DFA, and that DFA is
+        // indeed larger than the tight limit.
+        let roomy = Plan {
+            kinds: &KINDS,
+            dfa_memory_limit: 4 * tight.dfa_memory_limit,
+        };
+        let matcher = Matcher::build_with(&tokens, roomy).expect("the token list is valid");
+        assert_eq!(kinds(&matcher), [AhoCorasickKind::DFA]);
+        assert!(matcher.memory_usage() > tight.dfa_memory_limit);
+        assert!(matcher.memory_usage() <= roomy.dfa_memory_limit);
+    }
+
+    #[test]
+    fn without_a_usable_kind_the_list_is_too_large() {
+        let plan = Plan {
+            kinds: &[],
+            dfa_memory_limit: DFA_MEMORY_LIMIT,
+        };
+        assert_eq!(
+            Matcher::build_with(&many_tokens(3), plan).err(),
+            Some(BuildError::TooLarge)
+        );
+        // An empty list needs no automaton at all.
+        assert!(Matcher::build_with(&[], plan).is_ok());
+    }
+
+    #[test]
+    fn every_kind_of_automaton_finds_the_same_matches() {
+        let tokens = [
+            TokenSpec::new("users-admin-backup", [EMAIL]),
+            TokenSpec::new("billing-canary", [INVOICE]).case_insensitive(true),
+            TokenSpec::new("repeating", ["abababababab"]),
+        ];
+        let haystack = format!(
+            "{EMAIL}|{}|\\x{EMAIL_HEX}|{INVOICE}{EMAIL}|ababababababababab|{}",
+            INVOICE.to_uppercase(),
+            &EMAIL[1..],
+        );
+        let expected = [
+            hit("users-admin-backup", 0, PatternForm::Raw, 0..30),
+            hit("billing-canary", 0, PatternForm::CaseInsensitive, 31..52),
+            hit("users-admin-backup", 0, PatternForm::Hex, 55..115),
+            hit("billing-canary", 0, PatternForm::Raw, 116..137),
+            hit("users-admin-backup", 0, PatternForm::Raw, 137..167),
+            hit("repeating", 0, PatternForm::Raw, 168..180),
+            hit("repeating", 0, PatternForm::Raw, 170..182),
+            hit("repeating", 0, PatternForm::Raw, 172..184),
+            hit("repeating", 0, PatternForm::Raw, 174..186),
+        ];
+        for kind in KINDS {
+            let plan = Plan {
+                kinds: &[kind],
+                dfa_memory_limit: DFA_MEMORY_LIMIT,
+            };
+            let matcher = Matcher::build_with(&tokens, plan).expect("the token list is valid");
+            assert_eq!(kinds(&matcher), [kind, kind]);
+            assert_eq!(scan(&matcher, haystack.as_bytes()), expected, "{kind:?}");
+        }
     }
 
     #[test]
