@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Fails on a secret or a private network address anywhere in the
+# repository: in a file, a file name, a commit message or the history.
+
+name: scan
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  scan:
+    name: scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The whole history is scanned, so fetch all of it.
+          fetch-depth: 0
+      - uses: ./.github/actions/dev-image
+      - run: make scan
+        env:
+          SCAN_REQUIRE_HISTORY: "1"
