@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Development and CI image for pgsnare. Every build, test, lint and fuzz run
+# happens inside it, so the host needs only Docker and make.
+#
+# The image creates no user. Run it with `--user "$(id -u):$(id -g)"`, as the
+# Makefile does, so nothing in the mounted source tree ends up owned by root.
+
+# The official Rust image, pinned by tag and by digest. Change both together,
+# and keep the version in step with rust-toolchain.toml.
+FROM rust:1.99.1-slim-trixie@sha256:f6c4a35d21dbb3c89d7a8d056c193e94fc09037f2b58dd858b09c39a47dd02d7
+
+# clang compiles the C++ part of libFuzzer and provides libclang.
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends clang \
+    && rm -rf /var/lib/apt/lists/*
+
+# Nightly toolchain used only for fuzzing, which needs sanitizer flags that
+# stable does not accept: `cargo +"$PGSNARE_FUZZ_TOOLCHAIN" fuzz ...`.
+ENV PGSNARE_FUZZ_TOOLCHAIN=nightly-2026-11-10
+
+ARG CARGO_FUZZ_VERSION=0.13.2
+
+# Limits parallel compilation while the image is built.
+ARG CARGO_BUILD_JOBS
+
+RUN rustup component add clippy rustfmt \
+    && rustup toolchain install "$PGSNARE_FUZZ_TOOLCHAIN" --profile minimal \
+    && cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked \
+    && rm -rf "$CARGO_HOME/registry" "$CARGO_HOME/git"

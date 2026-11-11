@@ -1,0 +1,18 @@
+[package]
+name = "pgsnare-proto"
+description = "The PostgreSQL wire format for pgsnare: framing, message views and encoders. No I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
