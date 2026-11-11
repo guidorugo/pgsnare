@@ -825,10 +825,24 @@ mod tests {
     #[test]
     fn debug_output_shows_sizes_and_no_patterns() {
         let matcher = build(&[TokenSpec::new("billing-canary", [INVOICE]).case_insensitive(true)]);
-        let debug = format!("{matcher:?}");
-        assert!(debug.starts_with("Matcher { tokens: 1, patterns: 3, max_pattern_len: 42"));
-        assert!(!debug.to_lowercase().contains("canary"));
-        assert!(!debug.contains("43616e617279"));
+        let kind = |set: &Option<PatternSet>| {
+            set.as_ref()
+                .map(|set| set.automaton.kind())
+                .expect("both automata exist")
+        };
+        // The whole output is compared, so that nothing can be added to it
+        // unnoticed. In particular the automata must never be printed: they
+        // are the values in another shape.
+        assert_eq!(
+            format!("{matcher:?}"),
+            format!(
+                "Matcher {{ tokens: 1, patterns: 3, max_pattern_len: 42, exact: Some({:?}), \
+                 case_insensitive: Some({:?}), memory_usage: {} }}",
+                kind(&matcher.inner.exact),
+                kind(&matcher.inner.folded),
+                matcher.memory_usage(),
+            )
+        );
 
         let matches = matcher.scan(INVOICE.as_bytes());
         assert_eq!(format!("{matches:?}"), "Matches { .. }");
