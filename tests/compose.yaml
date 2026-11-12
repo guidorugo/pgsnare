@@ -8,14 +8,18 @@
 #
 # The services, in the order tests/itest.sh uses them:
 #
-#   setup     runs once and writes the configuration of pgsnare to the
-#             `state` volume: tests/proxy/setup.sh
-#   pgNN      the databases
-#   pgsnare   one proxy in front of all of them, with a listener for each.
-#             It runs the binary that `make itest` built, in a container
-#             with a read-only root filesystem and no capabilities.
-#   client    runs the differential runner, tests/differential/run.sh, and
-#             is started once for each comparison
+#   setup     runs once and writes certificates and the configuration of
+#             pgsnare to the `state` volume: tests/proxy/setup.sh
+#   pgNN      the databases, each with TLS on and its Unix socket in a
+#             volume that pgsnare mounts too
+#   pglegacy  a database that speaks no TLS version above 1.1, to show
+#             that pgsnare refuses one
+#   pgsnare   one proxy in front of all of them, with a listener for each
+#             database and each TLS setup. It runs the binary that
+#             `make itest` built, in a container with a read-only root
+#             filesystem and no capabilities.
+#   client    runs the test scripts, such as the differential runner
+#             tests/differential/run.sh, and is started once for each
 #
 # Every container runs as the user `postgres` of its image, which has the
 # same id in all of them. A file one of them writes to a volume therefore
@@ -78,6 +82,10 @@ services:
     volumes:
       - ${ITEST_BINARY:?run the tests with make itest}:/usr/local/bin/pgsnare:ro
       - state:/state:ro
+      - socket15:/sockets/pg15:ro
+      - socket16:/sockets/pg16:ro
+      - socket17:/sockets/pg17:ro
+      - socket18:/sockets/pg18:ro
     healthcheck:
       # Through the proxy, so the check passes only once pgsnare relays to
       # a database that accepts clients.
@@ -91,18 +99,84 @@ services:
   pg15:
     <<: *postgres
     image: postgres:15.19-trixie@sha256:1aac5b49cefd627f02816141ca4ad012d6cc19460dfe02a9b5168a105be3fc53
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/state/certs/pg15.crt
+      - -c
+      - ssl_key_file=/state/certs/pg15.key
+    volumes:
+      - state:/state:ro
+      - socket15:/var/run/postgresql
 
   pg16:
     <<: *postgres
     image: postgres:16.15-trixie@sha256:f9a7b9ebf6f56201f949db745e47bc423c0f0f8294bafe991cc10bf74b029657
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/state/certs/pg16.crt
+      - -c
+      - ssl_key_file=/state/certs/pg16.key
+    volumes:
+      - state:/state:ro
+      - socket16:/var/run/postgresql
 
   pg17:
     <<: *postgres
     image: postgres:17.11-trixie@sha256:ff87138949ad9a46f32ff23bd6852b52ce024a13dffe9b4087be98292cdd3b4f
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/state/certs/pg17.crt
+      - -c
+      - ssl_key_file=/state/certs/pg17.key
+    volumes:
+      - state:/state:ro
+      - socket17:/var/run/postgresql
 
   pg18:
     <<: *postgres
     image: postgres:18.6-trixie@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/state/certs/pg18.crt
+      - -c
+      - ssl_key_file=/state/certs/pg18.key
+    volumes:
+      - state:/state:ro
+      - socket18:/var/run/postgresql
+
+  pglegacy:
+    <<: *postgres
+    image: postgres:18.6-trixie@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/state/certs/pglegacy.crt
+      - -c
+      - ssl_key_file=/state/certs/pglegacy.key
+      # TLS 1.1 at most, which the TLS library only does at its lowest
+      # security level.
+      - -c
+      - ssl_min_protocol_version=TLSv1
+      - -c
+      - ssl_max_protocol_version=TLSv1.1
+      - -c
+      - ssl_ciphers=DEFAULT@SECLEVEL=0
+    volumes:
+      - state:/state:ro
 
   client:
     image: postgres:18.6-trixie@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
@@ -121,11 +195,17 @@ services:
       PGPASSWORD: ${PGSNARE_ITEST_PASSWORD:?run the tests with make itest}
     volumes:
       - ./differential:/differential:ro
+      - ./login:/login:ro
+      - state:/state:ro
     networks:
       - itest
 
 volumes:
   state:
+  socket15:
+  socket16:
+  socket17:
+  socket18:
 
 networks:
   itest:
