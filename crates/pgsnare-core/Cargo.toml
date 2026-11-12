@@ -24,6 +24,7 @@ rules = []
 
 [dependencies]
 aho-corasick.workspace = true
+pgsnare-proto.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
