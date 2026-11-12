@@ -59,4 +59,6 @@ capture/capture.sh
 
 The script needs only Docker. It starts each server and a recording relay in containers on a private network, publishes no port, and removes everything when it ends. Its header describes the options.
 
+Before it captures, the script asks each server which startup packet layouts it accepts (`crafted_client.py layouts`) and stops if a server judges one differently than expected. The startup parser is tested against a port of PostgreSQL's own parsing loop, and this check ties that port to what real servers do. `tests/properties.rs` holds the same list of layouts.
+
 A new capture differs from the last in every random value: salts, nonces, cancel keys and process ids. The tests do not depend on those. They do depend on the scenarios, so a change to a scenario file may need a change in `tests/golden.rs`.

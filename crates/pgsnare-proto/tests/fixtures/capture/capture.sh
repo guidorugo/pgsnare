@@ -266,6 +266,9 @@ for version in ${*:-15 16 17 18}; do
     server_image=$(printf "$SERVER_IMAGE" "$version")
     echo "PostgreSQL $version ($server_image)"
     start_server "$server_image"
+    # Check, against the server itself, which startup packet layouts it
+    # accepts. The tests of the startup parser rely on this.
+    in_container "$RECORDER_IMAGE" "$password" python3 /crafted_client.py layouts pg 5432
     capture "$version" 3.0
     if [ "$version" -eq 18 ]; then
         capture "$version" 3.2

@@ -848,6 +848,63 @@ fn startup_packet(version: ProtocolVersion, region: &[u8]) -> Vec<u8> {
     bytes
 }
 
+/// The bytes after the protocol version of a startup message, and whether
+/// PostgreSQL accepts their layout.
+///
+/// Real servers gave these verdicts. `tests/fixtures/capture/crafted_client.py`
+/// holds the same list, sends each layout to a server and fails if the
+/// server judges one differently. The capture script runs that against
+/// PostgreSQL 15 to 18.
+const LAYOUTS: [(&[u8], bool); 12] = [
+    (b"user\0app_plain\0database\0appdb\0\0", true),
+    // The last byte is not zero.
+    (b"user\0app_plain\0database\0appdb\0x", true),
+    // No terminator.
+    (b"user\0app_plain\0database\0appdb\0", false),
+    // A byte after the terminator.
+    (b"user\0app_plain\0database\0appdb\0\0x", false),
+    (b"user\0app_plain\0database\0appdb\0\0\0", false),
+    // A name without a value.
+    (b"user\0app_plain\0database\0", false),
+    // An empty value, then the end of the packet.
+    (b"user\0app_plain\0options\0\0", false),
+    // A value that is not terminated.
+    (b"user\0app_plain\0database\0appdb", false),
+    // A terminator first.
+    (b"\0user\0app_plain\0\0", false),
+    // Nothing after the version.
+    (b"", false),
+    // No parameters: the layout passes, and the login fails later.
+    (b"\0", true),
+    (b"x", true),
+];
+
+/// The port of PostgreSQL's loop, which the properties below use as their
+/// reference, judges the layouts as real servers did. The crate accepts
+/// what the servers accept, except a packet whose last byte is not zero.
+#[test]
+fn reference_parser_matches_real_servers() {
+    for (region, accepted) in LAYOUTS {
+        let bytes = startup_packet(ProtocolVersion::V3_0, region);
+        let reference = postgres_startup_parameters(&bytes[4..]);
+        assert_eq!(reference.is_some(), accepted, "{region:?}");
+
+        let ours = StartupPacket::parse(&bytes);
+        if accepted && region.last() == Some(&0) {
+            let Ok(Some(StartupPacket::StartupMessage(message))) = ours else {
+                panic!("{region:?} must be accepted, got {ours:?}");
+            };
+            let pairs: Vec<(Vec<u8>, Vec<u8>)> = message
+                .parameters()
+                .map(|parameter| (parameter.name().to_vec(), parameter.value().to_vec()))
+                .collect();
+            assert_eq!(Some(pairs), reference);
+        } else {
+            assert_eq!(ours, Err(StartupError::MalformedParameters), "{region:?}");
+        }
+    }
+}
+
 proptest! {
     /// The startup parser never accepts a packet PostgreSQL rejects, and
     /// reads the packets it accepts into the same pairs as PostgreSQL. The
