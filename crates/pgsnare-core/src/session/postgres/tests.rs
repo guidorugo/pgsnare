@@ -833,12 +833,30 @@ fn what_a_client_sends_before_the_login_is_bounded() {
     expected.extend_from_slice(&early);
     assert_eq!(harness.take_to_server(), expected);
 
+    // More than one message of a login is not kept, however it arrives:
+    // after the startup message, with it, or all at once.
     let mut harness = Harness::new(TlsPolicy::Disabled);
     harness.client(&plain_startup()).unwrap();
-    let flood = vec![0u8; 10_004 + MAX_LOGIN_FRAME + 1];
+    harness.client(&vec![0u8; MAX_LOGIN_FRAME]).unwrap();
     assert_eq!(
-        harness.client(&flood).unwrap_err().reason(),
+        harness.client(&[0]).unwrap_err().reason(),
         "the client sent too much before logging in"
+    );
+    assert_eq!(harness.session.buffered_bytes(), 0);
+
+    let mut harness = Harness::new(TlsPolicy::Disabled);
+    let mut together = plain_startup();
+    together.extend_from_slice(&vec![0u8; MAX_LOGIN_FRAME + 1]);
+    assert!(harness.client(&together).is_err());
+    // The database is not asked for on behalf of a session that has ended.
+    assert!(harness.take_effects().is_empty());
+    assert_eq!(harness.session.buffered_bytes(), 0);
+
+    let mut harness = Harness::new(TlsPolicy::Disabled);
+    assert!(
+        harness
+            .client(&vec![0u8; 10_004 + MAX_LOGIN_FRAME + 1])
+            .is_err()
     );
     assert_eq!(harness.session.buffered_bytes(), 0);
 }

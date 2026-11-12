@@ -26,9 +26,10 @@ use super::inspect::{Context, InspectionError, Inspector, Verdict};
 use super::messages::{self, Identity, Negotiation};
 use super::names::message_name;
 
-/// The most bytes a client may have sent before the login begins without
-/// any of them being passed on: the largest startup packet, and what may
-/// follow it while the connection to the database is being opened.
+/// The most bytes a client may hand over at once before the login begins:
+/// the largest startup packet, and what may follow it while the connection
+/// to the database is being opened, which is at most one message of the
+/// login.
 const MAX_BEFORE_LOGIN: usize = MAX_STARTUP_PACKET_LEN.saturating_add(MAX_LOGIN_FRAME);
 
 /// Where a session stands.
@@ -352,13 +353,15 @@ impl PostgresSession {
         policy: &PolicySnapshot,
         out: &mut Output,
     ) -> Result<(), SessionError> {
-        let mut held = mem::take(&mut self.from_client.held);
-        if held.len().saturating_add(input.len()) > MAX_BEFORE_LOGIN {
+        // No runtime reads this much at once. Refusing it here keeps what
+        // is copied below within bounds whoever calls.
+        if input.len() > MAX_BEFORE_LOGIN {
             self.close();
             return Err(SessionError::new(
                 "the client sent too much before logging in",
             ));
         }
+        let mut held = mem::take(&mut self.from_client.held);
         held.extend_from_slice(input);
 
         let mut consumed = 0usize;
@@ -367,7 +370,10 @@ impl PostgresSession {
             return Err(error);
         }
         // Only a session that reads on, or that is about to log in, keeps
-        // what it has not read yet.
+        // what it has not read yet. A session that reads on holds less
+        // than one startup packet, because a longer one has been refused
+        // by its length. A session that is about to log in holds what
+        // followed the startup message, which is for the login.
         if matches!(self.phase, Phase::Startup | Phase::Connecting) {
             held.drain(..consumed.min(held.len()));
             self.from_client.held = held;
@@ -452,6 +458,13 @@ impl PostgresSession {
                     self.phase = Phase::Closed;
                 }
                 StartupPacket::StartupMessage(message) => {
+                    // What follows the startup message is kept for the
+                    // login, and no more of it than one message of a login.
+                    if view.len().saturating_sub(length) > MAX_LOGIN_FRAME {
+                        return Err(SessionError::new(
+                            "the client sent too much before logging in",
+                        ));
+                    }
                     self.begin_login(&message, policy, out)?;
                 }
             }
@@ -514,7 +527,7 @@ impl PostgresSession {
     /// being opened. It is read when the login begins.
     fn hold_before_login(&mut self, input: &[u8]) -> Result<(), SessionError> {
         let held = self.from_client.held.len();
-        if held.saturating_add(input.len()) > MAX_BEFORE_LOGIN {
+        if held.saturating_add(input.len()) > MAX_LOGIN_FRAME {
             self.close();
             return Err(SessionError::new(
                 "the client sent too much before logging in",
@@ -991,6 +1004,11 @@ impl ProtocolSession for PostgresSession {
         policy: &PolicySnapshot,
         out: &mut Output,
     ) -> Result<(), SessionError> {
+        // Nothing arrived, so nothing changes, whatever the session is
+        // waiting for.
+        if input.is_empty() {
+            return Ok(());
+        }
         match (self.phase, from) {
             (Phase::Closed, _) => Ok(()),
             (Phase::Tunnel, _) => {
