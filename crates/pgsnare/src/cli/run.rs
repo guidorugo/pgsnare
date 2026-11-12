@@ -253,7 +253,7 @@ fn listeners(config: &Config, module: &Postgres) -> Result<Vec<ListenerSettings>
             UpstreamTlsMode::Prefer | UpstreamTlsMode::Require
         ) {
             tracing::warn!(
-                listener = name,
+                listener = %name,
                 "the certificate of the database is not verified, because upstream_tls.mode \
                  is not verify-full: whoever answers at its address is taken for the database"
             );
