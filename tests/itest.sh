@@ -13,6 +13,11 @@
 #     document is tried with a real client, and a row that must fail is
 #     checked for the failure it must fail with.
 #   - What pgsnare logs when it starts.
+#   - pgsnare as a container: it refuses to start with files that are open
+#     to other users, its worker threads follow the processors it may use,
+#     it stays within a memory limit that is smaller than the largest
+#     message of the scenarios, and as process 1 it stops on SIGTERM the
+#     way the design says.
 #
 # A pass has to mean something, so the run also proves that its checks can
 # fail:
@@ -130,6 +135,27 @@ compare() {
         --as "TLS to TLS with the database's certificate" \
         --proxied "host=pgsnare port=64$v sslmode=require $options" \
         "$@"
+}
+
+# await_log CONTAINER TEXT: waits until a container has logged TEXT.
+await_log() {
+    tries=0
+    until "$docker" logs "$1" 2>&1 | grep -qF -- "$2"; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 150 ]; then
+            return 1
+        fi
+        sleep 0.2
+    done
+}
+
+# sessions_running VERSION SQL: how many sessions of the database run this
+# statement right now, as the database itself says.
+sessions_running() {
+    compose --profile client run --rm --no-deps -T --entrypoint psql client \
+        --no-psqlrc --no-password --quiet --tuples-only --no-align \
+        --dbname "$(direct "$1") dbname=postgres" \
+        --command "SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND query = '$2'"
 }
 
 # logged TEXT: whether pgsnare has written a line with TEXT to its log.
@@ -260,6 +286,109 @@ expect_status 2 "an unreachable endpoint" \
     runner --direct "$(direct "$first")" \
     --proxied "host=pg$first port=1 user=postgres connect_timeout=5" \
     /differential/selfcheck
+
+# --- pgsnare as a container ---------------------------------------------------
+
+echo "itest: pgsnare must refuse to start with files that are open to other users"
+for config in open-key open-config; do
+    status=0
+    output="$(compose run --rm --no-deps -T pgsnare run \
+        --config "/state/config/$config.yaml" 2>&1)" || status=$?
+    case "$config" in
+        open-key) file="/state/certs/open.key" ;;
+        *) file="/state/config/open-config.yaml" ;;
+    esac
+    if [ "$status" -ne 1 ] \
+        || ! echo "$output" | grep -qF "refusing to start" \
+        || ! echo "$output" | grep -qF "$file: the file is open to the group or to others"; then
+        echo "itest: FAILED: pgsnare did not refuse $file (exit status $status):" >&2
+        echo "$output" | sed 's/^/    /' >&2
+        failed=1
+    fi
+done
+# With the override it starts, and says which file it was warned about.
+compose run --detach --no-deps --name "$project-open-files" pgsnare run \
+    --config /state/config/open-key.yaml --allow-insecure-file-permissions >/dev/null
+if ! await_log "$project-open-files" "listening" \
+    || ! "$docker" logs "$project-open-files" 2>&1 \
+        | grep -F "starting although a file that holds secrets is not protected" \
+        | grep -qF "file=/state/certs/open.key"; then
+    echo "itest: FAILED: pgsnare did not start with --allow-insecure-file-permissions, or did not say so" >&2
+    failed=1
+fi
+"$docker" rm --force "$project-open-files" >/dev/null 2>&1 || true
+
+echo "itest: the worker threads of pgsnare must follow the processors its container may use"
+compose --profile limits up --detach pgsnare-one-cpu pgsnare-two-cpus >/dev/null 2>&1
+for limit in "one-cpu 1" "two-cpus 2"; do
+    service="pgsnare-${limit% *}"
+    if ! await_log "$(compose --profile limits ps --all --quiet "$service")" \
+        "worker_threads=${limit#* }"; then
+        echo "itest: FAILED: $service does not run ${limit#* } worker thread(s)" >&2
+        compose --profile limits logs --no-log-prefix --tail 20 "$service" >&2 || true
+        failed=1
+    fi
+done
+compose --profile limits rm --stop --force pgsnare-one-cpu pgsnare-two-cpus >/dev/null 2>&1 || true
+
+# The scenarios sent messages of 100 MB through a pgsnare that may use
+# 64 MiB. It is still the same process.
+proxy="$(compose ps --quiet pgsnare)"
+if [ "$("$docker" inspect --format '{{.State.OOMKilled}} {{.RestartCount}}' "$proxy")" != "false 0" ] \
+    || [ "$("$docker" exec "$proxy" cat /proc/1/comm)" != "pgsnare" ]; then
+    echo "itest: FAILED: pgsnare did not stay within its memory limit, or is not process 1" >&2
+    failed=1
+fi
+peak="$("$docker" exec "$proxy" cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo unknown)"
+echo "itest: pgsnare and its health check used at most $peak bytes of memory"
+
+# The last check, because it ends pgsnare: it stops on SIGTERM.
+echo "itest: pgsnare must stop on SIGTERM, as process 1 of its container"
+staying="$(mktemp)"
+compose --profile client run --rm --no-deps -T --entrypoint psql client \
+    --no-psqlrc --no-password --quiet --dbname "$(proxied "$first") dbname=postgres" \
+    --command "SELECT pg_sleep(300)" >"$staying" 2>&1 &
+client=$!
+tries=0
+until [ "$(sessions_running "$first" "SELECT pg_sleep(300)")" = "1" ]; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 30 ]; then
+        echo "itest: FAILED: the session that is to be shut down did not start" >&2
+        failed=1
+        break
+    fi
+done
+asked="$(date +%s)"
+"$docker" kill --signal TERM "$proxy" >/dev/null
+# While open sessions get their grace period, nobody new is let in.
+expect_status 2 "a new client after SIGTERM" \
+    version "$first" "$(proxied "$first") connect_timeout=3"
+still_draining="$("$docker" inspect --format '{{.State.Running}}' "$proxy")"
+still_asleep="$(sessions_running "$first" "SELECT pg_sleep(300)")"
+exit_code="$("$docker" wait "$proxy")"
+took=$(($(date +%s) - asked))
+wait "$client" || true
+if [ "$still_draining" != "true" ] || [ "$still_asleep" != "1" ]; then
+    echo "itest: FAILED: pgsnare did not leave an open session its grace period (running: $still_draining, sessions: $still_asleep)" >&2
+    failed=1
+fi
+if [ "$exit_code" != "0" ] || [ "$took" -lt 4 ] || [ "$took" -gt 20 ]; then
+    echo "itest: FAILED: pgsnare ended with status $exit_code after $took seconds, expected status 0 after its grace period of 5 seconds" >&2
+    failed=1
+fi
+if ! grep -qF "FATAL:  terminating connection due to administrator command" "$staying"; then
+    echo "itest: FAILED: the open session was not closed with the error of an administrator shutdown:" >&2
+    sed 's/^/    /' "$staying" >&2
+    failed=1
+fi
+rm -f "$staying"
+for line in "received SIGTERM" "stopping: no new clients are accepted" \
+    "the grace period is over" "stopped"; do
+    if ! "$docker" logs "$proxy" 2>&1 | grep -qF "$line"; then
+        echo "itest: FAILED: pgsnare did not log: $line" >&2
+        failed=1
+    fi
+done
 
 if [ "$failed" -ne 0 ]; then
     echo "itest: the log of pgsnare ends with:" >&2

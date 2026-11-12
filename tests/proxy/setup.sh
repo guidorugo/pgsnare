@@ -146,4 +146,33 @@ shutdown:
 REST
 } > "$config"
 
+# --- Files that are open to other users --------------------------------------
+#
+# pgsnare must refuse to start with either of these: a configuration that
+# names a private key the group can read, and a configuration that
+# everybody can read.
+
+cp "$state/certs/pgsnare.key" "$state/certs/open.key"
+chmod 0640 "$state/certs/open.key"
+
+minimal() {
+    cat <<MINIMAL
+listeners:
+  - name: main
+    listen: 0.0.0.0:6000
+    upstream: pg.example.com:5432
+    client_tls: { mode: require, cert: /state/certs/pgsnare.crt, key: /state/certs/$1 }
+    upstream_tls: { mode: disable }
+events:
+  sinks:
+    - type: stdout
+shutdown:
+  grace_period: 1s
+MINIMAL
+}
+
+minimal open.key > "$state/config/open-key.yaml"
+minimal pgsnare.key > "$state/config/open-config.yaml"
+chmod 0644 "$state/config/open-config.yaml"
+
 echo "setup: wrote the certificates and $config"
