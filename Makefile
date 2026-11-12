@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# Every target runs inside the development image (Dockerfile.dev), as the
-# calling user. The host needs only Docker and make.
+# Every target runs in containers, so the host needs only Docker and make.
+# All targets but `itest` run inside the development image (Dockerfile.dev),
+# as the calling user. `itest` starts containers of its own.
 #
 #   make image    build the development image, unless it already exists
 #   make build    build the workspace
 #   make test     run the unit tests, with and without the default features
-#   make lint     check the repository rules and formatting, and run clippy
-#                 with warnings denied
+#   make lint     check the repository rules and formatting, run clippy with
+#                 warnings denied, and build the documentation the same way
 #   make fmt      format the code
 #   make deny     check advisories, licences and sources of every dependency
 #   make scan     scan for secrets and private network addresses
@@ -90,6 +91,7 @@ lint: image cargo-cache
 	$(RUN) $(DEV_IMAGE) sh -c '$(call FOR_EACH_FUZZ_CRATE,--check)'
 	$(RUN) $(DEV_IMAGE) cargo clippy --workspace --all-targets $(LOCKED) -- -D warnings
 	$(RUN) $(DEV_IMAGE) cargo clippy --workspace --all-targets --no-default-features $(LOCKED) -- -D warnings
+	$(RUN) --env RUSTDOCFLAGS="-D warnings" $(DEV_IMAGE) cargo doc --workspace --no-deps $(LOCKED)
 
 fmt: image cargo-cache
 	$(RUN) $(DEV_IMAGE) cargo fmt --all
