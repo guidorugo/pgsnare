@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Fuzz targets for the pgsnare crate. Run them with `make fuzz`.
+#
+# This package is not part of the workspace and has its own lock file.
+
+[package]
+name = "pgsnare-fuzz"
+description = "Fuzz targets for the pgsnare crate."
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+repository = "https://github.com/guidorugo/pgsnare"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+pgsnare = { path = ".." }
+
+[[bin]]
+name = "config_loader"
+path = "fuzz_targets/config_loader.rs"
+test = false
+doc = false
+bench = false

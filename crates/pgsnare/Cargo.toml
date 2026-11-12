@@ -1,0 +1,26 @@
+[package]
+name = "pgsnare"
+description = "A PostgreSQL proxy that detects data theft with honeytokens."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["rules"]
+# Optional SQL rules. A build without this feature contains no C code.
+rules = ["pgsnare-core/rules"]
+
+[dependencies]
+clap.workspace = true
+pgsnare-core.workspace = true
+serde.workspace = true
+serde-saphyr.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

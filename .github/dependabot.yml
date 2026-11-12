@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Dependabot version updates for everything this repository pins.
+#
+# A new release is proposed only after it has been public for a week, which
+# gives a compromised release time to be noticed. Security updates are not
+# delayed by this.
+
+version: 2
+
+updates:
+  # The workspace, and every fuzz crate with its own lock file.
+  - package-ecosystem: cargo
+    directories:
+      - /
+      - /crates/*/fuzz
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Workflows and the local composite actions. Actions stay pinned to a
+  # commit SHA; Dependabot updates the SHA and the version comment together.
+  - package-ecosystem: github-actions
+    directories:
+      - /
+      - /.github/actions/*
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+
+  # The base image of Dockerfile.dev. A new Rust release also needs the same
+  # version in rust-toolchain.toml; `make lint` fails until both agree.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+
+  # The PostgreSQL images of the integration tests.
+  - package-ecosystem: docker-compose
+    directory: /tests
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
