@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Every target runs in containers, so the host needs only Docker and make.
-# All targets but `itest` run inside the development image (Dockerfile.dev),
-# as the calling user. `itest` starts containers of its own.
+# All targets run inside the development image (Dockerfile.dev), as the
+# calling user. `itest` builds pgsnare there and then starts containers of
+# its own.
 #
 #   make image    build the development image, unless it already exists
 #   make build    build the workspace
@@ -12,7 +13,8 @@
 #   make fmt      format the code
 #   make deny     check advisories, licences and sources of every dependency
 #   make scan     scan for secrets and private network addresses
-#   make itest    run the integration tests against PostgreSQL 15 to 18
+#   make itest    build pgsnare and run the integration tests against
+#                 PostgreSQL 15 to 18
 #   make fuzz     run every fuzz target for FUZZ_SECONDS each
 #   make bench    run the benchmarks
 #   make shell    open a shell in the development image (commands can be piped in)
@@ -28,6 +30,8 @@
 #   BENCH_ARGS    extra arguments for `cargo bench`
 #   ITEST_PROJECT the Compose project name of the integration tests
 #                 (default pgsnare-itest)
+#   ITEST_VERSIONS the PostgreSQL versions the integration tests run
+#                 against (default "15 16 17 18")
 
 DOCKER ?= docker
 JOBS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)
@@ -104,9 +108,11 @@ scan: image cargo-cache
 	$(RUN) $(DEV_IMAGE) scripts/scan/selftest.sh
 	$(RUN) $(GIT_HISTORY) --env SCAN_REQUIRE_HISTORY $(DEV_IMAGE) scripts/scan/run.sh
 
-# The databases and the test client are containers of their own, started
-# with Docker Compose. Nothing publishes a host port.
-itest:
+# The tests run the binary a release build gives, which is what ships. The
+# databases, pgsnare and the test client are containers of their own,
+# started with Docker Compose. Nothing publishes a host port.
+itest: image cargo-cache
+	$(RUN) $(DEV_IMAGE) cargo build --release --package pgsnare $(LOCKED)
 	DOCKER="$(DOCKER)" ITEST_PROJECT="$(ITEST_PROJECT)" tests/itest.sh
 
 fuzz: image cargo-cache

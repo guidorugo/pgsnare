@@ -1,13 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# PostgreSQL 15 to 18 for the integration tests: `make itest`.
+# PostgreSQL 15 to 18 and pgsnare for the integration tests: `make itest`.
 #
 # Nothing here publishes a host port, and the network has no route to the
 # outside. The password is generated for each run by tests/itest.sh and is
 # never stored. Images are pinned by tag and by digest.
 #
-# The `client` service is not started with the databases. It runs the
-# differential runner: tests/differential/run.sh.
+# The services, in the order tests/itest.sh uses them:
+#
+#   setup     runs once and writes the configuration of pgsnare to the
+#             `state` volume: tests/proxy/setup.sh
+#   pgNN      the databases
+#   pgsnare   one proxy in front of all of them, with a listener for each.
+#             It runs the binary that `make itest` built, in a container
+#             with a read-only root filesystem and no capabilities.
+#   client    runs the differential runner, tests/differential/run.sh, and
+#             is started once for each comparison
+#
+# Every container runs as the user `postgres` of its image, which has the
+# same id in all of them. A file one of them writes to a volume therefore
+# belongs to the user that reads it in another, which is what the access
+# rules of both PostgreSQL and pgsnare ask for.
 
 name: pgsnare-itest
 
@@ -31,6 +44,50 @@ x-postgres: &postgres
     - itest
 
 services:
+  setup:
+    image: postgres:18.6-trixie@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
+    profiles:
+      - setup
+    user: postgres
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    network_mode: none
+    entrypoint: ["/proxy/setup.sh"]
+    environment:
+      ITEST_VERSIONS: ${ITEST_VERSIONS:?run the tests with make itest}
+    volumes:
+      # A new volume takes the owner of the directory it is first mounted
+      # on. This one belongs to `postgres` in the image, so the volume is
+      # writable without a container that runs as root.
+      - state:/var/lib/postgresql
+      - ./proxy:/proxy:ro
+
+  pgsnare:
+    image: postgres:18.6-trixie@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
+    user: postgres
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    entrypoint: ["/usr/local/bin/pgsnare"]
+    command: ["run", "--config", "/state/config/pgsnare.yaml"]
+    volumes:
+      - ${ITEST_BINARY:?run the tests with make itest}:/usr/local/bin/pgsnare:ro
+      - state:/state:ro
+    healthcheck:
+      # Through the proxy, so the check passes only once pgsnare relays to
+      # a database that accepts clients.
+      test: ["CMD", "pg_isready", "--host", "127.0.0.1", "--port", "${ITEST_READY_PORT:?run the tests with make itest}", "--username", "postgres", "--dbname", "postgres"]
+      interval: 1s
+      timeout: 3s
+      retries: 120
+    networks:
+      - itest
+
   pg15:
     <<: *postgres
     image: postgres:15.19-trixie@sha256:1aac5b49cefd627f02816141ca4ad012d6cc19460dfe02a9b5168a105be3fc53
@@ -66,6 +123,9 @@ services:
       - ./differential:/differential:ro
     networks:
       - itest
+
+volumes:
+  state:
 
 networks:
   itest:
