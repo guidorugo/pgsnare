@@ -1,0 +1,31 @@
+[package]
+name = "pgsnare-core"
+description = "The I/O-free core of pgsnare: session logic, detection, policy, actions and the event schema."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Scan throughput of the detect module. A plain program that needs only the
+# standard library: `cargo bench -p pgsnare-core --bench detect_scan`.
+[[bench]]
+name = "detect_scan"
+harness = false
+
+[lints]
+workspace = true
+
+[features]
+default = ["rules"]
+# Optional SQL rules. A build without this feature contains no C code.
+rules = []
+
+[dependencies]
+aho-corasick.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true

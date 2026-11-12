@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Development and CI image for pgsnare. Every build, test, lint and fuzz run
+# happens inside it, so the host needs only Docker and make.
+#
+# The image creates no user. Run it with `--user "$(id -u):$(id -g)"`, as the
+# Makefile does, so nothing in the mounted source tree ends up owned by root.
+
+# The official Rust image, pinned by tag and by digest. Change both together,
+# and keep the version in step with rust-toolchain.toml.
+FROM rust:1.99.1-slim-trixie@sha256:f6c4a35d21dbb3c89d7a8d056c193e94fc09037f2b58dd858b09c39a47dd02d7
+
+# clang compiles the C++ part of libFuzzer and provides libclang.
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends clang \
+    && rm -rf /var/lib/apt/lists/*
+
+# Nightly toolchain used only for fuzzing, which needs sanitizer flags that
+# stable does not accept: `cargo +"$PGSNARE_FUZZ_TOOLCHAIN" fuzz ...`.
+ENV PGSNARE_FUZZ_TOOLCHAIN=nightly-2026-11-10
+
+ARG CARGO_FUZZ_VERSION=0.13.2
+
+# Limits parallel compilation while the image is built.
+ARG CARGO_BUILD_JOBS
+
+RUN rustup component add clippy rustfmt \
+    && rustup toolchain install "$PGSNARE_FUZZ_TOOLCHAIN" --profile minimal \
+    && cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked \
+    && rm -rf "$CARGO_HOME/registry" "$CARGO_HOME/git"
+
+# Tools that check the repository and its dependencies. Each is a release
+# binary from its project, verified against the SHA-256 recorded here.
+# git lets the scanner read history, and curl fetches the downloads.
+ARG CARGO_DENY_VERSION=0.20.2
+ARG CARGO_DENY_SHA256_AMD64=9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+ARG CARGO_DENY_SHA256_ARM64=995c82be0defc7a025cae49a2aa2644ce8245c9a3318fc4103907c6a285e8c7d
+ARG GITLEAKS_VERSION=8.30.1
+ARG GITLEAKS_SHA256_AMD64=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+ARG GITLEAKS_SHA256_ARM64=e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080
+
+RUN set -eu; \
+    apt-get update; \
+    apt-get install --yes --no-install-recommends curl git; \
+    rm -rf /var/lib/apt/lists/*; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+        amd64) \
+            deny_target=x86_64-unknown-linux-musl; deny_sha256="$CARGO_DENY_SHA256_AMD64"; \
+            gitleaks_arch=x64; gitleaks_sha256="$GITLEAKS_SHA256_AMD64" ;; \
+        arm64) \
+            deny_target=aarch64-unknown-linux-musl; deny_sha256="$CARGO_DENY_SHA256_ARM64"; \
+            gitleaks_arch=arm64; gitleaks_sha256="$GITLEAKS_SHA256_ARM64" ;; \
+        *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    tmp="$(mktemp -d)"; \
+    cd "$tmp"; \
+    deny_name="cargo-deny-${CARGO_DENY_VERSION}-${deny_target}"; \
+    curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+        --output cargo-deny.tar.gz \
+        "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${deny_name}.tar.gz"; \
+    echo "${deny_sha256}  cargo-deny.tar.gz" | sha256sum --check --strict -; \
+    tar --extract --gzip --file cargo-deny.tar.gz "${deny_name}/cargo-deny"; \
+    install --mode 0755 "${deny_name}/cargo-deny" /usr/local/bin/cargo-deny; \
+    curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+        --output gitleaks.tar.gz \
+        "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_${gitleaks_arch}.tar.gz"; \
+    echo "${gitleaks_sha256}  gitleaks.tar.gz" | sha256sum --check --strict -; \
+    tar --extract --gzip --file gitleaks.tar.gz gitleaks; \
+    install --mode 0755 gitleaks /usr/local/bin/gitleaks; \
+    cd /; \
+    rm -rf "$tmp"; \
+    cargo deny --version; \
+    gitleaks version

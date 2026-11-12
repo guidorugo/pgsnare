@@ -1,0 +1,2 @@
+# Captured wire traffic is binary, whatever bytes it happens to hold.
+*.bin binary

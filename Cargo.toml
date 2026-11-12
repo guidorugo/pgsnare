@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+# The members are pgsnare-proto, pgsnare-core and pgsnare. They are matched by
+# a pattern because cargo ignores `exclude` for anything below a member that
+# is listed by its full path, and the fuzz crates below must stay excluded.
+members = ["crates/*"]
+# Fuzz targets live next to the crate they exercise, in `crates/<crate>/fuzz/`.
+# Each is a separate package with its own lock file, outside this workspace.
+exclude = [
+    "crates/pgsnare-proto/fuzz",
+    "crates/pgsnare-core/fuzz",
+    "crates/pgsnare/fuzz",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+repository = "https://github.com/guidorugo/pgsnare"
+publish = false
+
+[workspace.dependencies]
+pgsnare-core = { path = "crates/pgsnare-core", version = "0.0.0", default-features = false }
+pgsnare-proto = { path = "crates/pgsnare-proto", version = "0.0.0" }
+
+aho-corasick = "1.1.5"
+bytes = "1.12.1"
+clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+proptest = "1.12.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde-saphyr = { version = "2.1.1", default-features = false, features = ["deserialize"] }
+serde_json = "1.0.154"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+# A release build keeps integer overflow checks, and a panic unwinds so that
+# it ends one session instead of the whole process.
+overflow-checks = true
+panic = "unwind"

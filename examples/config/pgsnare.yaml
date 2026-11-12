@@ -1,0 +1,133 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# A complete pgsnare configuration, with every section and every setting.
+#
+# Most settings have a default and can be left out. The few that are
+# required are marked. The addresses and names are reserved for
+# documentation: replace them with your own.
+#
+# Rules of the format:
+#   - An unknown field is an error.
+#   - A duration is a whole number and a unit: 500ms, 30s, 10m, 1h, 1d.
+#   - A size is a whole number and a unit: 512B, 64KiB, 1MiB, 1GiB.
+#   - Text that looks like a number or a boolean must be quoted.
+#   - A relative path is relative to the directory of this file.
+#   - A secret is never written here. It is named by an environment variable
+#     or by a file.
+
+# Required. Where pgsnare accepts clients and where it sends them.
+listeners:
+  - name: main                              # required, for logs and metrics
+    listen: 0.0.0.0:5432                    # required
+    upstream: db.example.com:5432           # required; or unix:/var/run/postgresql/.s.PGSQL.5432
+
+    # Required. TLS between applications and pgsnare.
+    #   disable   plaintext only
+    #   prefer    TLS offered, plaintext accepted
+    #   require   plaintext refused
+    # For logins with SCRAM channel binding to work with TLS on both legs,
+    # this must be the certificate and key of the database itself.
+    client_tls:
+      mode: require
+      cert: /etc/pgsnare/server.crt
+      key: /etc/pgsnare/server.key
+      min_version: tls1.2                   # tls1.2 (default) or tls1.3
+
+    # Required. TLS between pgsnare and the database.
+    #   disable       plaintext, for loopback or a Unix socket
+    #   prefer        TLS if offered, not verified
+    #   require       TLS always, not verified
+    #   verify-full   TLS always, certificate and host name verified
+    upstream_tls:
+      mode: verify-full
+      ca: /etc/pgsnare/root.crt             # default: the system's store
+      server_name: db.example.com           # default: the host of upstream
+      min_version: tls1.2
+
+    max_connections: 1000                   # default 1000
+    login_timeout: 60s                      # default 60s
+
+  # A second listener, next to a database on the same machine.
+  - name: local
+    listen: 127.0.0.1:6432
+    upstream: unix:/var/run/postgresql/.s.PGSQL.5432
+    client_tls: { mode: disable }
+    upstream_tls: { mode: disable }
+
+inspection:
+  on_error: fail_closed                     # fail_closed (default) or fail_open
+  max_buffered_frame: 1MiB                  # default 1MiB
+
+# Files with more honeytokens, so that they can be stored as a secret.
+# A pattern may use * and ? in the file name. It must match at least one file.
+token_files:
+  - tokens/*.yaml
+
+# Honeytokens. A value must be ASCII and at least 12 bytes long.
+tokens:
+  - id: users-admin-backup                  # required; this is what events show
+    values: ["svc.backup.8f3k2q@mail.example"]   # required
+    case_insensitive: false                 # default false
+    scope: { database: app, table: public.users, column: email }   # a hint for the reader
+    actions: [alert, kill]                  # default [alert]; also tarpit, fake_data
+    escalate: { after_hits: 3, to: [kill] } # a stronger response after repeated hits
+
+# Who may read honeytokens without triggering anything. Hits are still counted.
+exemptions:
+  - { db_user: backup, client_cidr: 192.0.2.5/32 }   # the nightly backup
+  - { db_user: replicator }
+
+# Optional SQL rules. Leave the section out to use none. A rule that is left
+# out is off. This needs a build with the rules feature.
+rules:
+  on_parse_failure: alert                   # allow, alert (default) or block
+  max_parse_bytes: 1MiB                     # default 1MiB
+  catalog_enumeration: { actions: [alert], exclude_users: [migrator] }
+  unbounded_read: { tables: [public.users], actions: [alert] }
+  row_threshold: { tables: [public.users], max_rows: 1000, actions: [alert, tarpit] }
+  functions: { names: [pg_read_file, pg_read_binary_file, lo_export, pg_sleep], actions: [alert] }
+
+actions:
+  kill:
+    sqlstate: "57P01"                       # default "57P01"
+    message: terminating connection due to administrator command
+  tarpit:
+    delay: 2s-30s                           # default 2s-30s; a single duration is a fixed delay
+    max_duration: 10m                       # default 10m
+    max_sessions: 50                        # default 50
+    max_bytes_per_second: 1KiB              # default: no cap
+  fake_data:
+    rows: 500                               # default 500
+
+# Required, because at least one sink is required.
+events:
+  query_redaction: fingerprint              # full, fingerprint (default) or none
+  dedup_window: 60s                         # default 60s; 0s turns it off
+  queue_size: 1024                          # default 1024
+  labels: { environment: production }       # added to every event
+  labels_from_env: [POD_NAME, POD_NAMESPACE]   # added to every event under these names
+  sinks:
+    - type: webhook
+      url: https://alerts.example.com/hooks/pgsnare   # or url_env, or url_file
+      hmac_secret_env: PGSNARE_WEBHOOK_SECRET          # or hmac_secret_file
+      allow_insecure_http: false            # default false
+      timeout: 5s                           # default 5s
+      max_retries: 5                        # default 5
+      queue_size: 1024                      # default 1024, for every sink
+      max_events_per_second: 20             # default: no limit, for every sink
+    - type: stdout
+    - type: file
+      path: /var/log/pgsnare/events.jsonl
+    - type: syslog
+      address: syslog.example.com:514       # or unix:/dev/log
+      transport: udp                        # udp (default) or tcp
+      facility: local0                      # default local0
+
+admin:
+  listen: 127.0.0.1:9641                    # default; health endpoints, read-only
+
+metrics:
+  listen: 127.0.0.1:9642                    # default; Prometheus format, read-only
+
+shutdown:
+  grace_period: 25s                         # default 25s
