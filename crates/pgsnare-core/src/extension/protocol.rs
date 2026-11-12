@@ -6,7 +6,7 @@ use core::fmt;
 use std::sync::Arc;
 
 use crate::policy::PolicySnapshot;
-use crate::session::{Direction, Output, SessionOrigin};
+use crate::session::{Direction, Output, Report, SessionOrigin};
 
 use super::LoginStrategy;
 
@@ -28,12 +28,59 @@ pub trait ProtocolModule: Send + Sync + 'static {
         origin: SessionOrigin,
         login: Arc<dyn LoginStrategy>,
     ) -> Box<dyn ProtocolSession>;
+
+    /// The name this protocol uses for itself in the ALPN extension of a
+    /// TLS handshake, if it has one.
+    ///
+    /// The runtime offers it on the backend leg and accepts it on the
+    /// client leg. A session can require it for one handshake with
+    /// [`Effect::AcceptTls`].
+    ///
+    /// [`Effect::AcceptTls`]: crate::session::Effect::AcceptTls
+    fn alpn_protocol(&self) -> Option<&'static [u8]> {
+        None
+    }
+
+    /// How a client of this protocol asks a server to switch a new
+    /// connection to TLS, if that is settled in the clear before the
+    /// handshake.
+    ///
+    /// The runtime uses it on every connection it opens to the database
+    /// with TLS: the one of a session and the one that carries a cancel
+    /// request. With `None`, the handshake starts with the first byte.
+    fn backend_tls_request(&self) -> Option<TlsRequest> {
+        None
+    }
+}
+
+/// How a client asks a server to switch a new connection to TLS.
+///
+/// The client sends `request` and the server answers with exactly one
+/// byte. The handshake follows `accepted` at once, so the runtime reads
+/// that one byte and nothing more before it: a byte that arrives later
+/// belongs to the handshake and can never be taken for an answer that was
+/// sent in the clear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TlsRequest {
+    /// The bytes that ask for TLS.
+    pub request: &'static [u8],
+    /// The answer of a server that goes on with a handshake.
+    pub accepted: u8,
+    /// The answer of a server that stays in plaintext.
+    pub refused: u8,
 }
 
 /// The logic of one session: bytes in, bytes and effects out.
 ///
 /// It never touches a socket or a clock. The runtime calls it with whatever
-/// it read from either connection and then carries out the [`Output`].
+/// it read from either connection, and with a [`Report`] when something
+/// else happened, and then carries out the [`Output`].
+///
+/// A session starts with the client connection only. It asks for the
+/// connection to the database with [`Effect::ConnectBackend`], when it
+/// knows that the client is going to log in.
+///
+/// [`Effect::ConnectBackend`]: crate::session::Effect::ConnectBackend
 pub trait ProtocolSession: Send {
     /// Takes bytes that arrived from one side.
     ///
@@ -46,8 +93,11 @@ pub trait ProtocolSession: Send {
     ///
     /// # Errors
     ///
-    /// Returns an error when the session cannot go on. The runtime then
-    /// applies the configured failure policy.
+    /// Returns an error when the session must end. The session has applied
+    /// the failure policy of `policy` by then: where the policy lets a
+    /// session go on without inspection, the session does so and returns
+    /// `Ok`. The runtime sends what `out` holds and closes both
+    /// connections.
     fn on_bytes(
         &mut self,
         from: Direction,
@@ -55,6 +105,27 @@ pub trait ProtocolSession: Send {
         policy: &PolicySnapshot,
         out: &mut Output,
     ) -> Result<(), SessionError>;
+
+    /// Takes a report from the runtime: the outcome of something the
+    /// session asked for with an effect, or news such as the proxy shutting
+    /// down. Everything the step produces is appended to `out`.
+    ///
+    /// The default does nothing, which suits a session that never asks for
+    /// anything a report answers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session must end, as
+    /// [`ProtocolSession::on_bytes`] does.
+    fn on_report(
+        &mut self,
+        report: Report,
+        policy: &PolicySnapshot,
+        out: &mut Output,
+    ) -> Result<(), SessionError> {
+        let _ = (report, policy, out);
+        Ok(())
+    }
 }
 
 /// A session could not go on.
@@ -186,6 +257,25 @@ mod tests {
         ));
         assert_eq!(out.effects.get(1), Some(&Effect::Close(Leg::Client)));
         assert_eq!(out.effects.get(2), Some(&Effect::Close(Leg::Backend)));
+    }
+
+    #[test]
+    fn a_module_needs_no_tls_conventions_and_a_session_may_ignore_reports() {
+        assert_eq!(Echo.alpn_protocol(), None);
+        assert_eq!(Echo.backend_tls_request(), None);
+
+        let policy = PolicySnapshot::builder().build().unwrap();
+        let mut session = Echo.start_session(origin(), Arc::new(Relay));
+        let mut out = Output::new();
+        for report in [
+            Report::ClientTlsEstablished,
+            Report::BackendConnected { tls: true },
+            Report::BackendUnavailable,
+            Report::ShuttingDown,
+        ] {
+            session.on_report(report, &policy, &mut out).unwrap();
+        }
+        assert!(out.is_empty());
     }
 
     #[test]
