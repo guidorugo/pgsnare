@@ -1,7 +1,7 @@
 # pgsnare: high-level design
 
 > [!NOTE]
-> Status: draft. This document describes the intended design of the first version. Nothing in it is implemented yet, and details may change as the implementation proves or disproves them.
+> Status: draft. This document describes the intended design of the first version. Only part of it is implemented so far, and the [README](../README.md#status-and-roadmap) says which. Details may change as the implementation proves or disproves them.
 
 ## Contents
 
@@ -215,6 +215,8 @@ sequenceDiagram
 
 **Unknown messages** are framed generically, scanned and passed through. A startup phase that cannot be parsed ends the connection.
 
+**Stricter than the server in two places.** pgsnare rejects a startup packet whose last byte is not zero, and an `SSLRequest` or `GSSENCRequest` that is not exactly eight bytes long. PostgreSQL accepts both. A client that follows the protocol documentation sends neither, and refusing the connection is the safe way to fail.
+
 **Limits.** Every size or count taken from the network is bounded: the startup packet (10 kB, PostgreSQL's own limit), frames held in memory, connections per listener, and the time allowed before login.
 
 ## 7. Authentication and TLS
@@ -250,6 +252,7 @@ Not supported in the first version: login with client certificates, GSSAPI encry
 - A token is one or more values with an id, an optional scope hint used only for reporting, and its response.
 - Values must be ASCII and at least 12 bytes. Matching then does not depend on the client's character encoding, and accidental matches are implausible.
 - Each value compiles to a small set of byte patterns: the raw value, its lowercase hex form (how `bytea` is printed in text format) and, if requested, a case-insensitive variant.
+- A token list in which data matching one value would also match another is rejected. That covers a value used twice and a value that contains a pattern of another. Every match then belongs to exactly one token.
 - All patterns are matched in one pass with the Aho-Corasick algorithm.
 
 ### 8.2 What is scanned
@@ -336,7 +339,9 @@ How they are built:
 - **Secrets** such as webhook signing keys come from environment variables or files, never from the configuration body.
 - **File permissions.** pgsnare refuses to start if a private key, token file or configuration file is open to other users, unless explicitly overridden. The rule is PostgreSQL's own: a file owned by the process user must not be readable by group or others, and a root-owned file may be group-readable.
 
-The sketch below is illustrative. The exact schema is not final.
+The format is strict: an unknown field is an error, at least one sink is required, and a webhook sink must name its signing key.
+
+The sketch below shows the shape. The complete reference is [`examples/config/pgsnare.yaml`](../examples/config/pgsnare.yaml), which lists every setting with its default and is loaded by the tests.
 
 ```yaml
 listeners:

@@ -3,8 +3,8 @@
 A PostgreSQL proxy that catches data theft with honeytokens.
 
 > [!IMPORTANT]
-> pgsnare is in its design phase. No code has been released yet, and nothing here is ready for use.
-> The design is described in [docs/high-level-design.md](docs/high-level-design.md).
+> pgsnare is under construction. It cannot relay traffic yet, no version has been released, and nothing here is ready for use.
+> [Status and roadmap](#status-and-roadmap) shows what exists today. The design is described in [docs/high-level-design.md](docs/high-level-design.md).
 
 ## What it is
 
@@ -86,18 +86,56 @@ Container images and the Helm chart will be published to the GitHub Container Re
 
 ## Security
 
-- To report a vulnerability, use [GitHub's private vulnerability reporting](https://github.com/guidorugo/pgsnare/security/advisories/new). Please do not open a public issue for a security problem.
+- To report a vulnerability, use [GitHub's private vulnerability reporting](https://github.com/guidorugo/pgsnare/security/advisories/new). Please do not open a public issue for a security problem. [SECURITY.md](SECURITY.md) has the details.
 - The threat model and the security requirements every part of pgsnare must meet are in [Security design](docs/high-level-design.md#15-security-design).
 
-## Roadmap
+## Status and roadmap
 
-Nothing below has been built yet.
+pgsnare cannot be used yet. The groundwork is in place:
 
-1. **Relay.** A proxy that real clients cannot tell from the database.
-2. **Detect and alert.** Honeytokens, events and sinks. The first usable version.
-3. **Respond.** Kill, tarpit, fake data and exemptions.
-4. **SQL rules.** Optional checks on the statements themselves.
-5. **Prove and ship.** Detection corpus, fuzzing, benchmarks, container image, Helm chart and documentation.
+- **Wire protocol.** Framing, message views and encoders for protocol 3.0 and 3.2, tested against traffic captured from PostgreSQL 15 to 18.
+- **Honeytoken matcher.** It finds token values in a stream of bytes, however the stream is split.
+- **Configuration and events.** The configuration format, with a [complete example](examples/config/pgsnare.yaml), and the event format.
+- **Toolchain.** Builds run in containers with pinned versions. Every change is checked for formatting and lints, tests, fuzz targets, dependency advisories and licences, secrets, and private network addresses.
+
+The steps to the first release:
+
+| Step | What it delivers | State |
+|---|---|---|
+| 1. Relay | A proxy that real clients cannot tell from the database | In progress |
+| 2. Detect and alert | Honeytokens, events and sinks. The first usable version | Not started |
+| 3. Respond | Kill, tarpit, fake data and exemptions | Not started |
+| 4. SQL rules | Optional checks on the statements themselves | Not started |
+| 5. Prove and ship | Detection corpus, fuzzing, benchmarks, container image, Helm chart and documentation | Not started |
+
+Progress is tracked in [the pgsnare epic](https://github.com/guidorugo/pgsnare/issues/2).
+
+## Building and testing
+
+You need Docker with the Compose plugin, and `make`. Every build and test runs in containers with a pinned toolchain, so nothing else has to be installed.
+
+| Command | What it does |
+|---|---|
+| `make build` | Builds the workspace |
+| `make test` | Runs the tests of every crate, with and without the optional SQL rules |
+| `make lint` | Checks formatting, runs Clippy with warnings denied, and builds the API documentation |
+| `make itest` | Runs the integration tests against PostgreSQL 15 to 18 |
+| `make fuzz` | Runs every fuzz target for a short time |
+| `make deny` | Checks the advisories, licences and sources of every dependency |
+| `make scan` | Scans for secrets and private network addresses |
+
+CI runs the last six on every pull request, and all of them must pass before it can be merged.
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `crates/pgsnare-proto` | The PostgreSQL wire format: framing, message views and encoders. No I/O. |
+| `crates/pgsnare-core` | Session logic, detection, policy, actions and the event format. No I/O. |
+| `crates/pgsnare` | The runtime and the `pgsnare` command: listeners, TLS, configuration and sinks. |
+| `examples/config` | A complete configuration file, with every setting explained. |
+| `tests` | Integration tests, built to compare what a client sees from PostgreSQL directly and through pgsnare. |
+| `docs` | The design. |
 
 ## License
 
