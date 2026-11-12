@@ -21,13 +21,18 @@ use proptest::sample::{Index, select};
 // ---------------------------------------------------------------------------
 
 /// The characters generated values are made of. There are few of them, in
-/// both letter cases, and `1` and `6` also occur in the hex forms of the
-/// letters. Values therefore share parts, repeat, and nearly match each
+/// both letter cases, so values share parts, repeat, and nearly match each
 /// other all the time.
-const ALPHABET: &[u8] = b"aAbB16";
+///
+/// The hex forms of these characters are `61`, `41`, `62`, `42`, `31`, `36`,
+/// `6a` and `4a`. They are made of `1`, `6` and `a`, which are in the
+/// alphabet themselves, so a value can turn up inside the hex form of
+/// another. And `j` and `J` put a letter into the hex forms, so that the
+/// letter case of hex digits matters.
+const ALPHABET: &[u8] = b"aAbB16jJ";
 
 /// Parts that many generated values have in common.
-const STEMS: &[&[u8]] = &[b"aAbB16aA", b"1616aAaA", b"BbBbAa61"];
+const STEMS: &[&[u8]] = &[b"aAbB16jJ", b"1616aAjJ", b"BbJjAa61"];
 
 #[derive(Debug, Clone)]
 struct TokenDef {
