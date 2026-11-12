@@ -272,8 +272,7 @@ mod tests {
     #[test]
     fn a_command_that_is_not_built_yet_fails() {
         for arguments in [
-            &["pgsnare", "run", "-c", "pgsnare.yaml"][..],
-            &["pgsnare", "config", "check", "-c", "pgsnare.yaml"],
+            &["pgsnare", "config", "check", "-c", "pgsnare.yaml"][..],
             &["pgsnare", "token", "generate", "--kind", "email"],
             &["pgsnare", "token", "list", "-c", "pgsnare.yaml"],
             &["pgsnare", "token", "test", "-c", "pgsnare.yaml"],
