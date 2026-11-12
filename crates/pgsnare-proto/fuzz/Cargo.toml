@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Fuzz targets for pgsnare-proto, run with cargo-fuzz. This package is not a
+# member of the workspace: it needs a nightly toolchain and has its own lock
+# file.
+
+[package]
+name = "pgsnare-proto-fuzz"
+description = "Fuzz targets for pgsnare-proto."
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Keeps this package out of any workspace above it.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pgsnare-proto = { path = ".." }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# Fuzz builds keep integer overflow checks and debug assertions on.
+[profile.release]
+debug = 1
+overflow-checks = true
+debug-assertions = true
+
+[[bin]]
+name = "framer_client"
+path = "fuzz_targets/framer_client.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "framer_server"
+path = "fuzz_targets/framer_server.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "startup"
+path = "fuzz_targets/startup.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frontend_views"
+path = "fuzz_targets/frontend_views.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "backend_views"
+path = "fuzz_targets/backend_views.rs"
+test = false
+doc = false
+bench = false
