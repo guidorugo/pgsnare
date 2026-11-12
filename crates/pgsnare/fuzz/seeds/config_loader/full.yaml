@@ -1,0 +1,82 @@
+listeners:
+  - name: main
+    listen: 0.0.0.0:5432
+    upstream: db.example.com:5432
+    client_tls:
+      mode: require
+      cert: /etc/pgsnare/server.crt
+      key: /etc/pgsnare/server.key
+      min_version: tls1.2
+    upstream_tls:
+      mode: verify-full
+      ca: /etc/pgsnare/root.crt
+      server_name: db.example.com
+      min_version: tls1.2
+    max_connections: 1000
+    login_timeout: 60s
+  - name: local
+    listen: 127.0.0.1:6432
+    upstream: unix:/var/run/postgresql/.s.PGSQL.5432
+    client_tls: { mode: disable }
+    upstream_tls: { mode: disable }
+inspection:
+  on_error: fail_closed
+  max_buffered_frame: 1MiB
+token_files:
+  - tokens/*.yaml
+tokens:
+  - id: users-admin-backup
+    values: ["svc.backup.8f3k2q@mail.example"]
+    case_insensitive: false
+    scope: { database: app, table: public.users, column: email }
+    actions: [alert, kill]
+    escalate: { after_hits: 3, to: [kill] }
+exemptions:
+  - { db_user: backup, client_cidr: 192.0.2.5/32 }
+  - { db_user: replicator }
+rules:
+  on_parse_failure: alert
+  max_parse_bytes: 1MiB
+  catalog_enumeration: { actions: [alert], exclude_users: [migrator] }
+  unbounded_read: { tables: [public.users], actions: [alert] }
+  row_threshold: { tables: [public.users], max_rows: 1000, actions: [alert, tarpit] }
+  functions: { names: [pg_read_file, pg_read_binary_file, lo_export, pg_sleep], actions: [alert] }
+actions:
+  kill:
+    sqlstate: "57P01"
+    message: terminating connection due to administrator command
+  tarpit:
+    delay: 2s-30s
+    max_duration: 10m
+    max_sessions: 50
+    max_bytes_per_second: 1KiB
+  fake_data:
+    rows: 500
+events:
+  query_redaction: fingerprint
+  dedup_window: 60s
+  queue_size: 1024
+  labels: { environment: production }
+  labels_from_env: [POD_NAME, POD_NAMESPACE]
+  sinks:
+    - type: webhook
+      url: https://alerts.example.com/hooks/pgsnare
+      hmac_secret_env: PGSNARE_WEBHOOK_SECRET
+      allow_insecure_http: false
+      timeout: 5s
+      max_retries: 5
+      queue_size: 1024
+      max_events_per_second: 20
+    - type: stdout
+    - type: file
+      path: /var/log/pgsnare/events.jsonl
+    - type: syslog
+      address: syslog.example.com:514
+      transport: udp
+      facility: local0
+admin:
+  listen: 127.0.0.1:9641
+metrics:
+  listen: 127.0.0.1:9642
+shutdown:
+  grace_period: 25s

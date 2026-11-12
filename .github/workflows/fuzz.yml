@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# A short run of every fuzz target of every crate. Long runs are separate.
+
+name: fuzz
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/dev-image
+      - run: make fuzz
+        env:
+          FUZZ_SECONDS: "30"
+      - name: Keep the crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-artifacts
+          path: crates/*/fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 14

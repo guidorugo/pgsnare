@@ -18,6 +18,8 @@ rules = []
 
 [dependencies]
 aho-corasick.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+serde_json.workspace = true

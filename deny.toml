@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Supply-chain policy, checked by cargo-deny: `make deny`.
+#
+# A new dependency must be needed, come from crates.io and carry a permissive
+# licence. Anything that needs an exception gets one here, with the reason.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# Every advisory is an error: vulnerabilities, unsound code, and crates that
+# are no longer maintained, anywhere in the dependency tree. An exception is
+# listed here with the reason it does not apply.
+unmaintained = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# MIT, Apache-2.0, BSD, ISC, Zlib, Unicode and PostgreSQL. Nothing else.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "PostgreSQL",
+]
+confidence-threshold = 0.93
+# The list above is the policy, not an inventory of what is in use today.
+unused-allowed-license = "allow"
+# The exception below applies to the fuzz crates only, so the check of the
+# workspace does not meet it.
+unused-license-exception = "allow"
+
+# libfuzzer-sys bundles libFuzzer, which carries the University of
+# Illinois/NCSA licence, a permissive licence in the style of MIT and BSD.
+# The crate is linked into fuzz targets only, never into pgsnare itself.
+[[licenses.exceptions]]
+crate = "libfuzzer-sys"
+allow = ["NCSA"]
+
+[bans]
+multiple-versions = "warn"
+# A dependency must state a version. Path dependencies between the crates of
+# this repository are the exception.
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+    # TLS is rustls. A stray feature flag must not link OpenSSL.
+    { crate = "openssl", reason = "pgsnare uses rustls" },
+    { crate = "openssl-sys", reason = "pgsnare uses rustls" },
+    { crate = "native-tls", reason = "pgsnare uses rustls" },
+    # Extensions are compiled in. Nothing is loaded at run time.
+    { crate = "libloading", reason = "pgsnare loads no code at run time" },
+    { crate = "dlopen2", reason = "pgsnare loads no code at run time" },
+]
+
+[sources]
+# crates.io is the only source.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -1,0 +1,26 @@
+listeners:
+  - name: Zq7honeytokenValue9xK
+    listen: Zq7honeytokenValue9xK
+    upstream: Zq7honeytokenValue9xK:5432
+    client_tls: { mode: Zq7honeytokenValue9xK }
+    upstream_tls: { mode: verify-full, server_name: "Zq7honeytokenValue9xK!" }
+    max_connections: Zq7honeytokenValue9xK
+    login_timeout: Zq7honeytokenValue9xK
+inspection: { on_error: Zq7honeytokenValue9xK, max_buffered_frame: Zq7honeytokenValue9xK }
+tokens:
+  - id: t
+    values: ["Zq7honeytokenValue9xK", "Zq7honeytokenValue9xK"]
+    actions: [Zq7honeytokenValue9xK]
+exemptions:
+  - { db_user: Zq7honeytokenValue9xK, client_cidr: Zq7honeytokenValue9xK }
+actions:
+  kill: { sqlstate: Zq7honeytokenValue9xK, message: "Zq7honeytokenValue9xK\n" }
+  tarpit: { delay: Zq7honeytokenValue9xK }
+events:
+  query_redaction: Zq7honeytokenValue9xK
+  labels: { Zq7honeytokenValue9xK: "" }
+  labels_from_env: ["Zq7honeytokenValue9xK-"]
+  sinks:
+    - { type: webhook, url: "https://Zq7honeytokenValue9xK@alerts.example.com/", hmac_secret_env: KEY }
+    - { type: Zq7honeytokenValue9xK }
+admin: { listen: Zq7honeytokenValue9xK }

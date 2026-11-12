@@ -1,0 +1,7 @@
+tokens:
+  - id: users-admin-backup
+    values: ["Zq7honeytokenValue9xK", "Zq7honeytokenValue9xK-second"]
+    case_insensitive: true
+    scope: { database: app, table: public.users, column: email }
+    actions: [alert, kill]
+    escalate: { after_hits: 3, to: [kill] }

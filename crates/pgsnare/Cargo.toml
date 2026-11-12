@@ -10,3 +10,17 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+default = ["rules"]
+# Optional SQL rules. A build without this feature contains no C code.
+rules = ["pgsnare-core/rules"]
+
+[dependencies]
+clap.workspace = true
+pgsnare-core.workspace = true
+serde.workspace = true
+serde-saphyr.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
