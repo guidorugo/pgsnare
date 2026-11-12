@@ -42,6 +42,8 @@ A scenario with a second connection names it `<scenario>.2`.
 
 In the two `crafted-` scenarios the client side was written by `capture/crafted_client.py`, because libpq cannot be made to send those messages. The server side is what a real server answered.
 
+The fuzz targets `framer_client`, `framer_server` and `startup` use `pg18-3.0` as their seed corpus, through links in `fuzz/seeds/`.
+
 ## What is not here
 
 - Sessions inside TLS. The recorder does not decrypt, so there is no captured `SCRAM-SHA-256-PLUS` offer.

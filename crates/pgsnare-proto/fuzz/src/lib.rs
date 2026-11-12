@@ -13,16 +13,19 @@
 //!
 //! # Running
 //!
-//! From this directory, inside the development image:
+//! From the root of the repository:
 //!
 //! ```sh
-//! cargo +"$PGSNARE_FUZZ_TOOLCHAIN" fuzz run framer_server -- -max_total_time=60
+//! make fuzz FUZZ_CRATE=pgsnare-proto FUZZ_SECONDS=60
 //! ```
 //!
 //! The targets are `framer_client`, `framer_server`, `startup`,
-//! `frontend_views` and `backend_views`. The captured streams under
-//! `../tests/fixtures/pg*/` are good seeds for the first three: name the
-//! corpus directory, then the seed directories, before the `--`.
+//! `frontend_views` and `backend_views`. `FUZZ_TARGET` selects one.
+//!
+//! The first three start from the traffic captured from PostgreSQL 18:
+//! their directories under `seeds/` are links to
+//! `../tests/fixtures/pg18-3.0`, so the seeds are the golden-byte fixtures
+//! themselves and cannot drift from them.
 
 use pgsnare_proto::backend::{self, Authentication};
 use pgsnare_proto::startup::{self, Classification, StartupPacket};
@@ -64,9 +67,17 @@ struct Outcome {
 /// The last three bytes of the input choose the limits and the size of the
 /// pieces the stream is delivered in. Everything before them is the stream,
 /// so a captured stream is a usable seed as it is.
+///
+/// A client stream may begin with its startup-phase packets, as a captured
+/// one does. They are not frames, and they are skipped the way a session
+/// reads them before it starts framing.
 pub fn fuzz_framer(direction: Direction, data: &[u8]) {
     let Some((stream, &[buffered, maximum, piece])) = data.split_last_chunk::<3>() else {
         return;
+    };
+    let stream = match direction {
+        Direction::FromClient => after_startup_phase(stream),
+        Direction::FromServer => stream,
     };
     let max_buffered = usize::from(buffered) * 4;
     let max_frame = if maximum == 0 {
@@ -88,6 +99,23 @@ pub fn fuzz_framer(direction: Direction, data: &[u8]) {
         at_once, in_pieces,
         "the result depends on how the stream was cut"
     );
+}
+
+/// The part of a client stream that follows its startup-phase packets: a
+/// request for encryption, if there is one, and the packet after it. A
+/// stream that does not begin with such packets is returned whole.
+fn after_startup_phase(stream: &[u8]) -> &[u8] {
+    let mut rest = stream;
+    while let Ok(Some(packet)) = StartupPacket::parse(rest) {
+        rest = &rest[packet.wire_len()..];
+        if !matches!(
+            packet,
+            StartupPacket::SslRequest | StartupPacket::GssEncRequest
+        ) {
+            break;
+        }
+    }
+    rest
 }
 
 /// Feeds `stream` to a framer in pieces of `piece_len` bytes, the way a
