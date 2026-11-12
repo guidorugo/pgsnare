@@ -79,11 +79,18 @@ pub fn fuzz_framer(direction: Direction, data: &[u8]) {
         Direction::FromClient => after_startup_phase(stream),
         Direction::FromServer => stream,
     };
-    let max_buffered = usize::from(buffered) * 4;
+    // Zero stands for a generous limit. A captured stream ends in bytes
+    // that are mostly zero, so as a seed it is framed whole and its
+    // messages reach the views.
+    let max_buffered = if buffered == 0 {
+        1 << 20
+    } else {
+        usize::from(buffered) * 4
+    };
     let max_frame = if maximum == 0 {
         usize::MAX
     } else {
-        usize::from(maximum) * 64
+        usize::from(maximum) * 1024
     };
     let limits = Limits::new(max_buffered, max_frame);
 
