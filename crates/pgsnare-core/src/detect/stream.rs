@@ -465,6 +465,39 @@ mod tests {
     }
 
     #[test]
+    fn offsets_stop_at_the_largest_number_instead_of_overflowing() {
+        let matcher = matcher();
+        let mut scanner = matcher.stream();
+        // As if almost 2^64 bytes had gone by.
+        scanner.position = u64::MAX - 10;
+
+        let found = scanner
+            .feed(EMAIL.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("the scan succeeds");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].start(), u64::MAX - 10);
+        assert_eq!(found[0].end(), u64::MAX);
+        assert_eq!(scanner.position(), u64::MAX);
+
+        // The count is stuck now, but values are still found, whole and
+        // split across chunks.
+        let (head, tail) = EMAIL.as_bytes().split_at(13);
+        let chunks: [&[u8]; 4] = [EMAIL.as_bytes(), b" ", head, tail];
+        let mut later = 0;
+        for chunk in chunks {
+            for found in scanner.feed(chunk) {
+                let found = found.expect("the scan succeeds");
+                assert_eq!(found.token_id().as_str(), "users-admin-backup");
+                assert_eq!(found.end(), u64::MAX);
+                later += 1;
+            }
+        }
+        assert_eq!(later, 2);
+        assert_eq!(scanner.position(), u64::MAX);
+    }
+
+    #[test]
     fn reset_starts_a_new_stream() {
         let matcher = matcher();
         let mut scanner = matcher.stream();
