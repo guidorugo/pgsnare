@@ -143,6 +143,39 @@ fn the_value_is_printed_nowhere() {
 }
 
 #[test]
+fn a_terminal_is_refused() {
+    use rustix::pty::{OpenptFlags, grantpt, ioctl_tiocgptpeer, openpt, unlockpt};
+
+    let fixture = Fixture::new();
+    let config = configuration(&fixture);
+
+    // A terminal that nobody sits at: the two ends of a pseudo-terminal.
+    // The command gets the end a shell would give it as standard input.
+    let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY;
+    let controller = openpt(flags).expect("a pseudo-terminal can be opened");
+    grantpt(&controller).unwrap();
+    unlockpt(&controller).unwrap();
+    let terminal = ioctl_tiocgptpeer(&controller, flags).unwrap();
+
+    // What somebody would type: a value of a token, Enter, and the end of
+    // the input. A command that read its terminal would answer with a
+    // match, so this test fails then, and does not wait for ever.
+    let mut keyboard = std::fs::File::from(controller);
+    keyboard
+        .write_all(b"svc.backup.aaaaaaaaaaaa\n\x04")
+        .unwrap();
+
+    let mut command = expected::pgsnare(&["token", "test", "--config", &config]);
+    command.stdin(Stdio::from(terminal));
+    let run = expected::run_command(command);
+
+    // No value is read from it, and so none is shown on it.
+    assert_eq!(run.status, 1);
+    assert_eq!(run.stdout, "");
+    expected::check("token-test-terminal.txt", &run.stderr);
+}
+
+#[test]
 fn without_a_value_no_test_is_made() {
     let fixture = Fixture::new();
     let config = configuration(&fixture);
