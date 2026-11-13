@@ -13,7 +13,8 @@ workspace = true
 
 [features]
 default = ["rules"]
-# Optional SQL rules. A build without this feature contains no C code.
+# Optional SQL rules. A build without this feature does not contain the SQL
+# parser, which is C code.
 rules = ["pgsnare-core/rules"]
 
 [dependencies]

@@ -355,7 +355,7 @@ Rules are optional. They flag suspicious statements before any data is read:
 How they are built:
 
 - Statements are parsed with the PostgreSQL 18 grammar through the `pg_query` library, which embeds PostgreSQL's own parser.
-- The parser is the only C code that receives attacker-controlled input, so it is isolated. It sits behind a build feature, runs on a dedicated thread pool, has an input size cap, and is never on the detection path. A build without the feature contains no C code.
+- The parser is C code that receives attacker-controlled input, so it is isolated. It sits behind a build feature, runs on a dedicated thread pool, has an input size cap, and is never on the detection path. A build without the feature does not contain the parser.
 - A statement that fails to parse follows a configured policy: allow, alert or block. It is never silently ignored.
 - Verdicts are cached by a hash of the statement text.
 
@@ -567,6 +567,7 @@ An attacker with root on the pgsnare host is out of scope.
 - `unsafe` code is forbidden in all pgsnare crates.
 - In the protocol and core crates, lints deny `unwrap`, `expect`, `panic!`, slice indexing and unchecked arithmetic outside tests. Integer overflow checks stay on in release builds.
 - Every parser has a fuzz target. A fuzz crash blocks release.
+- Not everything in a build is Rust. The TLS protocol is handled by `rustls`, which is Rust, but its cryptographic primitives come from `aws-lc-rs`, a library in C and assembly that is part of every build. The optional SQL parser is C and is isolated as [section 10](#10-sql-rules) describes. Like most Rust programs, pgsnare also calls the C library of the system.
 
 ### 15.5 Supply chain
 
