@@ -14,8 +14,10 @@
 //! - **No resumption.** Every connection runs a full handshake, as it does
 //!   against PostgreSQL itself.
 //! - **The protocol's ALPN name is offered and accepted.** A client that
-//!   names other protocols and not this one is refused, as PostgreSQL
-//!   refuses it.
+//!   names other protocols and not this one is refused, as PostgreSQL 17
+//!   and 18 refuse it. PostgreSQL 15 and 16 ignore the extension and
+//!   accept such a client, so in front of them pgsnare is the stricter of
+//!   the two.
 //!
 //! # The backend leg
 //!

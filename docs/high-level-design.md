@@ -226,11 +226,11 @@ sequenceDiagram
 
 - On the client leg, bytes that arrive together with an `SSLRequest` end the connection before anything is answered.
 - On the backend leg, pgsnare reads exactly one byte in answer to its own `SSLRequest`. Whatever follows that byte is read by the handshake, so it can never be taken for a message from the database.
-- A client that names other ALPN protocols and not `postgresql` is refused. With TLS 1.2 it receives the alert the server sends. With TLS 1.3 its connection is closed in the middle of the handshake, without the alert.
+- A client that names other ALPN protocols and not `postgresql` is refused, after an `SSLRequest` as well as with direct TLS, and whatever the version of the database. PostgreSQL 17 and 18 refuse such a client too, with the alert `no_application_protocol`. PostgreSQL 15 and 16 ignore the ALPN extension and accept it. From pgsnare, the client receives the same alert with TLS 1.2. With TLS 1.3 its connection is closed in the middle of the handshake, without the alert.
 
 **Unknown messages** are framed generically, scanned and passed through. A startup phase that cannot be parsed ends the connection. So does a login that cannot be followed: the failure policy applies only once the database has accepted the login (see [section 15.2](#152-secure-defaults)).
 
-**Stricter than the server in two places.** pgsnare rejects a startup packet whose last byte is not zero, and an `SSLRequest` or `GSSENCRequest` that is not exactly eight bytes long. PostgreSQL accepts both. A client that follows the protocol documentation sends neither, and refusing the connection is the safe way to fail.
+**Stricter than the server in three places.** pgsnare rejects a startup packet whose last byte is not zero, and an `SSLRequest` or `GSSENCRequest` that is not exactly eight bytes long. PostgreSQL accepts both. In front of PostgreSQL 15 or 16, pgsnare also refuses the TLS client that names ALPN protocols and not `postgresql`, which those two versions accept. A client that follows the protocol documentation sends none of the three, and refusing the connection is the safe way to fail.
 
 **Limits.** Every size or count taken from the network is bounded: the startup packet (10 kB, PostgreSQL's own limit), a message before the database has accepted the login (65,535 bytes, PostgreSQL's own limit for a client that has not logged in), frames held in memory, connections per listener, and the time allowed before login. A frame above the size that is held is passed on in chunks as it arrives (see [section 8.3](#83-buffering-and-streaming)), so the memory a session needs does not depend on the size of a message.
 
