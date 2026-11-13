@@ -17,6 +17,8 @@
 //! |---|---|
 //! | [`WebhookSink`] | Posts it to an HTTP endpoint, as a signed request: see [`webhook`] for the signature and what a receiver does with it |
 //! | [`StdoutSink`] | Writes it to standard output as one line of JSON |
+//! | [`FileSink`] | Appends it to a file as one line of JSON: see [`mod@file`] for how the file is opened and what happens when it is rotated |
+//! | [`SyslogSink`] | Sends it to a syslog server as one message of RFC 5424: see [`syslog`] for the message |
 //!
 //! Each implements [`EventSink`], the public interface for sinks, and
 //! makes one attempt to deliver one event. Queueing, the rate limit, the
@@ -45,14 +47,18 @@ use crate::redact::RedactorBuilder;
 
 mod dedup;
 pub(crate) mod dispatcher;
+pub mod file;
 mod lines;
 mod pace;
 mod secret;
 mod stdout;
+pub mod syslog;
 pub mod webhook;
 
+pub use file::{FileError, FileSink};
 pub use secret::MAX_SECRET_BYTES;
 pub use stdout::StdoutSink;
+pub use syslog::SyslogSink;
 pub use webhook::{
     EVENT_ID_HEADER, RECOMMENDED_KEY_BYTES, SIGNATURE_HEADER, SIGNATURE_PREFIX, TIMESTAMP_HEADER,
     Trust, WebhookError, WebhookSettings, WebhookSink,
@@ -227,7 +233,16 @@ pub fn from_config(
                 Arc::new(sink)
             }
             config::Sink::Stdout(_) => Arc::new(StdoutSink::new(name)),
-            _ => return Err(failed("this kind of sink is not built yet".to_owned())),
+            config::Sink::File(file) => Arc::new(
+                FileSink::new(name, &file.path)
+                    .map_err(|error| failed(format!("{}: {error}", file.path.display())))?,
+            ),
+            config::Sink::Syslog(syslog) => Arc::new(SyslogSink::new(
+                name,
+                &syslog.address,
+                syslog.transport,
+                syslog.facility,
+            )),
         };
         sinks.push(Configured {
             sink: built,
@@ -489,18 +504,51 @@ mod tests {
     }
 
     #[test]
-    fn a_sink_that_is_not_built_yet_is_refused() {
+    fn every_kind_of_sink_of_a_configuration_is_built() {
+        let dir = TempDir::new();
+        let key = dir.file("key", KEY);
+        let events_file = dir.0.join("events.jsonl").display().to_string();
+        let (sinks, _) = from_config(
+            &events(&format!(
+                "    - type: webhook\n      url: {URL}\n      hmac_secret_file: {key}\n\
+                 \x20   - type: stdout\n\
+                 \x20   - type: file\n      path: {events_file}\n      queue_size: 4\n\
+                 \x20   - type: syslog\n      address: syslog.example.com:514\n      max_events_per_second: 50\n"
+            )),
+            Redactor::builder(),
+        )
+        .unwrap();
+        let names: Vec<&str> = sinks.iter().map(|built| built.sink.name()).collect();
+        assert_eq!(names, ["webhook-0", "stdout-1", "file-2", "syslog-3"]);
+        assert_eq!(sinks[2].options.queue_size, 4);
+        assert_eq!(sinks[3].options.max_events_per_second, Some(50));
+        // The sinks without a setting for it get the default number of
+        // retries.
+        assert_eq!(sinks[2].options.max_retries, DEFAULT_RETRIES);
+        assert_eq!(sinks[3].options.max_retries, DEFAULT_RETRIES);
+        // The file of the file sink is there once the sink is built.
+        assert!(dir.0.join("events.jsonl").is_file());
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_opened_keeps_its_sink_from_being_built() {
+        let dir = TempDir::new();
+        let missing = dir.0.join("no-such-directory").join("events.jsonl");
         let error = from_config(
-            &events(
-                "    - type: stdout\n    - type: syslog\n      address: syslog.example.com:514\n",
-            ),
+            &events(&format!(
+                "    - type: stdout\n    - type: file\n      path: {}\n",
+                missing.display()
+            )),
             Redactor::builder(),
         )
         .unwrap_err();
         assert_eq!(error.index(), 1);
         assert_eq!(
             error.to_string(),
-            "events.sinks[1] (syslog): this kind of sink is not built yet"
+            format!(
+                "events.sinks[1] (file): {}: the file cannot be opened: entity not found",
+                missing.display()
+            )
         );
     }
 }

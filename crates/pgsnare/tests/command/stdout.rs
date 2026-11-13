@@ -87,15 +87,17 @@ async fn an_event_of_a_session_is_one_line_of_json_on_standard_output() {
 }
 
 #[tokio::test]
-async fn a_sink_that_is_not_built_yet_keeps_the_proxy_from_starting() {
+async fn a_sink_that_cannot_be_built_keeps_the_proxy_from_starting() {
     let dir = TempDir::new();
+    let missing = dir.path("no-such-directory").join("events.jsonl");
     let config = dir.write(
         "pgsnare.yaml",
         format!(
             "listeners:\n  - name: main\n    listen: 127.0.0.1:{}\n    upstream: db.example.com:5432\n    \
              client_tls: {{ mode: disable }}\n    upstream_tls: {{ mode: disable }}\n\
-             events:\n  sinks:\n    - type: stdout\n    - type: syslog\n      address: syslog.example.com:514\n",
-            free_port()
+             events:\n  sinks:\n    - type: stdout\n    - type: file\n      path: {}\n",
+            free_port(),
+            missing.display()
         )
         .as_bytes(),
     );
@@ -104,7 +106,10 @@ async fn a_sink_that_is_not_built_yet_keeps_the_proxy_from_starting() {
     assert_eq!(status.code(), Some(1));
     let log = pgsnare.stderr.text();
     assert!(
-        log.contains("events.sinks[1] (syslog): this kind of sink is not built yet"),
+        log.contains(&format!(
+            "events.sinks[1] (file): {}: the file cannot be opened: entity not found",
+            missing.display()
+        )),
         "{log}"
     );
     assert!(pgsnare.stdout.bytes().is_empty());
