@@ -19,6 +19,7 @@ rules = ["pgsnare-core/rules"]
 
 [dependencies]
 clap.workspace = true
+getrandom.workspace = true
 pgsnare-core.workspace = true
 rustix.workspace = true
 rustls.workspace = true
