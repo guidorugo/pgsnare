@@ -100,7 +100,10 @@ pub struct ListenerSettings {
     pub upstream: Upstream,
     /// TLS between applications and pgsnare.
     pub client_tls: ClientLeg,
-    /// TLS between pgsnare and the database.
+    /// TLS between pgsnare and the database. A leg that must use TLS does
+    /// not go with a Unix socket as the upstream, because a connection
+    /// over a Unix socket is never encrypted: [`Runtime::bind`] refuses
+    /// the two together.
     pub backend_tls: BackendLeg,
     /// How many clients may be connected at once. Further clients are
     /// refused.
@@ -234,6 +237,11 @@ impl Runtime {
     ///
     /// Returns the error of the first listener whose address cannot be
     /// bound. No listener is left open then.
+    ///
+    /// A listener that must use TLS to a database it reaches over a Unix
+    /// socket is refused with an error of the kind
+    /// [`InvalidInput`](io::ErrorKind::InvalidInput), before any socket is
+    /// opened: it could not serve a single client.
     pub fn bind(self) -> io::Result<Bound> {
         let Self {
             proxy,
@@ -241,6 +249,18 @@ impl Runtime {
             settings,
             status,
         } = self;
+        if let Some(listener) = settings.listeners.iter().find(|listener| {
+            backend::requires_tls_over_unix_socket(&listener.upstream, &listener.backend_tls)
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "listener {}: {}",
+                    listener.name,
+                    backend::TLS_OVER_UNIX_SOCKET
+                ),
+            ));
+        }
         let events = Arc::new(Events::new(
             proxy.event_sinks().to_vec(),
             settings.labels,

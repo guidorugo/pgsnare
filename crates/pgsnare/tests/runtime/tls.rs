@@ -9,6 +9,7 @@
 //! extension, or present the wrong certificate.
 
 use std::io::Write;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::support::{
@@ -23,7 +24,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UnixListener};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 const ALPN: &[u8] = b"postgresql";
@@ -655,6 +656,72 @@ async fn an_answer_that_is_neither_yes_nor_no_stops_the_login() {
     .await;
     assert_eq!(refused_login(&database, "{ mode: prefer }").await, "57P03");
     assert_eq!(refused_login(&database, "{ mode: require }").await, "57P03");
+}
+
+#[tokio::test]
+async fn a_listener_that_must_use_tls_does_not_start_in_front_of_a_unix_socket() {
+    // A database behind a Unix socket, which counts the connections it gets.
+    let dir = TempDir::new();
+    let path = dir.0.join(".s.PGSQL.5432");
+    let socket = UnixListener::bind(&path).unwrap();
+    let connections = Arc::new(AtomicU32::new(0));
+    let counter = Arc::clone(&connections);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = socket.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let _ = serve_session(&mut stream).await;
+            });
+        }
+    });
+
+    // A configuration file cannot ask for TLS over a Unix socket. Code that
+    // puts the settings together by itself can: here, with the leg of a
+    // database that is reached over TCP.
+    let pki = Pki::new();
+    let elsewhere = Upstream::Tcp {
+        host: "db.example.com".to_owned(),
+        port: 5432,
+    };
+    let settings = |upstream_tls: &str| {
+        let (client, backend) = tls_legs("{ mode: disable }", &elsewhere, upstream_tls);
+        Running::listener(Upstream::Unix(path.clone())).with_tls(client, backend)
+    };
+    let events = Arc::new(support::Memory::default());
+    let bind = |listener: ListenerSettings| {
+        let module = Arc::new(pgsnare_core::session::postgres::Postgres::new());
+        pgsnare::runtime::Runtime::new(
+            support::proxy_of(module, &events),
+            Arc::new(pgsnare_core::policy::FixedPolicy::new(support::policy(
+                pgsnare_core::policy::OnError::FailClosed,
+                1024 * 1024,
+            ))),
+            pgsnare::runtime::Settings::new(vec![listener]),
+        )
+        .bind()
+    };
+
+    // TLS that must be used, with and without verification: the runtime
+    // does not start, and says which listener it is and why.
+    for upstream_tls in ["{ mode: require }".to_owned(), pki.verified()] {
+        let listener = settings(&upstream_tls);
+        assert_eq!(listener.backend_tls.usage(), BackendTlsUse::Always);
+        let refused = bind(listener).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            refused.to_string(),
+            "listener test: the settings require TLS to the database, and a connection over a \
+             Unix socket is never encrypted"
+        );
+    }
+    assert_eq!(connections.load(Ordering::SeqCst), 0);
+
+    // TLS that is used only where it is offered: the session goes on in
+    // plaintext, which is what that mode allows.
+    let proxy = Running::start(settings("{ mode: prefer }")).await;
+    let (_client, greeting) = proxy.log_in().await;
+    assert_eq!(greeting, welcome());
+    assert_eq!(connections.load(Ordering::SeqCst), 1);
 }
 
 // ---------------------------------------------------------------------------

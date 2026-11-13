@@ -14,6 +14,12 @@
 //! begins. Whatever arrives after it is read by the TLS library, as part of
 //! the handshake, so nothing that was sent in the clear can ever be taken
 //! for something the database said inside TLS.
+//!
+//! A connection over a Unix socket is never encrypted: the runtime has no
+//! TLS for it. A leg that must use TLS and a Unix socket therefore do not
+//! go together. `Runtime::bind` refuses a listener that asks for both, and
+//! `Connector::connect` refuses a second time, so that no path leads to a
+//! plaintext connection where the settings ask for an encrypted one.
 
 use std::fmt;
 use std::io;
@@ -38,7 +44,7 @@ pub enum Upstream {
         /// The port.
         port: u16,
     },
-    /// A Unix socket.
+    /// A Unix socket. A connection over it is never encrypted.
     Unix(PathBuf),
 }
 
@@ -95,11 +101,26 @@ pub(crate) struct Connected {
     pub(crate) tls: bool,
 }
 
+/// What is said of settings that require TLS to a database reached over a
+/// Unix socket.
+pub(crate) const TLS_OVER_UNIX_SOCKET: &str = "the settings require TLS to the database, and a connection over a Unix socket is never \
+     encrypted";
+
+/// Whether these settings ask for what the runtime cannot give: a
+/// connection that must be encrypted, over a Unix socket.
+pub(crate) fn requires_tls_over_unix_socket(upstream: &Upstream, tls: &BackendLeg) -> bool {
+    matches!(upstream, Upstream::Unix(_)) && tls.usage() == BackendTlsUse::Always
+}
+
 impl Connector {
     /// Opens a connection to the database, with TLS as configured.
     ///
     /// The caller bounds the time this may take.
     pub(crate) async fn connect(&self) -> Result<Connected, ConnectError> {
+        // Before anything is opened: see the module documentation.
+        if requires_tls_over_unix_socket(&self.upstream, &self.tls) {
+            return Err(ConnectError(TLS_OVER_UNIX_SOCKET));
+        }
         let (host, port) = match &self.upstream {
             Upstream::Unix(path) => {
                 let stream = UnixStream::connect(path)
@@ -304,5 +325,104 @@ pub(crate) fn io_reason(error: &io::Error) -> &'static str {
             "the host cannot be reached"
         }
         _ => "an input or output error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicU32;
+    use std::time::Duration;
+
+    use tokio::net::UnixListener;
+
+    use super::*;
+    use crate::config::Config;
+
+    /// A directory that is removed again when the test ends.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            static NEXT: AtomicU32 = AtomicU32::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "pgsnare-backend-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The backend leg a configuration gives for this mode. Its database is
+    /// reached over TCP: a configuration that asks for TLS over a Unix
+    /// socket is not accepted in the first place, so only code that puts
+    /// the settings together by itself can pair such a leg with a socket.
+    fn leg(mode: &str) -> BackendLeg {
+        let config = Config::from_yaml(&format!(
+            "listeners:\n  - name: test\n    listen: 127.0.0.1:5432\n    upstream: db.example.com:5432\n    \
+             client_tls: {{ mode: disable }}\n    upstream_tls: {{ mode: {mode} }}\nevents:\n  sinks:\n    \
+             - type: stdout\n"
+        ))
+        .unwrap();
+        let listener = &config.listeners[0];
+        BackendLeg::from_config(&listener.upstream_tls, &listener.upstream, None).unwrap()
+    }
+
+    fn connector(upstream: Upstream, tls: BackendLeg) -> Connector {
+        Connector {
+            upstream,
+            tls,
+            tls_request: None,
+            client_certificate: None,
+            mismatch_logged: AtomicBool::new(false),
+            listener: "test".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_unix_socket_is_not_used_where_tls_is_required() {
+        let dir = TempDir::new();
+        let path = dir.0.join("socket");
+        let socket = UnixListener::bind(&path).unwrap();
+        let upstream = || Upstream::Unix(path.clone());
+
+        // TLS that must be used: no connection, and not even an attempt.
+        let leg_that_must = leg("require");
+        assert_eq!(leg_that_must.usage(), BackendTlsUse::Always);
+        assert!(requires_tls_over_unix_socket(&upstream(), &leg_that_must));
+        let refused = connector(upstream(), leg_that_must).connect().await;
+        assert_eq!(refused.err(), Some(ConnectError(TLS_OVER_UNIX_SOCKET)));
+        let waited = tokio::time::timeout(Duration::from_millis(200), socket.accept()).await;
+        assert!(waited.is_err(), "nothing has connected to the socket");
+
+        // Where the mode allows plaintext, the socket is used, in plaintext.
+        for (mode, usage) in [
+            ("disable", BackendTlsUse::Never),
+            ("prefer", BackendTlsUse::IfOffered),
+        ] {
+            let leg_that_may = leg(mode);
+            assert_eq!(leg_that_may.usage(), usage);
+            assert!(!requires_tls_over_unix_socket(&upstream(), &leg_that_may));
+            let connected = connector(upstream(), leg_that_may).connect().await;
+            assert!(
+                matches!(connected, Ok(Connected { tls: false, .. })),
+                "{mode}"
+            );
+            socket.accept().await.unwrap();
+        }
+
+        // Over TCP, nothing is refused on these grounds.
+        let tcp = Upstream::Tcp {
+            host: "db.example.com".to_owned(),
+            port: 5432,
+        };
+        assert!(!requires_tls_over_unix_socket(&tcp, &leg("require")));
     }
 }
