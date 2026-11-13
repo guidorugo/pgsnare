@@ -25,11 +25,13 @@ pgsnare-core = { path = "crates/pgsnare-core", version = "0.0.0", default-featur
 pgsnare-proto = { path = "crates/pgsnare-proto", version = "0.0.0" }
 
 aho-corasick = "1.1.5"
+aws-lc-rs = { version = "1.19.0", default-features = false, features = ["aws-lc-sys"] }
 bytes = "1.12.1"
 clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+hyper = { version = "1.12.0", default-features = false, features = ["http1", "client", "server"] }
 proptest = "1.12.0"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
-rustix = { version = "1.1.6", default-features = false, features = ["std", "process"] }
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "process", "system"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 rustls-native-certs = "0.8.5"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -39,6 +41,7 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "io-util", "
 tokio-rustls = { version = "0.26.6", default-features = false }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt"] }
+zeroize = "1.9.1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

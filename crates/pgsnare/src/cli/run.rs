@@ -15,15 +15,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use pgsnare_core::event::{Event, Labels};
-use pgsnare_core::extension::{EventSink, Relay, SinkFuture};
+use pgsnare_core::event::Labels;
+use pgsnare_core::extension::Relay;
 use pgsnare_core::policy::FixedPolicy;
 use pgsnare_core::session::postgres::Postgres;
 use tokio::signal::unix::{SignalKind, signal};
 
 use crate::builder::{Proxy, ProxyBuilder};
 use crate::config::{self, Config, UpstreamTlsMode};
-use crate::runtime::{ListenerSettings, Runtime, Settings, Upstream, permissions};
+use crate::redact::{Redaction, Redactor};
+use crate::runtime::{ListenerSettings, Runtime, Settings, Stopped, Upstream, permissions};
+use crate::sinks;
 use crate::tls::{BackendLeg, ClientLeg};
 
 use super::{FAILURE, SUCCESS};
@@ -92,24 +94,29 @@ fn start(args: &Args) -> Result<(), String> {
     let policy = config.policy(1).map_err(|error| error.to_string())?;
     let module = Postgres::new();
     let listeners = listeners(&config, &module)?;
-    let proxy = ProxyBuilder::new()
+    let redaction = Redaction::new(redactor(&config)?);
+
+    let mut builder = ProxyBuilder::new()
         .protocol_module(Arc::new(module))
-        .login_strategy(Arc::new(Relay))
-        .event_sink(Arc::new(LogSink))
-        .build()
-        .map_err(|error| error.to_string())?;
+        .login_strategy(Arc::new(Relay));
+    for built in sinks::from_config(&config.events).map_err(|error| error.to_string())? {
+        builder = builder.event_sink_with(built.sink, built.options);
+    }
+    let proxy = builder.build().map_err(|error| error.to_string())?;
 
     tracing::warn!(
         tokens = config.tokens.len(),
         sinks = config.events.sinks.len(),
-        "this build relays traffic and detects nothing: honeytoken detection, responses and \
-         event sinks are not built yet, and events are written to this log only"
+        "this build relays traffic and detects nothing: honeytoken detection and responses \
+         are not built yet, so the only events are those of sessions that inspection gave up on"
     );
 
     let settings = Settings::new(listeners)
         .with_grace_period(config.shutdown.grace_period)
         .with_labels(labels(&config))
-        .with_event_capacity(usize::try_from(config.events.queue_size).unwrap_or(usize::MAX));
+        .with_event_capacity(usize::try_from(config.events.queue_size).unwrap_or(usize::MAX))
+        .with_dedup_window(config.events.dedup_window)
+        .with_redaction(redaction);
 
     let workers = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -151,8 +158,8 @@ async fn serve(proxy: Proxy, policy: Arc<FixedPolicy>, settings: Settings) -> Re
         .map_err(|error| format!("cannot open a listener: {}", error.kind()))?;
     bound.compare_certificates(CERTIFICATE_PROBE_TIMEOUT).await;
 
-    bound
-        .serve(async move {
+    let stopped = bound
+        .run(async move {
             loop {
                 tokio::select! {
                     _ = terminate.recv() => {
@@ -173,7 +180,30 @@ async fn serve(proxy: Proxy, policy: Arc<FixedPolicy>, settings: Settings) -> Re
             }
         })
         .await;
-    Ok(())
+    outcome(stopped)
+}
+
+/// What the command makes of the way the runtime stopped. A runtime that
+/// stopped without having been asked to is a failure: the exit status then
+/// tells whatever supervises the process to start it again.
+fn outcome(stopped: Stopped) -> Result<(), String> {
+    match stopped {
+        Stopped::Asked => Ok(()),
+        _ => Err("a listener stopped accepting clients while the proxy was running".to_owned()),
+    }
+}
+
+/// What must never be written anywhere: the values of the honeytokens.
+fn redactor(config: &Config) -> Result<Redactor, String> {
+    let mut builder = Redactor::builder();
+    for token in &config.tokens {
+        builder = builder.token(
+            token.id.as_str(),
+            token.values.iter().map(config::TokenValue::expose),
+            token.case_insensitive,
+        );
+    }
+    builder.build().map_err(|error| error.to_string())
 }
 
 /// Refuses to start when a file that holds secrets is open to other users,
@@ -304,30 +334,6 @@ fn labels(config: &Config) -> Labels {
     labels
 }
 
-/// Writes events to the log: what happened, in which session and to which
-/// client. The texts of an event that come from the network are left out.
-struct LogSink;
-
-impl EventSink for LogSink {
-    fn name(&self) -> &str {
-        "log"
-    }
-
-    fn deliver<'a>(&'a self, event: &'a Event) -> SinkFuture<'a> {
-        Box::pin(async move {
-            tracing::warn!(
-                kind = ?event.body.kind,
-                event_id = %event.event_id,
-                session_id = %event.body.session_id,
-                client = %event.body.client_ip,
-                client_port = event.body.client_port,
-                "event"
-            );
-            Ok(())
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +347,51 @@ mod tests {
         assert_eq!(run(&args), FAILURE);
         let error = start(&args).unwrap_err();
         assert!(error.contains("cannot read the file"), "{error}");
+    }
+
+    #[test]
+    fn a_runtime_that_stopped_by_itself_fails_the_command() {
+        assert_eq!(outcome(Stopped::Asked), Ok(()));
+        let error = outcome(Stopped::ListenerFailed).unwrap_err();
+        assert!(
+            error.contains("a listener stopped accepting clients"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_values_of_the_tokens_are_what_must_never_be_written() {
+        let config = Config::from_yaml(
+            "listeners:\n  - name: main\n    listen: 127.0.0.1:5432\n    upstream: db.example.com:5432\n    \
+             client_tls: { mode: disable }\n    upstream_tls: { mode: disable }\n\
+             tokens:\n  - id: users-admin-backup\n    values: [\"svc.backup.8f3k2q@mail.example\"]\n\
+             \x20 - id: billing-canary\n    values: [\"Canary.Invoice.000417\"]\n    case_insensitive: true\n\
+             events:\n  sinks:\n    - type: stdout\n",
+        )
+        .unwrap();
+        let built = redactor(&config).unwrap();
+        assert_eq!(
+            built.text("user svc.backup.8f3k2q@mail.example"),
+            "user [redacted]"
+        );
+        assert_eq!(built.text("CANARY.INVOICE.000417"), "[redacted]");
+
+        // A token list the matcher refuses keeps the proxy from starting,
+        // and the reason names no value.
+        let config = Config::from_yaml(
+            "listeners:\n  - name: main\n    listen: 127.0.0.1:5432\n    upstream: db.example.com:5432\n    \
+             client_tls: { mode: disable }\n    upstream_tls: { mode: disable }\n\
+             tokens:\n  - id: inner\n    values: [\"svc.backup.8f3k2q@mail.example\"]\n\
+             \x20 - id: outer\n    values: [\"x-svc.backup.8f3k2q@mail.example-x\"]\n\
+             events:\n  sinks:\n    - type: stdout\n",
+        )
+        .unwrap();
+        let error = redactor(&config).unwrap_err();
+        assert!(!error.contains("svc.backup"), "{error}");
+        assert!(
+            error.contains("outer") || error.contains("inner"),
+            "{error}"
+        );
     }
 
     #[test]

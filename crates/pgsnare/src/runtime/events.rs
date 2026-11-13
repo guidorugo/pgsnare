@@ -2,83 +2,78 @@
 
 //! Handing events over, without ever making traffic wait.
 //!
-//! The session logic raises an event as an `EventBody`. The runtime seals
-//! it with an identifier, the time and the labels of this instance, and
-//! hands it to every sink of the proxy.
+//! The session logic raises an event as an `EventBody`. The runtime notes
+//! the time and hands the event to the dispatcher of [`crate::sinks`],
+//! which does everything else: it removes what must not be shown, folds
+//! repeated hits, seals the event with an identifier and the labels of
+//! this instance, and delivers it to every sink of the proxy.
 //!
-//! A session never waits for that. Each delivery runs as a task of its
-//! own, and only so many may be under way at once. When that many are, a
-//! further event is dropped and counted.
-//!
-//! This is all there is: no queue per sink, no retry, no deduplication and
-//! no rate limit. Those belong to the dispatcher, which will take the place
-//! of this module between the sessions and the sinks.
+//! A session never waits for any of that. [`Events::submit`] puts the event
+//! into a queue of fixed length and returns. When the queue is full, the
+//! event is dropped and counted.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pgsnare_core::event::{EventBody, EventId, Labels, SessionId, Timestamp};
 use pgsnare_core::extension::EventSink;
-use tokio::sync::Semaphore;
+
+use crate::redact::Redaction;
+use crate::sinks::SinkOptions;
+use crate::sinks::dispatcher::{Dispatcher, DispatcherSettings};
 
 use super::status::Status;
 
 /// Where the sessions of a proxy hand their events.
 pub(crate) struct Events {
-    sinks: Vec<Arc<dyn EventSink>>,
-    labels: Labels,
-    /// One permit for each delivery that may be under way.
-    in_flight: Arc<Semaphore>,
+    dispatcher: Dispatcher,
     status: Arc<Status>,
 }
 
+/// What the events of a proxy need apart from its sinks.
+pub(crate) struct EventSettings {
+    /// How many events may wait for the dispatcher.
+    pub(crate) capacity: usize,
+    /// How long repeated hits are folded into one event.
+    pub(crate) dedup_window: Duration,
+    /// The labels every event carries.
+    pub(crate) labels: Labels,
+    /// What removes from an event what must not be shown.
+    pub(crate) redaction: Redaction,
+}
+
 impl Events {
+    /// Starts the dispatcher for these sinks. Must be called inside a
+    /// tokio runtime.
     pub(crate) fn new(
-        sinks: Vec<Arc<dyn EventSink>>,
-        labels: Labels,
-        capacity: usize,
+        sinks: Vec<(Arc<dyn EventSink>, SinkOptions)>,
+        settings: EventSettings,
         status: Arc<Status>,
     ) -> Self {
-        Self {
+        let dispatcher = Dispatcher::start(
+            DispatcherSettings {
+                queue_size: settings.capacity,
+                dedup_window: settings.dedup_window,
+                labels: settings.labels,
+                redaction: settings.redaction,
+                event_id: new_event_id,
+            },
             sinks,
-            labels,
-            in_flight: Arc::new(Semaphore::new(capacity.max(1))),
-            status,
-        }
+            Arc::clone(&status),
+        );
+        Self { dispatcher, status }
     }
 
     /// Takes an event from a session. Returns at once.
     pub(crate) fn submit(&self, body: Box<EventBody>) {
         self.status.event_emitted();
-        let event = Arc::new((*body).seal(
-            EventId::from_u128(random_u128()),
-            now(),
-            self.labels.clone(),
-        ));
-        for sink in &self.sinks {
-            let Ok(permit) = Arc::clone(&self.in_flight).try_acquire_owned() else {
-                self.status.event_dropped();
-                tracing::warn!(
-                    sink = sink.name(),
-                    "an event was dropped: too many are waiting to be delivered"
-                );
-                continue;
-            };
-            let sink = Arc::clone(sink);
-            let event = Arc::clone(&event);
-            let status = Arc::clone(&self.status);
-            tokio::spawn(async move {
-                let _permit = permit;
-                if let Err(error) = sink.deliver(&event).await {
-                    status.event_delivery_failed();
-                    tracing::warn!(
-                        sink = sink.name(),
-                        retryable = error.is_retryable(),
-                        "an event could not be delivered"
-                    );
-                }
-            });
-        }
+        self.dispatcher.submit(body, now());
+    }
+
+    /// Lets the events that wait be delivered, for up to `patience`, and
+    /// stops the dispatcher. What is left then is dropped and counted.
+    pub(crate) async fn close(&self, patience: Duration) {
+        self.dispatcher.stop(patience).await;
     }
 }
 
@@ -129,25 +124,26 @@ pub(crate) fn new_session_id() -> SessionId {
     SessionId::from_u128(random_u128())
 }
 
+/// An identifier for a new event.
+pub(crate) fn new_event_id() -> EventId {
+    EventId::from_u128(random_u128())
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Mutex;
-    use std::time::Duration;
 
     use pgsnare_core::event::{Event, EventKind};
-    use pgsnare_core::extension::{SinkError, SinkFuture};
+    use pgsnare_core::extension::SinkFuture;
     use pgsnare_core::session::SessionOrigin;
-    use tokio::sync::Notify;
 
     use super::*;
 
-    /// Keeps what it is given. It can be made to wait, and to fail.
+    /// Keeps what it is given.
     #[derive(Default)]
     struct Memory {
         delivered: Mutex<Vec<Event>>,
-        gate: Option<Arc<Notify>>,
-        fail: bool,
     }
 
     impl EventSink for Memory {
@@ -157,12 +153,6 @@ mod tests {
 
         fn deliver<'a>(&'a self, event: &'a Event) -> SinkFuture<'a> {
             Box::pin(async move {
-                if let Some(gate) = &self.gate {
-                    gate.notified().await;
-                }
-                if self.fail {
-                    return Err(SinkError::retryable("no"));
-                }
                 self.delivered.lock().unwrap().push(event.clone());
                 Ok(())
             })
@@ -179,29 +169,30 @@ mod tests {
         Box::new(EventBody::new(EventKind::InspectionBypassed, &origin))
     }
 
-    async fn settle() {
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
     #[tokio::test]
-    async fn an_event_is_sealed_and_reaches_every_sink() {
+    async fn an_event_is_stamped_sealed_and_reaches_every_sink() {
         let first = Arc::new(Memory::default());
         let second = Arc::new(Memory::default());
         let status = Arc::new(Status::new());
         let labels: Labels = [("pod".to_owned(), "pgsnare-0".to_owned())].into();
         let events = Events::new(
-            vec![first.clone(), second.clone()],
-            labels.clone(),
-            8,
+            vec![
+                (first.clone(), SinkOptions::default()),
+                (second.clone(), SinkOptions::default()),
+            ],
+            EventSettings {
+                capacity: 8,
+                dedup_window: Duration::from_secs(60),
+                labels: labels.clone(),
+                redaction: Redaction::default(),
+            },
             status.clone(),
         );
 
+        let before = now();
         events.submit(body());
         events.submit(body());
-        settle().await;
+        events.close(Duration::from_secs(10)).await;
 
         for sink in [&first, &second] {
             let delivered = sink.delivered.lock().unwrap();
@@ -209,7 +200,9 @@ mod tests {
             assert_eq!(delivered[0].body.kind, EventKind::InspectionBypassed);
             assert_eq!(delivered[0].labels, labels);
             assert_ne!(delivered[0].event_id, delivered[1].event_id);
-            assert!(delivered[0].timestamp > Timestamp::UNIX_EPOCH);
+            // The time is the one of the moment the session raised it.
+            assert!(delivered[0].timestamp >= before);
+            assert!(delivered[0].timestamp <= now());
         }
         // Both sinks got the same event.
         assert_eq!(
@@ -219,58 +212,19 @@ mod tests {
         let counters = status.counters();
         assert_eq!(counters.events_emitted, 2);
         assert_eq!(counters.events_dropped, 0);
-    }
+        assert_eq!(counters.event_queue_depth, 0);
 
-    #[tokio::test]
-    async fn a_slow_sink_never_holds_up_a_session_and_the_overflow_is_counted() {
-        let gate = Arc::new(Notify::new());
-        let sink = Arc::new(Memory {
-            gate: Some(gate.clone()),
-            ..Memory::default()
-        });
-        let status = Arc::new(Status::new());
-        let events = Events::new(vec![sink.clone()], Labels::new(), 2, status.clone());
-
-        // None of these calls waits, though no delivery can finish.
-        for _ in 0..5 {
-            events.submit(body());
-        }
-        settle().await;
-        assert_eq!(status.counters().events_emitted, 5);
-        assert_eq!(status.counters().events_dropped, 3);
-        assert!(sink.delivered.lock().unwrap().is_empty());
-
-        // The two that were taken are delivered once the sink moves again.
-        gate.notify_waiters();
-        settle().await;
-        assert_eq!(sink.delivered.lock().unwrap().len(), 2);
-
-        // And there is room again.
-        gate.notify_one();
+        // An event that is raised after the dispatcher has stopped is
+        // dropped and counted. The session that raised it does not wait.
         events.submit(body());
-        settle().await;
-        assert_eq!(sink.delivered.lock().unwrap().len(), 3);
-        assert_eq!(status.counters().events_dropped, 3);
-    }
-
-    #[tokio::test]
-    async fn a_failed_delivery_is_counted() {
-        let sink = Arc::new(Memory {
-            fail: true,
-            ..Memory::default()
-        });
-        let status = Arc::new(Status::new());
-        let events = Events::new(vec![sink], Labels::new(), 2, status.clone());
-        events.submit(body());
-        settle().await;
-        assert_eq!(status.counters().event_delivery_failures, 1);
+        assert_eq!(status.counters().events_emitted, 3);
+        assert_eq!(status.counters().events_dropped, 1);
     }
 
     #[test]
     fn identifiers_do_not_repeat() {
-        let a = new_session_id();
-        let b = new_session_id();
-        assert_ne!(a, b);
+        assert_ne!(new_session_id(), new_session_id());
+        assert_ne!(new_event_id(), new_event_id());
         assert_ne!(fallback_u128(), fallback_u128());
     }
 }

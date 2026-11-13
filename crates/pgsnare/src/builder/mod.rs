@@ -27,12 +27,16 @@ use std::sync::Arc;
 use pgsnare_core::extension::{EventSink, LoginStrategy, ProtocolModule, ProtocolSession};
 use pgsnare_core::session::SessionOrigin;
 
+use crate::sinks::SinkOptions;
+
 /// Collects the parts of a proxy.
 #[derive(Default)]
 pub struct ProxyBuilder {
     protocol_modules: Vec<Arc<dyn ProtocolModule>>,
     login_strategies: Vec<Arc<dyn LoginStrategy>>,
     event_sinks: Vec<Arc<dyn EventSink>>,
+    /// How the dispatcher treats each sink, in the order of `event_sinks`.
+    sink_options: Vec<SinkOptions>,
 }
 
 impl ProxyBuilder {
@@ -57,9 +61,21 @@ impl ProxyBuilder {
     }
 
     /// Adds an event sink. A proxy has at least one.
+    ///
+    /// The sink gets the queue, the retries and the time limit of
+    /// [`SinkOptions::default`], and no rate limit.
     #[must_use]
-    pub fn event_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
+    pub fn event_sink(self, sink: Arc<dyn EventSink>) -> Self {
+        self.event_sink_with(sink, SinkOptions::default())
+    }
+
+    /// Adds an event sink, and says how the dispatcher is to treat it: the
+    /// length of its queue, its rate limit, its retries and the time one
+    /// attempt may take.
+    #[must_use]
+    pub fn event_sink_with(mut self, sink: Arc<dyn EventSink>, options: SinkOptions) -> Self {
         self.event_sinks.push(sink);
+        self.sink_options.push(options);
         self
     }
 
@@ -74,6 +90,7 @@ impl ProxyBuilder {
             mut protocol_modules,
             mut login_strategies,
             event_sinks,
+            sink_options,
         } = self;
 
         let protocol_module = match (protocol_modules.pop(), protocol_modules.is_empty()) {
@@ -94,6 +111,7 @@ impl ProxyBuilder {
             protocol_module,
             login_strategy,
             event_sinks,
+            sink_options,
         })
     }
 }
@@ -157,6 +175,7 @@ pub struct Proxy {
     protocol_module: Arc<dyn ProtocolModule>,
     login_strategy: Arc<dyn LoginStrategy>,
     event_sinks: Vec<Arc<dyn EventSink>>,
+    sink_options: Vec<SinkOptions>,
 }
 
 impl Proxy {
@@ -176,6 +195,13 @@ impl Proxy {
     #[must_use]
     pub fn event_sinks(&self) -> &[Arc<dyn EventSink>] {
         &self.event_sinks
+    }
+
+    /// How the dispatcher treats each sink, in the order of
+    /// [`Proxy::event_sinks`].
+    #[must_use]
+    pub fn sink_options(&self) -> &[SinkOptions] {
+        &self.sink_options
     }
 
     /// Creates the logic for one accepted connection: a session of the
@@ -441,6 +467,23 @@ mod tests {
             BuildError::NoEventSink.to_string(),
             "a proxy needs at least one event sink"
         );
+    }
+
+    #[test]
+    fn every_sink_has_its_options() {
+        let limited = SinkOptions::new()
+            .with_queue_size(8)
+            .with_max_events_per_second(Some(2));
+        let proxy = ProxyBuilder::new()
+            .protocol_module(Arc::new(TestProtocol))
+            .login_strategy(Arc::new(Relay))
+            .event_sink(Arc::new(MemorySink::named("plain")))
+            .event_sink_with(Arc::new(MemorySink::named("limited")), limited.clone())
+            .build()
+            .unwrap();
+        let sinks: Vec<&str> = proxy.event_sinks().iter().map(|sink| sink.name()).collect();
+        assert_eq!(sinks, ["plain", "limited"]);
+        assert_eq!(proxy.sink_options(), [SinkOptions::default(), limited]);
     }
 
     #[test]

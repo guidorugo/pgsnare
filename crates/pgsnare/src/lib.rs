@@ -14,6 +14,7 @@ pub mod admin;
 pub mod builder;
 pub mod cli;
 pub mod config;
+pub mod redact;
 pub mod reload;
 pub mod runtime;
 pub mod sinks;

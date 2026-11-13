@@ -31,6 +31,16 @@
 //! - Once one connection is being closed, the session has [`LINGER`] to
 //!   send what is still queued. A peer that does not read cannot hold it
 //!   open.
+//!
+//! # What the proxy adds
+//!
+//! Once the database has accepted the login, the session measures how long
+//! bytes stay in the proxy: from the moment it read something from one
+//! connection to the moment everything that came of it has been written to
+//! the other. That time goes into the histogram of added latency of the
+//! [`Status`]. It includes what the session logic takes and the wait for a
+//! peer that is slow to read. It leaves out what is held back on purpose:
+//! bytes for a client that the session logic told the runtime to delay.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -240,6 +250,10 @@ struct Driver {
     login_deadline: Instant,
     /// Nothing is written to the client before this moment.
     hold_client_until: Option<Instant>,
+    /// When the oldest bytes were read whose outcome has not been written
+    /// to the client in full, and the same for the database.
+    to_client_since: Option<Instant>,
+    to_backend_since: Option<Instant>,
     /// The session ends at this moment at the latest.
     linger_until: Option<Instant>,
     /// Set when the session is to end at once.
@@ -283,6 +297,8 @@ pub(crate) async fn run(
         logged_in: false,
         login_deadline,
         hold_client_until: None,
+        to_client_since: None,
+        to_backend_since: None,
         linger_until: None,
         over: false,
         told_to_stop: false,
@@ -314,6 +330,10 @@ impl Driver {
             let to_backend = self.out.to_server.len().saturating_sub(self.backend_sent);
             let now = Instant::now();
             let client_held = self.hold_client_until.is_some_and(|until| until > now);
+            if client_held {
+                // Held back on purpose: not time the proxy adds.
+                self.to_client_since = None;
+            }
             let login_deadline = (!self.logged_in).then_some(self.login_deadline);
 
             let (client_reader, client_writer) = match &mut self.client {
@@ -395,6 +415,7 @@ impl Driver {
                             self.client_sent = self.client_sent.saturating_add(count);
                             self.client_unflushed = self.client_is_tls;
                             self.compact();
+                            self.note_written(Leg::Client);
                         }
                         _ => self.drop_client(),
                     }
@@ -406,19 +427,26 @@ impl Driver {
                             self.backend_sent = self.backend_sent.saturating_add(count);
                             self.backend_unflushed = self.backend_is_tls;
                             self.compact();
+                            self.note_written(Leg::Backend);
                         }
                         _ => self.drop_backend(),
                     }
                 }
                 flushed = flush_some(client_flush), if flush_client => {
                     match flushed {
-                        Ok(()) => self.client_unflushed = false,
+                        Ok(()) => {
+                            self.client_unflushed = false;
+                            self.note_written(Leg::Client);
+                        }
                         Err(_) => self.drop_client(),
                     }
                 }
                 flushed = flush_some(backend_flush), if flush_backend => {
                     match flushed {
-                        Ok(()) => self.backend_unflushed = false,
+                        Ok(()) => {
+                            self.backend_unflushed = false;
+                            self.note_written(Leg::Backend);
+                        }
                         Err(_) => self.drop_backend(),
                     }
                 }
@@ -426,9 +454,11 @@ impl Driver {
                     active = true;
                     match read {
                         Ok(count) if count > 0 => {
+                            let read_at = Instant::now();
                             self.context.status.read_from_client(count);
                             self.step(Direction::FromClient, count).await;
                             self.client_buffer.after_read(count);
+                            self.note_read(Direction::FromClient, read_at);
                         }
                         // The client has gone, cleanly or not.
                         _ => self.drop_client(),
@@ -438,9 +468,11 @@ impl Driver {
                     active = true;
                     match read {
                         Ok(count) if count > 0 => {
+                            let read_at = Instant::now();
                             self.context.status.read_from_server(count);
                             self.step(Direction::FromServer, count).await;
                             self.backend_buffer.after_read(count);
+                            self.note_read(Direction::FromServer, read_at);
                         }
                         _ => self.drop_backend(),
                     }
@@ -465,6 +497,57 @@ impl Driver {
         let input = buffer.bytes.get(..count).unwrap_or_default();
         let result = self.session.on_bytes(from, input, &policy, &mut self.out);
         self.after(result).await;
+    }
+
+    /// Starts the clock for what a read left to be written to the other
+    /// connection, unless a clock for that connection is running already:
+    /// what is measured is the wait of the oldest bytes.
+    fn note_read(&mut self, from: Direction, read_at: Instant) {
+        // The login waits for the database, which is not time the proxy
+        // adds.
+        if !self.logged_in {
+            return;
+        }
+        match from {
+            Direction::FromClient => {
+                if self.to_backend_since.is_none() && self.out.to_server.len() > self.backend_sent {
+                    self.to_backend_since = Some(read_at);
+                }
+            }
+            Direction::FromServer => {
+                if self.to_client_since.is_none()
+                    && self.hold_client_until.is_none()
+                    && self.out.to_client.len() > self.client_sent
+                {
+                    self.to_client_since = Some(read_at);
+                }
+            }
+        }
+    }
+
+    /// Stops the clock of a connection once everything queued for it has
+    /// been written, and notes how long that took.
+    fn note_written(&mut self, leg: Leg) {
+        let (since, queued, sent, unflushed) = match leg {
+            Leg::Client => (
+                &mut self.to_client_since,
+                self.out.to_client.len(),
+                self.client_sent,
+                self.client_unflushed,
+            ),
+            Leg::Backend => (
+                &mut self.to_backend_since,
+                self.out.to_server.len(),
+                self.backend_sent,
+                self.backend_unflushed,
+            ),
+        };
+        if sent >= queued
+            && !unflushed
+            && let Some(read_at) = since.take()
+        {
+            self.context.status.latency_added(read_at.elapsed());
+        }
     }
 
     fn report(&mut self, report: Report) {
@@ -783,6 +866,7 @@ impl Driver {
         self.out.to_client = Vec::new();
         self.client_sent = 0;
         self.client_unflushed = false;
+        self.to_client_since = None;
         if self.backend.is_some() {
             self.close_after_flush(Leg::Backend);
         }
@@ -795,6 +879,7 @@ impl Driver {
         self.out.to_server = Vec::new();
         self.backend_sent = 0;
         self.backend_unflushed = false;
+        self.to_backend_since = None;
         if self.client.is_some() {
             self.close_after_flush(Leg::Client);
         }
