@@ -255,8 +255,10 @@ impl Connector {
 }
 
 /// What the log says when the two legs present different certificates.
-pub(crate) const CERTIFICATE_MISMATCH: &str = "the certificate of the client leg is not the one the database presents: a client that \
-     uses SCRAM channel binding, as libpq does by default, cannot log in through this listener";
+/// It names no protocol: channel binding is what ties a login to the
+/// certificate the client saw, whatever the protocol calls it.
+pub(crate) const CERTIFICATE_MISMATCH: &str = "the certificate of the client leg is not the one the database presents: a login that \
+     uses channel binding will fail through this listener";
 
 /// Opens a TCP connection to the first address of `host` that answers.
 async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, ConnectError> {
