@@ -1,0 +1,53 @@
+Generate honeytokens: the SQL to plant them and the matching configuration
+
+Usage: pgsnare token generate [OPTIONS] --kind <KIND> --table <TABLE>
+
+Options:
+      --kind <KIND>
+          The kind of honeytoken to generate
+
+          Possible values:
+          - identity:      A made-up service account: a name and an email address. Needs --domain
+          - bcrypt:        A stored password in the format of bcrypt. It is the hash of nothing
+          - argon2id:      A stored password in the format of Argon2id. It is the hash of nothing
+          - scram-sha-256: A SCRAM-SHA-256 verifier as PostgreSQL stores one. It belongs to no password
+          - api-key:       An API key: 40 random characters, the key of no service
+          - card:          A number with the length and the check digit of a payment card number, from outside the ranges of the payment schemes
+          - marker:        A marker to put into free text, such as a note
+
+      --table <TABLE>
+          The table the honeytokens are planted in, with its schema if you like: public.users. A name is taken exactly as written and is case-sensitive. Put double quotes around a part that contains a dot: '"my.schema".users'
+
+      --column <COLUMN>
+          The column a value goes into. The kind identity takes two, the name first and the email address second. Without it the columns are name and email for identity, password_hash for the three hash kinds, api_key, card_number and note
+
+      --domain <DOMAIN>
+          The domain of the email addresses, such as mail.example. The kind identity needs it, and no domain is built in. Use a domain of your own that receives no mail
+
+      --count <N>
+          How many honeytokens to generate, 1000 at most
+          
+          [default: 1]
+
+      --id <ID>
+          The id of the honeytoken in the configuration, which is what events show. With more than one honeytoken, each id is this and a number. Without it, the id is the kind and a few random characters
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+The output is an SQL script: an INSERT with one row for each honeytoken, and
+the token file for pgsnare inside an SQL comment. That is all the command
+does. It connects to no database and writes no file. Review the statement,
+adapt it to your table and run it yourself.
+
+Every value is new and random, and comes from the secure random generator of
+the operating system. No option and no environment variable changes that, and
+running the command again gives other values.
+
+Examples:
+  pgsnare token generate --kind identity --table public.users --domain mail.example
+  pgsnare token generate --kind api-key --table public.api_keys --column key --count 3
+  pgsnare token generate --kind bcrypt --table '"Shop"."Customer Logins"' --id shop-logins

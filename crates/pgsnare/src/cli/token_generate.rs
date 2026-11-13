@@ -158,20 +158,30 @@ impl Kind {
     }
 }
 
+/// The examples at the end of the help.
+macro_rules! examples {
+    () => {
+        "Examples:\n  \
+         pgsnare token generate --kind identity --table public.users --domain mail.example\n  \
+         pgsnare token generate --kind api-key --table public.api_keys --column key --count 3\n  \
+         pgsnare token generate --kind bcrypt --table '\"Shop\".\"Customer Logins\"' --id shop-logins"
+    };
+}
+
 /// The arguments of `pgsnare token generate`.
 #[derive(Debug, clap::Args)]
 #[command(
-    long_about = "Generate honeytokens: the SQL to plant them and the matching configuration.\n\n\
-        The output is an SQL script: an INSERT with one row for each honeytoken, and a token \
-        file for pgsnare inside an SQL comment. Nothing else happens. pgsnare connects to no \
-        database and writes no file. Review the statement, adapt it to your table and run it \
-        yourself.\n\n\
-        Every value is new and random, from the secure random generator of the operating \
-        system. Running the command again gives other values.",
-    after_help = "Examples:\n  \
-        pgsnare token generate --kind identity --table public.users --domain mail.example\n  \
-        pgsnare token generate --kind api-key --table public.api_keys --column key --count 3\n  \
-        pgsnare token generate --kind bcrypt --table '\"Shop\".\"Customer Logins\"' --id shop-logins"
+    after_help = examples!(),
+    after_long_help = concat!(
+        "The output is an SQL script: an INSERT with one row for each honeytoken, and\n\
+         the token file for pgsnare inside an SQL comment. That is all the command\n\
+         does. It connects to no database and writes no file. Review the statement,\n\
+         adapt it to your table and run it yourself.\n\n\
+         Every value is new and random, and comes from the secure random generator of\n\
+         the operating system. No option and no environment variable changes that, and\n\
+         running the command again gives other values.\n\n",
+        examples!()
+    )
 )]
 pub struct Args {
     /// The kind of honeytoken to generate.
