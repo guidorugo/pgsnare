@@ -26,6 +26,7 @@ pub struct Status {
     cancels_forwarded: AtomicU64,
     bytes_from_clients: AtomicU64,
     bytes_from_servers: AtomicU64,
+    read_buffer_bytes: AtomicU64,
     events_emitted: AtomicU64,
     events_dropped: AtomicU64,
     event_delivery_failures: AtomicU64,
@@ -33,7 +34,8 @@ pub struct Status {
 
 /// The counters of a proxy at one moment.
 ///
-/// All of them only ever grow, except `sessions_active`.
+/// All of them only ever grow, except `sessions_active` and
+/// `read_buffer_bytes`, which say what is there right now.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Counters {
@@ -62,6 +64,10 @@ pub struct Counters {
     pub bytes_from_clients: u64,
     /// Bytes read from the database.
     pub bytes_from_servers: u64,
+    /// The size of the buffers all open sessions read into, right now. A
+    /// session that is quiet holds a small buffer for each direction, and
+    /// a busy one a large one.
+    pub read_buffer_bytes: u64,
     /// Events the session logic raised.
     pub events_emitted: u64,
     /// Events that were dropped because too many were waiting to be
@@ -101,6 +107,7 @@ impl Status {
             cancels_forwarded: read(&self.cancels_forwarded),
             bytes_from_clients: read(&self.bytes_from_clients),
             bytes_from_servers: read(&self.bytes_from_servers),
+            read_buffer_bytes: read(&self.read_buffer_bytes),
             events_emitted: read(&self.events_emitted),
             events_dropped: read(&self.events_dropped),
             event_delivery_failures: read(&self.event_delivery_failures),
@@ -158,6 +165,23 @@ impl Status {
             .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
+    /// A session's read buffer changed its size, from `old` to `new`
+    /// bytes. A buffer that comes into being was 0 bytes before, and one
+    /// that goes away is 0 bytes after.
+    pub(crate) fn read_buffer_resized(&self, old: usize, new: usize) {
+        let (old, new) = (
+            u64::try_from(old).unwrap_or(u64::MAX),
+            u64::try_from(new).unwrap_or(u64::MAX),
+        );
+        if new >= old {
+            self.read_buffer_bytes
+                .fetch_add(new.saturating_sub(old), Ordering::Relaxed);
+        } else {
+            self.read_buffer_bytes
+                .fetch_sub(old.saturating_sub(new), Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn event_emitted(&self) {
         self.events_emitted.fetch_add(1, Ordering::Relaxed);
     }
@@ -199,6 +223,10 @@ mod tests {
         status.read_from_client(10);
         status.read_from_client(5);
         status.read_from_server(7);
+        status.read_buffer_resized(0, 1024);
+        status.read_buffer_resized(0, 1024);
+        status.read_buffer_resized(1024, 65536);
+        status.read_buffer_resized(1024, 0);
         status.event_emitted();
         status.event_dropped();
         status.event_delivery_failed();
@@ -216,6 +244,7 @@ mod tests {
         assert_eq!(counters.cancels_forwarded, 1);
         assert_eq!(counters.bytes_from_clients, 15);
         assert_eq!(counters.bytes_from_servers, 7);
+        assert_eq!(counters.read_buffer_bytes, 65536);
         assert_eq!(counters.events_emitted, 1);
         assert_eq!(counters.events_dropped, 1);
         assert_eq!(counters.event_delivery_failures, 1);

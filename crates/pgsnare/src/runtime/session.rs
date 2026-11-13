@@ -103,30 +103,45 @@ pub(crate) struct ListenerContext {
     pub(crate) events: Arc<Events>,
 }
 
-/// A buffer to read into, small while quiet and large while busy.
+/// A buffer to read into, small while quiet and large while busy. What it
+/// holds at any moment is part of what the runtime reports about itself.
 struct ReadBuffer {
     bytes: Vec<u8>,
+    status: Arc<Status>,
 }
 
 impl ReadBuffer {
-    fn new() -> Self {
+    fn new(status: &Arc<Status>) -> Self {
+        status.read_buffer_resized(0, SMALL_READ);
         Self {
             bytes: vec![0; SMALL_READ],
+            status: Arc::clone(status),
         }
+    }
+
+    fn resize(&mut self, size: usize) {
+        self.status.read_buffer_resized(self.bytes.len(), size);
+        self.bytes = vec![0; size];
     }
 
     /// After a read of `count` bytes: a read that filled the buffer is
     /// followed by a larger one.
     fn after_read(&mut self, count: usize) {
         if count >= self.bytes.len() && self.bytes.len() < LARGE_READ {
-            self.bytes = vec![0; LARGE_READ];
+            self.resize(LARGE_READ);
         }
     }
 
     fn shrink(&mut self) {
         if self.bytes.len() > SMALL_READ {
-            self.bytes = vec![0; SMALL_READ];
+            self.resize(SMALL_READ);
         }
+    }
+}
+
+impl Drop for ReadBuffer {
+    fn drop(&mut self) {
+        self.status.read_buffer_resized(self.bytes.len(), 0);
     }
 }
 
@@ -243,6 +258,10 @@ pub(crate) async fn run(
         .with_client_tls_policy(context.client_tls.policy());
     let session = context.proxy.start_session(origin);
     let login_deadline = Instant::now() + context.login_timeout;
+    let (client_buffer, backend_buffer) = (
+        ReadBuffer::new(&context.status),
+        ReadBuffer::new(&context.status),
+    );
     let mut driver = Driver {
         context,
         peer,
@@ -259,8 +278,8 @@ pub(crate) async fn run(
         backend_unflushed: false,
         client_closing: false,
         backend_closing: false,
-        client_buffer: ReadBuffer::new(),
-        backend_buffer: ReadBuffer::new(),
+        client_buffer,
+        backend_buffer,
         logged_in: false,
         login_deadline,
         hold_client_until: None,
@@ -821,17 +840,29 @@ mod tests {
 
     #[test]
     fn a_read_buffer_grows_when_filled_and_shrinks_when_told() {
-        let mut buffer = ReadBuffer::new();
+        let status = Arc::new(Status::new());
+        let held = || status.counters().read_buffer_bytes;
+        let mut buffer = ReadBuffer::new(&status);
         assert_eq!(buffer.bytes.len(), SMALL_READ);
+        assert_eq!(held(), SMALL_READ as u64);
         buffer.after_read(SMALL_READ - 1);
         assert_eq!(buffer.bytes.len(), SMALL_READ);
         buffer.after_read(SMALL_READ);
         assert_eq!(buffer.bytes.len(), LARGE_READ);
+        assert_eq!(held(), LARGE_READ as u64);
         buffer.after_read(LARGE_READ);
         assert_eq!(buffer.bytes.len(), LARGE_READ);
         buffer.shrink();
         assert_eq!(buffer.bytes.len(), SMALL_READ);
         assert!(buffer.bytes.capacity() < LARGE_READ);
+        assert_eq!(held(), SMALL_READ as u64);
+
+        // A second buffer counts too, and a buffer that is gone does not.
+        let other = ReadBuffer::new(&status);
+        assert_eq!(held(), 2 * SMALL_READ as u64);
+        drop(buffer);
+        drop(other);
+        assert_eq!(held(), 0);
     }
 
     #[test]
