@@ -33,17 +33,23 @@ fn finish(text: String, length: usize) -> Result<Bait, BaitError> {
     }
 }
 
-/// A bcrypt hash: `$2b$12$`, then a salt of 22 characters and a hash of 31.
+/// A bcrypt hash: `$2a$12$`, then a salt of 22 characters and a hash of 31.
 ///
 /// The format is the one of the reference implementation, OpenBSD's
-/// `bcrypt.c`: version `2b`, the cost as two digits, 16 bytes of salt and
+/// `bcrypt.c`: a version, the cost as two digits, 16 bytes of salt and
 /// 23 bytes of hash, both in bcrypt's own Base64 without padding.
+///
+/// The version is `2a`. The reference implementation reads `2a` and `2b`,
+/// which are written the same way but for that letter. `2a` is the one
+/// that the `pgcrypto` extension of PostgreSQL documents, writes and
+/// reads: given a `2b` hash, its `crypt` does not take it for bcrypt at
+/// all. Bait for a PostgreSQL database is therefore `2a`.
 pub(super) fn bcrypt(draw: &mut Draw<'_>) -> Result<Bait, BaitError> {
     let salt: [u8; 16] = draw.bytes()?;
     let hash: [u8; 23] = draw.bytes()?;
 
     let mut text = String::with_capacity(BCRYPT_LEN);
-    text.push_str("$2b$12$");
+    text.push_str("$2a$12$");
     append_base64(&salt, BCRYPT, Padding::None, &mut text)?;
     append_base64(&hash, BCRYPT, Padding::None, &mut text)?;
     finish(text, BCRYPT_LEN)
@@ -112,7 +118,7 @@ mod tests {
             let text = with_sequence(seed, bcrypt);
             assert_eq!(text.len(), 60);
             let (head, rest) = text.split_at(7);
-            assert_eq!(head, "$2b$12$");
+            assert_eq!(head, "$2a$12$");
             let (salt, hash) = rest.split_at(22);
             // 16 bytes and 23 bytes, in the one spelling a strict decoder
             // accepts.
@@ -136,7 +142,7 @@ mod tests {
         // are 30 times '9' and then '6'.
         let mut source = Constant(0xff);
         let mut draw = Draw::new(&mut source);
-        let expected = format!("$2b$12${}u{}6", "9".repeat(21), "9".repeat(30));
+        let expected = format!("$2a$12${}u{}6", "9".repeat(21), "9".repeat(30));
         assert_eq!(bcrypt(&mut draw).unwrap().expose(), expected);
     }
 

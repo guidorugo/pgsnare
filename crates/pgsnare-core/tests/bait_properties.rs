@@ -142,7 +142,7 @@ fn has_the_format(which: Which, text: &str, domain: &Domain) -> bool {
         Which::Bcrypt => {
             text.len() == 60
                 && text
-                    .strip_prefix("$2b$12$")
+                    .strip_prefix("$2a$12$")
                     .is_some_and(|rest| all_in(rest, BCRYPT))
         }
         Which::Argon2id => text
@@ -312,11 +312,11 @@ fn the_format_checks_of_this_file_can_fail() {
         (Which::Email, "svc.backup.k7q2m5xd3pza"),
         (
             Which::Bcrypt,
-            "$2b$12$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+",
+            "$2a$12$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+",
         ),
         (
             Which::Bcrypt,
-            "$2b$12$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            "$2a$12$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
         ),
         (
             Which::Bcrypt,
@@ -337,7 +337,7 @@ fn the_format_checks_of_this_file_can_fail() {
         (Which::Email, "svc.backup.k7q2m5xd3pza@mail.example"),
         (
             Which::Bcrypt,
-            "$2b$12$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0",
+            "$2a$12$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0",
         ),
         (Which::CardNumber, "9900000000000002"),
         (Which::Marker, "ABCD-EFGH-IJKL-MNOP"),

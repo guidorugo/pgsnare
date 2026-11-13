@@ -62,7 +62,7 @@
 //! |---|---|---|
 //! | [`Kind::AccountName`] | `svc.backup.` and twelve characters: a prefix and a role from short lists of words, and a random end | 60, and the choice of words |
 //! | [`Kind::Email`] | An account name, `@`, and the domain the caller gives | As the account name |
-//! | [`Kind::Bcrypt`] | `$2b$12$` and 53 characters | 312 |
+//! | [`Kind::Bcrypt`] | `$2a$12$` and 53 characters | 312 |
 //! | [`Kind::Argon2id`] | `$argon2id$v=19$m=65536,t=3,p=4$`, 22 characters, `$` and 43 characters | 384 |
 //! | [`Kind::ScramSha256`] | `SCRAM-SHA-256$4096:`, the salt, `$`, the stored key, `:` and the server key | 640 |
 //! | [`Kind::ApiKey`] | 40 letters, digits, `-` and `_` | 240 |
@@ -287,7 +287,7 @@ mod tests {
         let starts = [
             "",
             "",
-            "$2b$12$",
+            "$2a$12$",
             "$argon2id$v=19$m=65536,t=3,p=4$",
             "SCRAM-SHA-256$4096:",
             "",

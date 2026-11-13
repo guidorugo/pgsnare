@@ -4,17 +4,20 @@
 # `tokens` section of the main configuration. In Kubernetes this file is a
 # Secret, mounted read-only.
 #
-# These values are examples. Generate your own.
+# These values are examples, in the shapes that `pgsnare token generate`
+# prints. Generate your own: whoever knows a value can avoid it.
 
 tokens:
   - id: api-key-reporting
-    values: ["pgsn_rpt_4Jq8Zt1Lw0Xe7Rb2Ks9"]
+    values: ["f2bTzU5GZ2ZzvB4AJxVmHw9WnYexIIyPErf-WXku"]
     scope: { database: app, table: public.api_keys, column: key }
     actions: [alert]
 
   - id: card-test-0002
     values:
-      - "4000 0000 0000 0002"
-      - "4000000000000002"
+      # One number, as it is stored and as it is often written. It begins
+      # with 99 and is the number of no card.
+      - "9914424273491280"
+      - "9914 4242 7349 1280"
     scope: { database: shop, table: public.cards, column: number }
     actions: [alert, fake_data]

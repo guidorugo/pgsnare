@@ -171,7 +171,7 @@ fn bcrypt() {
         "public.users",
         1,
     );
-    assert!(insert.rows[0][0].starts_with("$2b$12$"));
+    assert!(insert.rows[0][0].starts_with("$2a$12$"));
     assert_eq!(insert.rows[0][0].len(), 60);
 }
 

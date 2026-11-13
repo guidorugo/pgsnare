@@ -790,17 +790,39 @@ tokens:
         assert!(!format!("{spec:?}").contains("svc.backup"));
     }
 
+    /// Values that clash all the time: few characters, in both letter
+    /// cases and with the digits their hex forms are made of, and many of
+    /// them built around the same two stems.
+    fn clashing_value() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+
+        const STEMS: [&str; 2] = ["aAbB16jJaAbB", "1616aAjJbBaA"];
+        let stem = || proptest::sample::select(STEMS.as_slice());
+        prop_oneof![
+            // Unrelated to the others. Some are too short.
+            3 => "[aAbB16jJ]{10,16}".prop_map(String::from),
+            // A stem, or a value that contains one.
+            3 => ("[aAbB16jJ]{0,2}", stem(), "[aAbB16jJ]{0,2}")
+                .prop_map(|(head, stem, tail)| format!("{head}{stem}{tail}")),
+            // The hex form of a stem, alone or inside a value.
+            1 => (stem(), "[aAbB16jJ]{0,2}").prop_map(|(stem, tail)| {
+                let hex: String = stem.bytes().map(|byte| format!("{byte:02x}")).collect();
+                format!("{hex}{tail}")
+            }),
+            // A stem in another letter case.
+            1 => stem().prop_map(str::to_uppercase),
+        ]
+    }
+
     proptest::proptest! {
-        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(600))]
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(800))]
 
         /// The loader accepts a token list exactly when the matcher
-        /// compiles it. The values are made of few characters, in both
-        /// letter cases and with the digits their hex forms are made of, so
-        /// that they repeat and contain each other all the time.
+        /// compiles it, whatever the values have to do with each other.
         #[test]
         fn the_loader_accepts_a_list_exactly_when_the_matcher_compiles_it(
             list in proptest::collection::vec(
-                (proptest::collection::vec("[aAbB16jJ]{10,16}", 1..=3), proptest::prelude::any::<bool>()),
+                (proptest::collection::vec(clashing_value(), 1..=3), proptest::prelude::any::<bool>()),
                 1..=4,
             ),
         ) {
@@ -820,6 +842,37 @@ tokens:
             let compiled = Matcher::build(&specs);
             proptest::prop_assert_eq!(loaded.is_ok(), compiled.is_ok(), "{:?}", loaded.err());
         }
+    }
+
+    #[test]
+    fn the_values_of_that_property_do_clash() {
+        // If they never did, the property above would only compare lists
+        // that both sides accept or that are too short.
+        use proptest::strategy::{Strategy, ValueTree};
+        use proptest::test_runner::TestRunner;
+
+        let mut runner = TestRunner::deterministic();
+        let (mut refused_for_a_clash, mut accepted) = (0, 0);
+        for _ in 0..300 {
+            let values: Vec<String> = (0..4)
+                .map(|_| clashing_value().new_tree(&mut runner).unwrap().current())
+                .filter(|value| value.len() >= MIN_VALUE_BYTES)
+                .collect();
+            let spec = TokenSpec::new("t", values.iter().map(String::as_str));
+            match Matcher::build(&[spec]) {
+                Ok(_) => accepted += 1,
+                Err(BuildError::Invalid(errors)) => {
+                    let contains =
+                        |error: &ValidationError| matches!(error, ValidationError::Contains { .. });
+                    if errors.errors().iter().any(contains) {
+                        refused_for_a_clash += 1;
+                    }
+                }
+                Err(other) => panic!("{other:?}"),
+            }
+        }
+        assert!(refused_for_a_clash >= 30, "{refused_for_a_clash}");
+        assert!(accepted >= 30, "{accepted}");
     }
 
     #[test]

@@ -40,7 +40,7 @@ use super::{FAILURE, SUCCESS, USAGE};
 pub const MAX_INPUT_BYTES: u64 = 1024 * 1024;
 
 /// The arguments of `pgsnare token test`.
-#[derive(Debug, clap::Args)]
+#[derive(clap::Args)]
 #[command(
     after_long_help = "The value is read from standard input. It is not an argument, because an\n\
         argument ends up in the history of the shell and in the process list, where\n\
@@ -68,6 +68,20 @@ pub struct Args {
     /// as an argument would be printed back in the complaint about it.
     #[arg(hide = true, allow_hyphen_values = true)]
     pub not_taken: Vec<OsString>,
+}
+
+/// Shows the configuration file, and of what else was given only how much:
+/// it may be the value itself.
+impl std::fmt::Debug for Args {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Args")
+            .field("config", &self.config)
+            .field(
+                "not_taken",
+                &format_args!("<{} not shown>", self.not_taken.len()),
+            )
+            .finish()
+    }
 }
 
 /// One way in which the input matches a honeytoken.
@@ -367,6 +381,18 @@ tokens:
         ] {
             assert!(!text.contains(secret), "{text}");
         }
+    }
+
+    #[test]
+    fn what_was_given_as_an_argument_stays_out_of_debug_output() {
+        let args = Args {
+            config: PathBuf::from("pgsnare.yaml"),
+            not_taken: vec![OsString::from("svc.backup.aaaaaaaaaaaa")],
+        };
+        let shown = format!("{args:?} {args:#?}");
+        assert!(shown.contains("pgsnare.yaml"), "{shown}");
+        assert!(shown.contains("<1 not shown>"), "{shown}");
+        assert!(!shown.contains("svc.backup"), "{shown}");
     }
 
     #[test]

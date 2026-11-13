@@ -63,7 +63,9 @@ inspection:
 token_files:
   - tokens/*.yaml
 
-# Honeytokens. A value must be ASCII and at least 12 bytes long.
+# Honeytokens. A value must be ASCII and at least 12 bytes long, and no
+# value may contain another. `pgsnare token generate` makes values and
+# prints the entry for each.
 tokens:
   - id: users-admin-backup                  # required; this is what events show
     values: ["svc.backup.8f3k2q@mail.example"]   # required
