@@ -11,7 +11,7 @@
 //! It logs to standard error, one line for each thing worth knowing. No
 //! line contains anything a client or a database sent.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -179,13 +179,7 @@ async fn serve(proxy: Proxy, policy: Arc<FixedPolicy>, settings: Settings) -> Re
 /// Refuses to start when a file that holds secrets is open to other users,
 /// unless the operator said to start all the same.
 fn check_permissions(loaded: &config::Loaded, allow: bool) -> Result<(), String> {
-    let keys = loaded
-        .config
-        .listeners
-        .iter()
-        .filter_map(|listener| listener.client_tls.key.as_deref());
-    let files = loaded.files.iter().map(PathBuf::as_path).chain(keys);
-    let refused = permissions::check_all(unique(files));
+    let refused = permissions::check_all(loaded.secret_files());
     if refused.is_empty() {
         return Ok(());
     }
@@ -211,17 +205,6 @@ fn check_permissions(loaded: &config::Loaded, allow: bool) -> Result<(), String>
          --allow-insecure-file-permissions to accept the risk.",
     );
     Err(message)
-}
-
-/// The files in the order given, each once.
-fn unique<'a>(files: impl Iterator<Item = &'a Path>) -> Vec<&'a Path> {
-    let mut seen: Vec<&Path> = Vec::new();
-    for file in files {
-        if !seen.contains(&file) {
-            seen.push(file);
-        }
-    }
-    seen
 }
 
 /// A core dump would write keys and traffic to disk.
@@ -341,12 +324,5 @@ mod tests {
         assert_eq!(run(&args), FAILURE);
         let error = start(&args).unwrap_err();
         assert!(error.contains("cannot read the file"), "{error}");
-    }
-
-    #[test]
-    fn files_are_listed_once_and_in_order() {
-        let (a, b) = (Path::new("/a"), Path::new("/b"));
-        assert_eq!(unique([a, b, a, b, a].into_iter()), [a, b]);
-        assert!(unique(std::iter::empty()).is_empty());
     }
 }

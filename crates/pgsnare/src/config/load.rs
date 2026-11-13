@@ -26,6 +26,37 @@ pub struct Loaded {
     pub files: Vec<PathBuf>,
 }
 
+impl Loaded {
+    /// The files that hold secrets, each once: every file that was read,
+    /// which is the configuration file and the token files, and the
+    /// private key of every listener.
+    ///
+    /// These are the files whose access rights must keep other users out.
+    /// `pgsnare run` checks them before it starts and `pgsnare config
+    /// check` reports on them, and both take the list from here, so that
+    /// the two can never disagree about which files count.
+    #[must_use]
+    pub fn secret_files(&self) -> Vec<&Path> {
+        let keys = self
+            .config
+            .listeners
+            .iter()
+            .filter_map(|listener| listener.client_tls.key.as_deref());
+        unique(self.files.iter().map(PathBuf::as_path).chain(keys))
+    }
+}
+
+/// The files in the order given, each once.
+fn unique<'a>(files: impl Iterator<Item = &'a Path>) -> Vec<&'a Path> {
+    let mut seen: Vec<&Path> = Vec::new();
+    for file in files {
+        if !seen.contains(&file) {
+            seen.push(file);
+        }
+    }
+    seen
+}
+
 /// Why a configuration could not be loaded.
 #[derive(Debug)]
 #[non_exhaustive]
