@@ -16,8 +16,8 @@
 #   - pgsnare as a container: it refuses to start with files that are open
 #     to other users, its worker threads follow the processors it may use,
 #     it stays within a memory limit that is smaller than the largest
-#     message of the scenarios, and as process 1 it stops on SIGTERM the
-#     way the design says.
+#     message of the scenarios, it cannot write a core dump, and as
+#     process 1 it stops on SIGTERM and on SIGINT the way the design says.
 #
 # A pass has to mean something, so the run also proves that its checks can
 # fail:
@@ -70,6 +70,8 @@ compose() {
 }
 
 cleanup() {
+    # The containers that were started under a name of their own.
+    "$docker" rm --force "$project-open-files" "$project-watcher" >/dev/null 2>&1 || true
     compose --profile client --profile setup down --volumes --remove-orphans >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -149,13 +151,20 @@ await_log() {
     done
 }
 
-# sessions_running VERSION SQL: how many sessions of the database run this
-# statement right now, as the database itself says.
-sessions_running() {
-    compose --profile client run --rm --no-deps -T --entrypoint psql client \
-        --no-psqlrc --no-password --quiet --tuples-only --no-align \
-        --dbname "$(direct "$1") dbname=postgres" \
-        --command "SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND query = '$2'"
+# await_exit CONTAINER SECONDS: waits until a container has stopped, for
+# SECONDS at most, and prints whether it still runs and its exit status.
+# A process 1 that does not handle a signal is not stopped by it at all,
+# so a wait for it needs an end of its own.
+await_exit() {
+    tries=0
+    while [ "$("$docker" inspect --format '{{.State.Running}}' "$1")" = "true" ]; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge "$(($2 * 5))" ]; then
+            break
+        fi
+        sleep 0.2
+    done
+    "$docker" inspect --format '{{.State.Running}} {{.State.ExitCode}}' "$1"
 }
 
 # logged TEXT: whether pgsnare has written a line with TEXT to its log.
@@ -290,12 +299,13 @@ expect_status 2 "an unreachable endpoint" \
 # --- pgsnare as a container ---------------------------------------------------
 
 echo "itest: pgsnare must refuse to start with files that are open to other users"
-for config in open-key open-config; do
+for config in open-key open-config open-tokens; do
     status=0
     output="$(compose run --rm --no-deps -T pgsnare run \
         --config "/state/config/$config.yaml" 2>&1)" || status=$?
     case "$config" in
         open-key) file="/state/certs/open.key" ;;
+        open-tokens) file="/state/config/tokens/open.yaml" ;;
         *) file="/state/config/open-config.yaml" ;;
     esac
     if [ "$status" -ne 1 ] \
@@ -329,6 +339,15 @@ for limit in "one-cpu 1" "two-cpus 2"; do
         failed=1
     fi
 done
+# One of the two is stopped with SIGINT, which must do what SIGTERM does.
+interrupted="$(compose --profile limits ps --all --quiet pgsnare-one-cpu)"
+"$docker" kill --signal INT "$interrupted" >/dev/null
+if [ "$(await_exit "$interrupted" 30)" != "false 0" ] \
+    || ! "$docker" logs "$interrupted" 2>&1 | grep -qF "received SIGINT" \
+    || ! "$docker" logs "$interrupted" 2>&1 | grep -qF "stopped"; then
+    echo "itest: FAILED: pgsnare did not stop on SIGINT with exit status 0" >&2
+    failed=1
+fi
 compose --profile limits rm --stop --force pgsnare-one-cpu pgsnare-two-cpus >/dev/null 2>&1 || true
 
 # The scenarios sent messages of 100 MB through a pgsnare that may use
@@ -342,38 +361,91 @@ fi
 peak="$("$docker" exec "$proxy" cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo unknown)"
 echo "itest: pgsnare and its health check used at most $peak bytes of memory"
 
+# A core dump would write keys and traffic to disk, so pgsnare switches
+# core dumps off for itself.
+if ! "$docker" exec "$proxy" grep -Eq '^Max core file size +0 +0 +bytes' /proc/1/limits; then
+    echo "itest: FAILED: pgsnare can still write a core dump:" >&2
+    "$docker" exec "$proxy" grep 'Max core file size' /proc/1/limits >&2 || true
+    failed=1
+fi
+
 # The last check, because it ends pgsnare: it stops on SIGTERM.
+#
+# What a look at pgsnare shows now depends on when the look is taken. So
+# everything that has to happen within the grace period happens in a
+# client that is already running: on a busy machine, starting a container
+# for each look can take longer than the grace period.
 echo "itest: pgsnare must stop on SIGTERM, as process 1 of its container"
+# The grace period tests/proxy/setup.sh configures, in seconds.
+grace=10
+watcher="$project-watcher"
+compose --profile client run --detach --no-deps --name "$watcher" \
+    --entrypoint sleep client 900 >/dev/null
+
+# in_client COMMAND ARGUMENTS...: runs a command in that client.
+in_client() {
+    "$docker" exec "$watcher" "$@"
+}
+
+# A session that is busy when the signal arrives. What the client saw is
+# kept, and so is the moment it ended.
 staying="$(mktemp)"
-compose --profile client run --rm --no-deps -T --entrypoint psql client \
-    --no-psqlrc --no-password --quiet --dbname "$(proxied "$first") dbname=postgres" \
-    --command "SELECT pg_sleep(300)" >"$staying" 2>&1 &
+(
+    in_client psql --no-psqlrc --no-password --quiet \
+        --dbname "$(proxied "$first") dbname=postgres" \
+        --command "SELECT pg_sleep(300)" 2>&1 || true
+    echo "ended at $(date +%s)"
+) >"$staying" 2>&1 &
 client=$!
 tries=0
-until [ "$(sessions_running "$first" "SELECT pg_sleep(300)")" = "1" ]; do
+until [ "$(in_client psql --no-psqlrc --no-password --quiet --tuples-only --no-align \
+    --dbname "$(direct "$first") dbname=postgres" \
+    --command "SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND query = 'SELECT pg_sleep(300)'" \
+    2>/dev/null)" = "1" ]; do
     tries=$((tries + 1))
-    if [ "$tries" -ge 30 ]; then
+    if [ "$tries" -ge 150 ]; then
         echo "itest: FAILED: the session that is to be shut down did not start" >&2
         failed=1
         break
     fi
+    sleep 0.2
 done
+
 asked="$(date +%s)"
 "$docker" kill --signal TERM "$proxy" >/dev/null
 # While open sessions get their grace period, nobody new is let in.
-expect_status 2 "a new client after SIGTERM" \
-    version "$first" "$(proxied "$first") connect_timeout=3"
+refused=0
+in_client /differential/version.sh "$first" "$(proxied "$first") connect_timeout=3" \
+    >/dev/null 2>&1 || refused=$?
 still_draining="$("$docker" inspect --format '{{.State.Running}}' "$proxy")"
-still_asleep="$(sessions_running "$first" "SELECT pg_sleep(300)")"
-exit_code="$("$docker" wait "$proxy")"
+looked=$(($(date +%s) - asked))
+# pgsnare must end by itself: whether it still runs, and the status it
+# ended with.
+state="$(await_exit "$proxy" "$((grace + 30))")"
 took=$(($(date +%s) - asked))
+# Without pgsnare the session is over, whatever became of pgsnare.
+"$docker" kill "$proxy" >/dev/null 2>&1 || true
 wait "$client" || true
-if [ "$still_draining" != "true" ] || [ "$still_asleep" != "1" ]; then
-    echo "itest: FAILED: pgsnare did not leave an open session its grace period (running: $still_draining, sessions: $still_asleep)" >&2
+"$docker" rm --force "$watcher" >/dev/null 2>&1 || true
+
+# pgsnare was still there after the new client had been turned away, so
+# it was turned away during the grace period.
+if [ "$still_draining" != "true" ]; then
+    echo "itest: FAILED: pgsnare was gone $looked seconds after SIGTERM, before its grace period of $grace seconds was over, or this machine was too busy to look in time" >&2
+    failed=1
+elif [ "$refused" -ne 2 ]; then
+    echo "itest: FAILED: a new client after SIGTERM: expected exit status 2, got $refused" >&2
     failed=1
 fi
-if [ "$exit_code" != "0" ] || [ "$took" -lt 4 ] || [ "$took" -gt 20 ]; then
-    echo "itest: FAILED: pgsnare ended with status $exit_code after $took seconds, expected status 0 after its grace period of 5 seconds" >&2
+# The open session was kept for the grace period, and then closed with
+# the error of an administrator shutdown.
+ended="$(sed -n 's/^ended at \([0-9][0-9]*\)$/\1/p' "$staying")"
+if [ -z "$ended" ]; then
+    echo "itest: FAILED: the open session did not say when it ended:" >&2
+    sed 's/^/    /' "$staying" >&2
+    failed=1
+elif [ "$((ended - asked))" -lt "$((grace - 1))" ]; then
+    echo "itest: FAILED: the open session was closed $((ended - asked)) seconds after SIGTERM, before its grace period of $grace seconds was over" >&2
     failed=1
 fi
 if ! grep -qF "FATAL:  terminating connection due to administrator command" "$staying"; then
@@ -382,6 +454,10 @@ if ! grep -qF "FATAL:  terminating connection due to administrator command" "$st
     failed=1
 fi
 rm -f "$staying"
+if [ "$state" != "false 0" ] || [ "$took" -lt "$((grace - 1))" ]; then
+    echo "itest: FAILED: $took seconds after SIGTERM, pgsnare was in the state \"$state\" (whether it runs, and its exit status): it must end with status 0 once its grace period of $grace seconds is over" >&2
+    failed=1
+fi
 for line in "received SIGTERM" "stopping: no new clients are accepted" \
     "the grace period is over" "stopped"; do
     if ! "$docker" logs "$proxy" 2>&1 | grep -qF "$line"; then

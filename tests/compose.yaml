@@ -86,6 +86,10 @@ services:
     # A proxy that held such a message would be stopped by the kernel.
     mem_limit: 64m
     memswap_limit: 64m
+    environment:
+      # The system's certificate store, for the listeners that name no
+      # authority of their own.
+      SSL_CERT_FILE: /state/certs/ca.crt
     volumes:
       - ${ITEST_BINARY:?run the tests with make itest}:/usr/local/bin/pgsnare:ro
       - state:/state:ro

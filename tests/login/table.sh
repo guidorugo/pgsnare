@@ -156,6 +156,8 @@ table() {
         "$plain port=66$v" fails "$unavailable"
     expect "a database whose certificate is from an unknown authority" \
         "$plain port=67$v" fails "$unavailable"
+    expect "a database verified against the system's certificate store" \
+        "$plain port=69$v" works
 }
 
 if [[ "$selfcheck" -eq 1 ]]; then
@@ -180,7 +182,7 @@ for version in "$@"; do
 done
 # A database that speaks no TLS version above 1.1 is not used.
 expect "a database that only speaks TLS 1.1" \
-    "host=pgsnare sslmode=disable port=6900" fails "$unavailable"
+    "host=pgsnare sslmode=disable port=7000" fails "$unavailable"
 
 echo "table.sh: $checks logins, $failures not as expected"
 if [[ "$failures" -ne 0 ]]; then

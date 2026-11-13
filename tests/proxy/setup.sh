@@ -93,12 +93,15 @@ certificate pglegacy
 #   67NN  plaintext                       to  TLS, verified against the
 #                                             wrong authority
 #   68NN  TLS offered, plaintext accepted to  plaintext
-#   6900  plaintext                       to  TLS, with a server that
+#   69NN  plaintext                       to  TLS, verified against the
+#                                             system's certificate store
+#   7000  plaintext                       to  TLS, with a server that
 #                                             speaks nothing above TLS 1.1
 #
 # Setups 60 to 64 are the supported ones. 65 is the one the design rules
-# out, 66, 67 and 6900 must fail, and 68 shows a listener that takes both
-# kinds of client.
+# out, 66, 67 and 7000 must fail, 68 shows a listener that takes both
+# kinds of client, and 69 names no authority of its own: tests/compose.yaml
+# makes the authority of the tests the system's store for pgsnare.
 
 config="$state/config/pgsnare.yaml"
 
@@ -135,25 +138,37 @@ verified="{ mode: verify-full, ca: /state/certs/ca.crt }"
         listener "wrong-authority-$version" "67$version" "$host:5432" "$plain" \
             "{ mode: verify-full, ca: /state/certs/stranger.crt }"
         listener "offered-plain-$version" "68$version" "$host:5432" "$offered" "$plain"
+        listener "system-store-$version" "69$version" "$host:5432" "$plain" \
+            "{ mode: verify-full }"
     done
-    listener "legacy-tls" "6900" "pglegacy:5432" "$plain" "$verified"
+    listener "legacy-tls" "7000" "pglegacy:5432" "$plain" "$verified"
     cat <<'REST'
 events:
   sinks:
     - type: stdout
 shutdown:
-  grace_period: 5s
+  grace_period: 10s
 REST
 } > "$config"
 
 # --- Files that are open to other users --------------------------------------
 #
-# pgsnare must refuse to start with either of these: a configuration that
-# names a private key the group can read, and a configuration that
-# everybody can read.
+# pgsnare must refuse to start with any of these: a configuration that
+# names a private key the group can read, a configuration that everybody
+# can read, and a configuration that names a token file the group can
+# read.
 
 cp "$state/certs/pgsnare.key" "$state/certs/open.key"
 chmod 0640 "$state/certs/open.key"
+
+# The value is made up for this file and is planted nowhere.
+mkdir -p "$state/config/tokens"
+cat > "$state/config/tokens/open.yaml" <<'TOKENS'
+tokens:
+  - id: itest
+    values: ["itest-value-planted-nowhere"]
+TOKENS
+chmod 0640 "$state/config/tokens/open.yaml"
 
 minimal() {
     cat <<MINIMAL
@@ -174,5 +189,10 @@ MINIMAL
 minimal open.key > "$state/config/open-key.yaml"
 minimal pgsnare.key > "$state/config/open-config.yaml"
 chmod 0644 "$state/config/open-config.yaml"
+{
+    minimal pgsnare.key
+    echo "token_files:"
+    echo "  - tokens/open.yaml"
+} > "$state/config/open-tokens.yaml"
 
 echo "setup: wrote the certificates and $config"
