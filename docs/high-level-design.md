@@ -149,7 +149,9 @@ flowchart TB
 | `pgsnare-core` | The session state machine, detection, policy, actions, optional SQL rules, the event schema and bait generators. | None |
 | `pgsnare` | The runtime as a library with a thin binary on top: listeners, TLS, configuration and reload, sinks, admin and metrics listeners, and the CLI. | All of it |
 
-The session logic takes bytes in and returns bytes out plus *effects*: close, cancel, delay, emit an event. It never touches a socket or a clock.
+The session logic takes bytes in and returns bytes out plus *effects*: close a connection, send a cancel request, delay, emit an event, start TLS on the client leg, open the connection to the database. The runtime carries them out and reports back what the session logic cannot see for itself: that a handshake succeeded, that the database is connected or cannot be reached, that the proxy is shutting down. The session logic never touches a socket or a clock.
+
+The state machine of a session belongs to the PostgreSQL protocol module of `pgsnare-core`. That module is the only part of the crate that uses `pgsnare-proto`: detection, policy and events contain no PostgreSQL-specific types (see [section 13](#13-extension-points)).
 
 This is the central structural decision. The whole session logic can be unit-tested and fuzzed with arbitrary interleavings of client and server bytes, which is how the requirement "no input can crash the proxy" is enforced rather than hoped for.
 
@@ -199,25 +201,47 @@ sequenceDiagram
 
 | Message | When |
 |---|---|
+| `StartupMessage` | When capping the protocol version or removing protocol options |
 | SASL mechanism list | In one TLS setup (see [section 7](#7-authentication-and-tls)) |
-| `NegotiateProtocolVersion` | When capping the protocol version |
+| `NegotiateProtocolVersion` | When the startup message was capped |
 | `CommandComplete` row count | After adding fake rows |
 | `DataRow` | Fake rows |
-| `ErrorResponse` | The `kill` response |
+| `ErrorResponse` | The `kill` response, a session closed at shutdown, and a client refused before it has logged in |
 
 **Versions.** Protocol 3.0 and 3.2 are relayed. They differ in one thing: the cancel key is 4 bytes in 3.0 and 1 to 256 bytes in 3.2. pgsnare reads the key by its length, so both work.
 
 **Negotiation is capped at what pgsnare understands.** A startup message asking for a minor version above 3.2, or carrying protocol options pgsnare does not know, is forwarded as 3.2 without those options, and the client is told through `NegotiateProtocolVersion`. Client and server can therefore never agree on a format pgsnare cannot parse.
 
+- pgsnare knows no protocol option today, so every `_pq_.` parameter is removed.
+- A startup message that needs no capping is forwarded as the bytes that arrived.
+- If the server answers a capped message with a `NegotiateProtocolVersion` of its own, the options pgsnare removed are added to it. If the server accepts the capped message without a word, pgsnare sends the `NegotiateProtocolVersion` itself, ahead of the server's first message, which is where a server puts it.
+- Either way the client receives the answer the server gives when it is asked directly. The tests compare the two for PostgreSQL 15 to 18.
+
 **Cancellation.** A `CancelRequest`, with any key length, is forwarded verbatim to the database on a fresh connection. Keys are never rewritten, so pgsnare keeps no lookup table and any replica can forward a cancel for any session.
+
+- A `CancelRequest` is accepted in plaintext even on a listener that requires TLS, as the server accepts it, because clients older than libpq 17 send it that way. The connection that carries it to the database uses TLS as the listener is configured.
+- Like the server, pgsnare answers nothing. It closes the client's connection once the database has closed its own, so a client that waits for that learns when the request has been dealt with.
 
 **TLS negotiation.** Both styles are accepted: `SSLRequest` followed by a handshake, and direct TLS, which requires the `postgresql` ALPN as the server itself does. `GSSENCRequest` is declined. After an `SSLRequest`, any plaintext already buffered is rejected on both legs. This closes the injection flaw PostgreSQL fixed as CVE-2021-23214 and CVE-2021-23222.
 
-**Unknown messages** are framed generically, scanned and passed through. A startup phase that cannot be parsed ends the connection.
+- On the client leg, bytes that arrive together with an `SSLRequest` end the connection before anything is answered.
+- On the backend leg, pgsnare reads exactly one byte in answer to its own `SSLRequest`. Whatever follows that byte is read by the handshake, so it can never be taken for a message from the database.
+- A client that names other ALPN protocols and not `postgresql` is refused. With TLS 1.2 it receives the alert the server sends. With TLS 1.3 its connection is closed in the middle of the handshake, without the alert.
+
+**Unknown messages** are framed generically, scanned and passed through. A startup phase that cannot be parsed ends the connection. So does a login that cannot be followed: the failure policy applies only once the database has accepted the login (see [section 15.2](#152-secure-defaults)).
 
 **Stricter than the server in two places.** pgsnare rejects a startup packet whose last byte is not zero, and an `SSLRequest` or `GSSENCRequest` that is not exactly eight bytes long. PostgreSQL accepts both. A client that follows the protocol documentation sends neither, and refusing the connection is the safe way to fail.
 
-**Limits.** Every size or count taken from the network is bounded: the startup packet (10 kB, PostgreSQL's own limit), frames held in memory, connections per listener, and the time allowed before login.
+**Limits.** Every size or count taken from the network is bounded: the startup packet (10 kB, PostgreSQL's own limit), a message before the database has accepted the login (65,535 bytes, PostgreSQL's own limit for a client that has not logged in), frames held in memory, connections per listener, and the time allowed before login. A frame above the size that is held is passed on in chunks as it arrives (see [section 8.3](#83-buffering-and-streaming)), so the memory a session needs does not depend on the size of a message.
+
+**What a client is told when pgsnare ends a connection.** pgsnare speaks with the codes and the texts of PostgreSQL's own errors, so that a client sees nothing specific to pgsnare:
+
+| Situation | What the client receives |
+|---|---|
+| The proxy shuts down and the grace period is over | `57P01`, "terminating connection due to administrator command" |
+| The database cannot be reached, or its certificate does not verify | `57P03`, "the database system is not accepting connections", the code of a server that cannot take connections at the moment |
+| A plaintext client on a listener that requires TLS | `28000`, with the text PostgreSQL uses when its access rules admit encrypted connections only |
+| A listener at its connection limit, a client that takes too long to log in, a startup phase or a login that cannot be parsed | The connection is closed without a message |
 
 ## 7. Authentication and TLS
 
@@ -225,7 +249,7 @@ pgsnare relays logins and never terminates them. It does not know any password a
 
 This combination has one consequence that shapes deployment. SCRAM channel binding ties a login to the server certificate the client saw, and the server detects both a mismatch and a downgrade. A relay that does not know the password cannot get around either check.
 
-The combinations below were verified against PostgreSQL 18.6 with a libpq 18 client.
+The integration tests try every row of this table against PostgreSQL 15 to 18 with a libpq 18 client. A row that fails is checked for the failure named here.
 
 | Client leg | Backend leg | What pgsnare does | Result with default client settings |
 |---|---|---|---|
@@ -233,7 +257,7 @@ The combinations below were verified against PostgreSQL 18.6 with a libpq 18 cli
 | TLS, pgsnare's own certificate | Plaintext or Unix socket | Relays unchanged | Works. `channel_binding=require` fails, because there is nothing to bind to |
 | Plaintext | TLS | Removes `SCRAM-SHA-256-PLUS` from the server's offer | Works |
 | Plaintext | Plaintext | Relays unchanged | Works |
-| TLS, pgsnare's own certificate | TLS | Relays unchanged, or removes `SCRAM-SHA-256-PLUS` | Fails for clients that use channel binding, which libpq does by default. Works only with `channel_binding=disable` |
+| TLS, pgsnare's own certificate | TLS | Relays unchanged | Fails for clients that use channel binding, which libpq does by default: the database reports that the channel binding check failed. Works only with `channel_binding=disable` |
 
 Supported setups, in order of preference:
 
@@ -241,7 +265,11 @@ Supported setups, in order of preference:
 2. **Next to the database**, with a plaintext or Unix-socket backend leg.
 3. **Next to the application**, with a plaintext client leg and TLS to the database. This suits managed databases that enforce TLS and do not hand out the server key.
 
-When both legs use TLS, pgsnare compares its client-leg certificate with the one the database presents and logs a clear warning at startup if they differ.
+In the third setup pgsnare removes every mechanism whose name ends in `-PLUS`, which is how the SCRAM family marks channel binding. Today that is `SCRAM-SHA-256-PLUS`. A client without TLS cannot use such a mechanism, and libpq ends the login when it is offered one.
+
+When both legs use TLS, pgsnare compares its client-leg certificate with the one the database presents and logs a clear warning at startup if they differ. The certificates are compared in their encoded form. When the database cannot be reached at startup, pgsnare says so and starts all the same, and the warning then comes with the first connection to the database.
+
+On the backend leg, `verify-full` checks that the certificate of the database chains to a configured authority, or to the system's certificate store, and that it carries the name of the database among its subject alternative names. The common name of a certificate is not looked at. The modes `prefer` and `require` encrypt and do not verify, and pgsnare says so in its log when it starts.
 
 Not supported in the first version: login with client certificates, GSSAPI encryption, and a central proxy with TLS on both legs in front of a database whose key is not available. Those require pgsnare to terminate authentication itself.
 
@@ -337,7 +365,7 @@ How they are built:
 - **Reload triggers.** `SIGHUP`, or a change to a watched file, including the atomic symlink swap Kubernetes uses for mounted volumes. Listener changes need a restart.
 - **One YAML file**, with honeytoken values optionally in separate files so they can be stored as a secret.
 - **Secrets** such as webhook signing keys come from environment variables or files, never from the configuration body.
-- **File permissions.** pgsnare refuses to start if a private key, token file or configuration file is open to other users, unless explicitly overridden. The rule is PostgreSQL's own: a file owned by the process user must not be readable by group or others, and a root-owned file may be group-readable.
+- **File permissions.** pgsnare refuses to start if a private key, token file or configuration file is open to other users, unless explicitly overridden. The rule is PostgreSQL's own: a file owned by the process user must not be readable by group or others, and a root-owned file may be group-readable. A file owned by anyone else is refused. The override is the option `--allow-insecure-file-permissions` of `pgsnare run`, and every file it lets through is named in the log.
 
 The format is strict: an unknown field is an error, at least one sink is required, and a webhook sink must name its signing key.
 
@@ -422,7 +450,8 @@ Extensions are compiled in. There is no runtime plugin loading, no dynamic libra
 ### 14.2 Lifecycle
 
 - pgsnare runs correctly as process 1 of a container.
-- On `SIGTERM` it stops accepting connections, reports not-ready, lets open sessions finish for a configurable grace period, then closes the rest with the same error the database sends on an administrator shutdown.
+- On `SIGTERM` it stops accepting connections, reports not-ready, lets open sessions finish for a configurable grace period, then closes the rest with the same error the database sends on an administrator shutdown. `SIGINT` does the same. It then exits with status 0.
+- A session that cannot read an error at that moment is closed without one: a client that has not sent its startup message yet, or one that is in the middle of a message that is being passed on in chunks.
 - `pgsnare healthcheck` asks the loopback admin listener and exits 0 or 1. It backs the image's health check and Kubernetes exec probes, so no health port has to be exposed.
 - Worker threads follow the container's CPU limit.
 
@@ -518,7 +547,7 @@ An attacker with root on the pgsnare host is out of scope.
 
 ### 15.2 Secure defaults
 
-- Inspection errors end the session (`fail_closed`). The alternative, `fail_open`, turns the session into an uninspected tunnel and emits an `inspection_bypassed` event; it must be chosen explicitly.
+- Inspection errors end the session (`fail_closed`). The alternative, `fail_open`, turns the session into an uninspected tunnel and emits an `inspection_bypassed` event; it must be chosen explicitly. It applies only to a session the database has accepted: before that, a connection that cannot be followed is closed whatever the setting.
 - TLS 1.2 is the floor and 1.3 is preferred. When upstream TLS is on, the certificate is verified. Turning verification off takes an explicit setting and is logged at startup.
 - Private keys, token files and the configuration file must not be open to other users (see [section 11](#11-policy-configuration-and-reload)).
 - The admin and metrics listeners bind to loopback by default and are read-only. There is no remote administration interface.
@@ -576,7 +605,8 @@ These are design targets, not measurements.
 
 ## 17. Verification
 
-- **Differential tests.** Every scenario runs twice, directly against PostgreSQL and through pgsnare, and the outputs must match. Scenarios cover simple and extended queries, prepared statements, pipelining, transactions and error recovery, COPY in and out, LISTEN and NOTIFY, cancellation, very large rows, cursors, and a logical replication stream.
+- **Differential tests.** Every scenario runs directly against PostgreSQL and through pgsnare, for each supported version, in every supported TLS setup and for protocol 3.0 and 3.2, and the outputs must match. Scenarios cover simple and extended queries, prepared statements, pipelining, transactions and error recovery, COPY in and out, LISTEN and NOTIFY, cancellation, very large rows, cursors and portal suspension, function calls, protocol version negotiation, and a logical replication stream.
+- **The login table.** Every row of the table in [section 7](#7-authentication-and-tls) is tried with a real client, including the rows that must fail.
 - **PostgreSQL's own regression suite**, run through the proxy.
 - **Detection corpus.** Each case is labelled as a hit or a known gap and run in simple, extended-text and extended-binary modes. Known gaps are asserted as misses, so the documentation stays honest.
 - **Property tests.** The scanner finds the same matches however the bytes are chunked.
