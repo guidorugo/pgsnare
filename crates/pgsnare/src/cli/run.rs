@@ -8,8 +8,14 @@
 //! sessions finish for the grace period of the configuration and exits
 //! with status 0.
 //!
-//! It logs to standard error, one line for each thing worth knowing. No
-//! line contains anything a client or a database sent.
+//! A listener that fails while the proxy runs stops it in the same way,
+//! and the command then exits with status 1.
+//!
+//! It logs to standard error, one JSON object for each line: see
+//! [`crate::log`]. No line contains anything a client or a database sent.
+//! A proxy that cannot start says why in the same log, and exits with
+//! status 1. Events go to the sinks of the configuration, and standard
+//! output carries nothing but the events of a `stdout` sink.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -52,27 +58,18 @@ pub struct Args {
 /// Runs the command and returns its exit status.
 #[must_use]
 pub fn run(args: &Args) -> u8 {
-    install_log();
-    match start(args) {
+    // The log comes first, and what it must not show follows as soon as
+    // the configuration has been read. A second call in one process, as in
+    // tests, keeps the first log.
+    let redaction = Redaction::default();
+    crate::log::install(redaction.clone());
+    match start(args, &redaction) {
         Ok(()) => SUCCESS,
-        Err(message) => {
-            // The log may not be what the operator is looking at when the
-            // proxy does not even start.
-            eprintln!("pgsnare run: {message}");
+        Err(reason) => {
+            tracing::error!(reason = %reason, "pgsnare cannot go on");
             FAILURE
         }
     }
-}
-
-/// Makes log lines visible: one line each, on standard error.
-fn install_log() {
-    // A second call in one process, as in tests, keeps the first setup.
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .with_target(false)
-        .with_max_level(tracing::Level::INFO)
-        .try_init();
 }
 
 /// A panic is logged with the place it happened and nothing else: its
@@ -86,13 +83,19 @@ fn install_panic_hook() {
     }));
 }
 
-fn start(args: &Args) -> Result<(), String> {
+fn start(args: &Args, redaction: &Redaction) -> Result<(), String> {
     // Before the first secret is read: the token files hold some.
     disable_core_dumps();
     let loaded = config::load(&args.config).map_err(|error| error.to_string())?;
     check_permissions(&loaded, args.allow_insecure_file_permissions)?;
 
     let config = loaded.config;
+    // From here on no line of the log can show a honeytoken value.
+    redaction.replace(
+        redactor(&config)
+            .build()
+            .map_err(|error| error.to_string())?,
+    );
     let policy = config.policy(1).map_err(|error| error.to_string())?;
     let module = Postgres::new();
     let listeners = listeners(&config, &module)?;
@@ -101,7 +104,7 @@ fn start(args: &Args) -> Result<(), String> {
     // looks for, so the redactor is complete once they are built.
     let (sinks, redactor) =
         sinks::from_config(&config.events, redactor(&config)).map_err(|error| error.to_string())?;
-    let redaction = Redaction::new(redactor.build().map_err(|error| error.to_string())?);
+    redaction.replace(redactor.build().map_err(|error| error.to_string())?);
     let mut builder = ProxyBuilder::new()
         .protocol_module(Arc::new(module))
         .login_strategy(Arc::new(Relay));
@@ -126,7 +129,7 @@ fn start(args: &Args) -> Result<(), String> {
     let observed = Observed {
         admin: config.admin.listen.socket_addr(),
         metrics: config.metrics.listen.socket_addr(),
-        redaction,
+        redaction: redaction.clone(),
     };
 
     let workers = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
@@ -438,7 +441,7 @@ mod tests {
             allow_insecure_file_permissions: false,
         };
         assert_eq!(run(&args), FAILURE);
-        let error = start(&args).unwrap_err();
+        let error = start(&args, &Redaction::default()).unwrap_err();
         assert!(error.contains("cannot read the file"), "{error}");
     }
 

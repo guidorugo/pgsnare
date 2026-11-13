@@ -15,6 +15,7 @@ pub mod builder;
 pub mod cli;
 pub mod config;
 mod http;
+pub mod log;
 pub mod redact;
 pub mod reload;
 pub mod runtime;

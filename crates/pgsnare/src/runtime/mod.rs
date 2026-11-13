@@ -607,6 +607,17 @@ mod tests {
         }
     }
 
+    /// Waits for a runtime to stop by itself. A runtime that does not
+    /// notice that a listener has failed would run for ever. The clock of
+    /// these tests jumps ahead when everything waits, so that shows as a
+    /// failure here and not as a test that never ends.
+    async fn stopped(running: tokio::task::JoinHandle<Stopped>) -> Stopped {
+        tokio::time::timeout(Duration::from_secs(24 * 3600), running)
+            .await
+            .expect("the runtime stops when one of its listeners has failed")
+            .unwrap()
+    }
+
     /// A runtime with two listeners, one of which a test can end.
     fn supervised(grace_period: Duration) -> (Supervised, oneshot::Sender<bool>, Arc<Status>) {
         let (stage, _) = watch::channel(Stage::Running);
@@ -672,7 +683,7 @@ mod tests {
 
         let failed = Instant::now();
         end.send(true).unwrap();
-        assert_eq!(running.await.unwrap(), Stopped::ListenerFailed);
+        assert_eq!(stopped(running).await, Stopped::ListenerFailed);
 
         assert!(!status.is_ready());
         assert!(!status.is_healthy());
@@ -690,7 +701,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         end.send(false).unwrap();
-        assert_eq!(running.await.unwrap(), Stopped::ListenerFailed);
+        assert_eq!(stopped(running).await, Stopped::ListenerFailed);
         assert!(!status.is_healthy());
         assert_eq!(status.counters().listener_failures, 1);
         assert_eq!(status.counters().listener_panics, 0);
@@ -713,7 +724,7 @@ mod tests {
 
         // The session ends by itself, and with it the runtime.
         status.session_ended();
-        assert_eq!(running.await.unwrap(), Stopped::ListenerFailed);
+        assert_eq!(stopped(running).await, Stopped::ListenerFailed);
         let waited = failed.elapsed();
         assert!(waited >= Duration::from_secs(10), "{waited:?}");
         assert!(waited < Duration::from_secs(11), "{waited:?}");
@@ -728,7 +739,7 @@ mod tests {
 
         let failed = Instant::now();
         end.send(true).unwrap();
-        assert_eq!(running.await.unwrap(), Stopped::ListenerFailed);
+        assert_eq!(stopped(running).await, Stopped::ListenerFailed);
         let waited = failed.elapsed();
         assert!(
             waited >= Duration::from_secs(25) + STOP_TIMEOUT,

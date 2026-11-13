@@ -173,6 +173,12 @@ logged() {
     compose logs --no-log-prefix pgsnare 2>&1 | grep -F -- "$1" | grep -qF -- "${2:-}"
 }
 
+# The log of pgsnare is JSON, one object for each line. field NAME VALUE
+# gives a field as such a line holds it, for a value that is text.
+field() {
+    printf '"%s":"%s"' "$1" "$2"
+}
+
 services=""
 for version in $versions; do
     services="$services pg$version"
@@ -231,19 +237,19 @@ fi
 # What pgsnare said when it started.
 echo "itest: the log of pgsnare at startup"
 for version in $versions; do
-    if ! logged "is not the one the database presents" "listener=own-tls-$version"; then
+    if ! logged "is not the one the database presents" "$(field listener "own-tls-$version")"; then
         echo "itest: FAILED: no warning that listener own-tls-$version presents another certificate than its database" >&2
         failed=1
     fi
-    if logged "is not the one the database presents" "listener=shared-tls-$version"; then
+    if logged "is not the one the database presents" "$(field listener "shared-tls-$version")"; then
         echo "itest: FAILED: listener shared-tls-$version presents the certificate of its database and was warned about" >&2
         failed=1
     fi
-    if ! logged "the certificate of the database is not verified" "listener=own-tls-$version"; then
+    if ! logged "the certificate of the database is not verified" "$(field listener "own-tls-$version")"; then
         echo "itest: FAILED: no warning that listener own-tls-$version does not verify its database" >&2
         failed=1
     fi
-    if logged "the certificate of the database is not verified" "listener=shared-tls-$version"; then
+    if logged "the certificate of the database is not verified" "$(field listener "shared-tls-$version")"; then
         echo "itest: FAILED: listener shared-tls-$version verifies its database and was warned about" >&2
         failed=1
     fi
@@ -266,7 +272,7 @@ for reason in \
         failed=1
     fi
 done
-if ! logged "listener=legacy-tls" "the database could not be reached"; then
+if ! logged "$(field listener legacy-tls)" "the database could not be reached"; then
     echo "itest: FAILED: pgsnare did not refuse the database that only speaks TLS 1.1" >&2
     failed=1
 fi
@@ -322,7 +328,7 @@ compose run --detach --no-deps --name "$project-open-files" pgsnare run \
 if ! await_log "$project-open-files" "listening" \
     || ! "$docker" logs "$project-open-files" 2>&1 \
         | grep -F "starting although a file that holds secrets is not protected" \
-        | grep -qF "file=/state/certs/open.key"; then
+        | grep -qF "$(field file /state/certs/open.key)"; then
     echo "itest: FAILED: pgsnare did not start with --allow-insecure-file-permissions, or did not say so" >&2
     failed=1
 fi
@@ -333,7 +339,7 @@ compose --profile limits up --detach pgsnare-one-cpu pgsnare-two-cpus >/dev/null
 for limit in "one-cpu 1" "two-cpus 2"; do
     service="pgsnare-${limit% *}"
     if ! await_log "$(compose --profile limits ps --all --quiet "$service")" \
-        "worker_threads=${limit#* }"; then
+        "\"worker_threads\":${limit#* }}"; then
         echo "itest: FAILED: $service does not run ${limit#* } worker thread(s)" >&2
         compose --profile limits logs --no-log-prefix --tail 20 "$service" >&2 || true
         failed=1

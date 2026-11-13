@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! What the tests of this program share: a `pgsnare` process and what it
+//! What the tests of the `pgsnare` process share: the process and what it
 //! wrote, a directory for its files, a database made of a few lines, and
 //! just enough of the wire protocol to log in.
+//!
+//! The binary of this build is started with a configuration file, and the
+//! tests look at what it writes and at how it ends. Everything the process
+//! talks to is test code on the loopback interface of this machine.
 
-use std::future::Future;
 use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
@@ -16,29 +19,11 @@ use std::thread;
 use std::time::Duration;
 
 use rustix::process::{Pid, Signal, kill_process};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
-/// How long a test waits for something that must happen.
-pub const PATIENCE: Duration = Duration::from_secs(20);
-
-/// Waits for something that must happen within [`PATIENCE`].
-pub async fn soon<T>(work: impl Future<Output = T>) -> T {
-    tokio::time::timeout(PATIENCE, work)
-        .await
-        .expect("this happens in time")
-}
-
-/// Waits until a condition holds, checking it every few milliseconds.
-pub async fn until(mut condition: impl FnMut() -> bool) {
-    soon(async {
-        while !condition() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-}
+use crate::support::soon;
 
 // ---------------------------------------------------------------------------
 // Files
@@ -328,27 +313,52 @@ pub async fn read_until_ready(stream: &mut (impl AsyncRead + Unpin)) -> io::Resu
 // ---------------------------------------------------------------------------
 
 /// A database that lets every client in, answers each query with the text
-/// of the query, and takes everything else without a word.
+/// of the query, and takes everything else without a word. It keeps
+/// everything clients sent it.
 pub struct Database {
     pub address: SocketAddr,
+    received: Arc<Mutex<Vec<u8>>>,
     task: JoinHandle<()>,
 }
 
 impl Database {
     pub async fn start() -> Self {
+        Self::start_with(false).await
+    }
+
+    /// A database that asks every client for its password, in clear text,
+    /// before it lets the client in. Whatever the password is, it will do.
+    pub async fn asking_for_a_password() -> Self {
+        Self::start_with(true).await
+    }
+
+    async fn start_with(password: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let received: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let all = Arc::clone(&received);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
+                let all = Arc::clone(&all);
                 tokio::spawn(async move {
-                    let _ = serve(&mut stream).await;
+                    let _ = serve(&mut stream, password, &all).await;
                 });
             }
         });
-        Self { address, task }
+        Self {
+            address,
+            received,
+            task,
+        }
+    }
+
+    /// Everything the clients of this database sent it, in the order it
+    /// arrived.
+    pub fn received(&self) -> Vec<u8> {
+        self.received.lock().unwrap().clone()
     }
 }
 
@@ -358,8 +368,16 @@ impl Drop for Database {
     }
 }
 
-async fn serve(stream: &mut TcpStream) -> io::Result<()> {
-    read_packet(stream).await?;
+async fn serve(stream: &mut TcpStream, password: bool, all: &Mutex<Vec<u8>>) -> io::Result<()> {
+    let startup = read_packet(stream).await?;
+    all.lock().unwrap().extend_from_slice(&startup);
+    if password {
+        // AuthenticationCleartextPassword, and the PasswordMessage that
+        // answers it.
+        stream.write_all(&frame(b'R', &3u32.to_be_bytes())).await?;
+        let answer = read_frame(stream).await?;
+        all.lock().unwrap().extend_from_slice(&answer);
+    }
     stream.write_all(&welcome()).await?;
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
@@ -367,10 +385,11 @@ async fn serve(stream: &mut TcpStream) -> io::Result<()> {
         if count == 0 {
             return Ok(());
         }
+        let received = &buffer[..count];
+        all.lock().unwrap().extend_from_slice(received);
         // A whole query in one read is answered. Whatever else arrives,
         // such as what a session passes on once it has given up following
         // the traffic, is taken and not answered.
-        let received = &buffer[..count];
         if received[0] == b'Q' && received.len() > 6 && received[count - 1] == 0 {
             let length = usize::try_from(u32::from_be_bytes(received[1..5].try_into().unwrap()));
             if length == Ok(count - 1) {
@@ -383,12 +402,46 @@ async fn serve(stream: &mut TcpStream) -> io::Result<()> {
 /// Connects to a proxy, logs in and returns the connection.
 pub async fn log_in(port: u16, user: &str, database: &str, application_name: &str) -> TcpStream {
     let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    start_session(&mut client, user, database, application_name, None).await;
+    client
+}
+
+/// Sends the startup message on a connection and reads until the database
+/// is ready for a query, answering a request for a password on the way.
+pub async fn start_session(
+    client: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    user: &str,
+    database: &str,
+    application_name: &str,
+    password: Option<&str>,
+) {
     client
         .write_all(&startup_message(user, database, application_name))
         .await
         .unwrap();
-    soon(read_until_ready(&mut client)).await.unwrap();
-    client
+    if let Some(password) = password {
+        // The database asks, in the clear, and is told.
+        let request = soon(read_frame(client)).await.unwrap();
+        assert_eq!(request, frame(b'R', &3u32.to_be_bytes()));
+        let mut body = password.as_bytes().to_vec();
+        body.push(0);
+        client.write_all(&frame(b'p', &body)).await.unwrap();
+    }
+    soon(read_until_ready(client)).await.unwrap();
+}
+
+/// A `Bind` message for the unnamed statement and portal, with one
+/// parameter in text format.
+pub fn bind(parameter: &[u8]) -> Vec<u8> {
+    let mut body = vec![0, 0];
+    // No format codes, one parameter, its length and its value, and no
+    // format codes for the result.
+    body.extend_from_slice(&0u16.to_be_bytes());
+    body.extend_from_slice(&1u16.to_be_bytes());
+    body.extend_from_slice(&u32::try_from(parameter.len()).unwrap().to_be_bytes());
+    body.extend_from_slice(parameter);
+    body.extend_from_slice(&0u16.to_be_bytes());
+    frame(b'B', &body)
 }
 
 // ---------------------------------------------------------------------------

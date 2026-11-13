@@ -3,9 +3,12 @@
 //! Redaction: the one place everything passes through before it leaves the
 //! process.
 //!
+//! pgsnare writes in three ways, and all three come through this module:
+//!
 //! | What is written | How it passes |
 //! |---|---|
 //! | An event, to the sinks | The dispatcher calls [`Redactor::event`] on every event before any sink sees it |
+//! | A line of the log | The format of [`crate::log`] passes every text of a line through [`Redactor::text`] |
 //! | The label of a metric | A name becomes a label through [`Redactor::label`], and in no other way |
 //!
 //! # What is removed
@@ -37,9 +40,10 @@
 //!
 //! # One redactor for the process
 //!
-//! A [`Redaction`] is a handle on the [`Redactor`] in force. Whatever
-//! writes holds the same handle, so replacing the redactor, as a reload of
-//! the tokens will, takes effect everywhere at once.
+//! A [`Redaction`] is a handle on the [`Redactor`] in force. The log, the
+//! dispatcher and the metrics hold the same handle, so replacing the
+//! redactor, as a reload of the tokens will, takes effect for all three at
+//! once.
 
 use std::borrow::Cow;
 use std::fmt;

@@ -24,7 +24,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 /// How long a test waits for something that must happen.
-pub const PATIENCE: Duration = Duration::from_secs(10);
+pub const PATIENCE: Duration = Duration::from_secs(20);
 
 /// Waits for something that must happen within [`PATIENCE`].
 pub async fn soon<T>(work: impl Future<Output = T>) -> T {
@@ -309,6 +309,8 @@ pub struct Authority {
 pub struct Identity {
     pub cert_pem: String,
     pub key_pem: String,
+    /// The key as the bytes its file encodes.
+    pub key_der: Vec<u8>,
 }
 
 impl Authority {
@@ -356,6 +358,7 @@ impl Authority {
         Identity {
             cert_pem: certificate.pem(),
             key_pem: key.serialize_pem(),
+            key_der: key.serialize_der(),
         }
     }
 }

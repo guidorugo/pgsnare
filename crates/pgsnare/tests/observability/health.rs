@@ -6,10 +6,11 @@
 use rustix::process::Signal;
 use tokio::io::AsyncWriteExt;
 
-use crate::support::{
+use crate::process::{
     BROKEN, Database, Pgsnare, TempDir, answer, free_port, http_get, log_in, metric, query,
-    read_until_ready, soon, until,
+    read_until_ready,
 };
+use crate::support::{soon, until};
 
 /// A configuration with one listener and with ports of its own for health
 /// and metrics. Returns the file and the three ports.

@@ -6,10 +6,10 @@ use pgsnare_core::event::{Event, EventKind};
 use rustix::process::Signal;
 use tokio::io::AsyncWriteExt;
 
-use crate::support::{
-    BROKEN, Database, Pgsnare, TempDir, answer, free_port, log_in, query, read_until_ready, soon,
-    until,
+use crate::process::{
+    BROKEN, Database, Pgsnare, TempDir, answer, free_port, log_in, query, read_until_ready,
 };
+use crate::support::{soon, until};
 
 #[tokio::test]
 async fn an_event_of_a_session_is_one_line_of_json_on_standard_output() {
@@ -87,6 +87,29 @@ async fn an_event_of_a_session_is_one_line_of_json_on_standard_output() {
     assert!(log.contains("listening"), "{log}");
     assert!(log.contains("stopped"), "{log}");
     assert!(!log.contains("inspection_bypassed"), "{log}");
+
+    // The log is JSON: every line of it is one object with a time, a level
+    // and a message.
+    let lines = pgsnare.stderr.lines();
+    assert!(lines.len() >= 5, "{log}");
+    for line in &lines {
+        let object: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|_| panic!("not JSON: {line}"));
+        assert!(object["timestamp"].is_string(), "{line}");
+        assert!(
+            matches!(object["level"].as_str(), Some("info" | "warn" | "error")),
+            "{line}"
+        );
+        assert!(object["message"].is_string(), "{line}");
+    }
+    let listening: serde_json::Value = lines
+        .iter()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|object| object["message"] == "listening")
+        .expect("a line about the listener");
+    assert_eq!(listening["listener"], "main");
+    assert_eq!(listening["address"], format!("127.0.0.1:{port}"));
+    assert_eq!(listening["max_connections"], 1000);
 }
 
 #[tokio::test]
@@ -116,4 +139,17 @@ async fn a_sink_that_cannot_be_built_keeps_the_proxy_from_starting() {
         "{log}"
     );
     assert!(pgsnare.stdout.bytes().is_empty());
+
+    // A proxy that cannot start says why in its log, as a line like any
+    // other.
+    let last: serde_json::Value =
+        serde_json::from_str(pgsnare.stderr.lines().last().unwrap()).unwrap();
+    assert_eq!(last["level"], "error");
+    assert_eq!(last["message"], "pgsnare cannot go on");
+    assert!(
+        last["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("events.sinks[1] (file)")
+    );
 }
