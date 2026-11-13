@@ -23,7 +23,7 @@ use tokio::signal::unix::{SignalKind, signal};
 
 use crate::builder::{Proxy, ProxyBuilder};
 use crate::config::{self, Config, UpstreamTlsMode};
-use crate::redact::{Redaction, Redactor};
+use crate::redact::{Redaction, Redactor, RedactorBuilder};
 use crate::runtime::{ListenerSettings, Runtime, Settings, Stopped, Upstream, permissions};
 use crate::sinks;
 use crate::tls::{BackendLeg, ClientLeg};
@@ -94,12 +94,16 @@ fn start(args: &Args) -> Result<(), String> {
     let policy = config.policy(1).map_err(|error| error.to_string())?;
     let module = Postgres::new();
     let listeners = listeners(&config, &module)?;
-    let redaction = Redaction::new(redactor(&config)?);
 
+    // The sinks add what they must keep to themselves to what the redactor
+    // looks for, so the redactor is complete once they are built.
+    let (sinks, redactor) =
+        sinks::from_config(&config.events, redactor(&config)).map_err(|error| error.to_string())?;
+    let redaction = Redaction::new(redactor.build().map_err(|error| error.to_string())?);
     let mut builder = ProxyBuilder::new()
         .protocol_module(Arc::new(module))
         .login_strategy(Arc::new(Relay));
-    for built in sinks::from_config(&config.events).map_err(|error| error.to_string())? {
+    for built in sinks {
         builder = builder.event_sink_with(built.sink, built.options);
     }
     let proxy = builder.build().map_err(|error| error.to_string())?;
@@ -193,8 +197,9 @@ fn outcome(stopped: Stopped) -> Result<(), String> {
     }
 }
 
-/// What must never be written anywhere: the values of the honeytokens.
-fn redactor(config: &Config) -> Result<Redactor, String> {
+/// What must never be written anywhere, as far as the configuration says
+/// it: the values of the honeytokens.
+fn redactor(config: &Config) -> RedactorBuilder {
     let mut builder = Redactor::builder();
     for token in &config.tokens {
         builder = builder.token(
@@ -203,7 +208,7 @@ fn redactor(config: &Config) -> Result<Redactor, String> {
             token.case_insensitive,
         );
     }
-    builder.build().map_err(|error| error.to_string())
+    builder
 }
 
 /// Refuses to start when a file that holds secrets is open to other users,
@@ -214,7 +219,12 @@ fn check_permissions(loaded: &config::Loaded, allow: bool) -> Result<(), String>
         .listeners
         .iter()
         .filter_map(|listener| listener.client_tls.key.as_deref());
-    let files = loaded.files.iter().map(PathBuf::as_path).chain(keys);
+    let files = loaded
+        .files
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(keys)
+        .chain(sink_secrets(&loaded.config));
     let refused = permissions::check_all(unique(files));
     if refused.is_empty() {
         return Ok(());
@@ -241,6 +251,24 @@ fn check_permissions(loaded: &config::Loaded, allow: bool) -> Result<(), String>
          --allow-insecure-file-permissions to accept the risk.",
     );
     Err(message)
+}
+
+/// The files the sinks of a configuration read a secret from: the signing
+/// key of a webhook, and its URL when that is kept in a file because it is
+/// a secret too.
+fn sink_secrets(config: &Config) -> Vec<&Path> {
+    let mut files = Vec::new();
+    for sink in &config.events.sinks {
+        if let config::Sink::Webhook(webhook) = sink {
+            if let config::SecretRef::File(file) = &webhook.hmac_secret {
+                files.push(file.as_path());
+            }
+            if let config::UrlSource::File(file) = &webhook.url {
+                files.push(file.as_path());
+            }
+        }
+    }
+    files
 }
 
 /// The files in the order given, each once.
@@ -369,7 +397,7 @@ mod tests {
              events:\n  sinks:\n    - type: stdout\n",
         )
         .unwrap();
-        let built = redactor(&config).unwrap();
+        let built = redactor(&config).build().unwrap();
         assert_eq!(
             built.text("user svc.backup.8f3k2q@mail.example"),
             "user [redacted]"
@@ -386,7 +414,7 @@ mod tests {
              events:\n  sinks:\n    - type: stdout\n",
         )
         .unwrap();
-        let error = redactor(&config).unwrap_err();
+        let error = redactor(&config).build().unwrap_err().to_string();
         assert!(!error.contains("svc.backup"), "{error}");
         assert!(
             error.contains("outer") || error.contains("inner"),

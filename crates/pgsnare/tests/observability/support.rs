@@ -294,3 +294,68 @@ impl Drop for Running {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Certificates
+// ---------------------------------------------------------------------------
+
+/// A certificate authority that exists for one test.
+pub struct Authority {
+    issuer: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
+}
+
+/// A certificate and its key, in PEM. Both are made when a test runs and
+/// are gone when it ends.
+pub struct Identity {
+    pub cert_pem: String,
+    pub key_pem: String,
+}
+
+impl Authority {
+    pub fn new(name: &str) -> Self {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        let key = rcgen::KeyPair::generate().unwrap();
+        Self {
+            issuer: rcgen::CertifiedIssuer::self_signed(params, key).unwrap(),
+        }
+    }
+
+    pub fn pem(&self) -> String {
+        self.issuer.pem()
+    }
+
+    /// The authorities a client trusts when it trusts this one alone.
+    pub fn roots(&self) -> rustls::RootCertStore {
+        use rustls::pki_types::pem::PemObject;
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from_pem_slice(self.pem().as_bytes()).unwrap())
+            .unwrap();
+        roots
+    }
+
+    /// A certificate for a server with these names, and its key.
+    pub fn issue(&self, names: &[&str]) -> Identity {
+        let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+        let mut params = rcgen::CertificateParams::new(names).unwrap();
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "a test receiver");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = params.signed_by(&key, &self.issuer).unwrap();
+        Identity {
+            cert_pem: certificate.pem(),
+            key_pem: key.serialize_pem(),
+        }
+    }
+}
