@@ -1,0 +1,4 @@
+error: listener main: <dir>/server.crt: the file holds no certificate
+error: listener main: <dir>/ca.crt: the file holds no certificate
+note: the configuration has no honeytokens, so pgsnare would detect nothing
+failed: <dir>/pgsnare.yaml: pgsnare would not start: 2 errors and no warnings

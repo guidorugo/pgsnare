@@ -88,3 +88,12 @@ pub fn run(arguments: &[&str]) -> Run {
 pub fn run_command(mut command: Command) -> Run {
     Run::from(command.output().expect("the pgsnare binary can be run"))
 }
+
+/// Waits for a command that was started, and returns what it gave.
+pub fn finish(child: std::process::Child) -> Run {
+    Run::from(
+        child
+            .wait_with_output()
+            .expect("the pgsnare binary can be waited for"),
+    )
+}

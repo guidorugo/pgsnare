@@ -194,8 +194,22 @@ mod tests {
             panic!("expected config check");
         };
         assert_eq!(args.config, Path::new("pgsnare.yaml"));
+        assert!(!args.allow_insecure_file_permissions);
         assert!(parse(&["config", "check"]).is_err());
         assert!(parse(&["config"]).is_err());
+
+        // The option of `run` that lets files through means the same here.
+        let Command::Config(ConfigCommand::Check(args)) = parse(&[
+            "config",
+            "check",
+            "--config",
+            "pgsnare.yaml",
+            "--allow-insecure-file-permissions",
+        ])
+        .unwrap() else {
+            panic!("expected config check");
+        };
+        assert!(args.allow_insecure_file_permissions);
     }
 
     #[test]
@@ -301,10 +315,38 @@ mod tests {
         };
         assert_eq!(args.config, Path::new("pgsnare.yaml"));
 
+        assert!(args.not_taken.is_empty());
+
         // The value to test is read from standard input. It is not an
         // argument, so it cannot end up in the process list or the shell
-        // history.
-        assert!(parse(&["token", "test", "-c", "pgsnare.yaml", "some-value"]).is_err());
+        // history. Something given as one is collected, so that the command
+        // can refuse it without printing it back, and it is refused.
+        for arguments in [
+            &["token", "test", "-c", "pgsnare.yaml", "some-value"][..],
+            &[
+                "token",
+                "test",
+                "-c",
+                "pgsnare.yaml",
+                "--value",
+                "some-value",
+            ],
+            &["token", "test", "-c", "pgsnare.yaml", "--value=some-value"],
+        ] {
+            let Command::Token(TokenCommand::Test(args)) = parse(arguments).unwrap() else {
+                panic!("expected token test");
+            };
+            assert!(!args.not_taken.is_empty(), "{arguments:?}");
+            let all = std::iter::once("pgsnare").chain(arguments.iter().copied());
+            assert_eq!(run_from(all), USAGE, "{arguments:?}");
+        }
+        // With the value in front, everything after it is collected too,
+        // and the parser misses --config. Its complaint does not repeat
+        // the value either.
+        let front = ["token", "test", "some-value", "-c", "pgsnare.yaml"];
+        let error = parse(&front).unwrap_err();
+        assert!(!error.to_string().contains("some-value"), "{error}");
+        assert_eq!(run_from(std::iter::once("pgsnare").chain(front)), USAGE);
         assert!(parse(&["token", "list"]).is_err());
         assert!(parse(&["token"]).is_err());
     }
@@ -325,18 +367,8 @@ mod tests {
 
     #[test]
     fn a_command_that_is_not_built_yet_fails() {
-        for arguments in [
-            &["pgsnare", "config", "check", "-c", "pgsnare.yaml"][..],
-            &["pgsnare", "token", "list", "-c", "pgsnare.yaml"],
-            &["pgsnare", "token", "test", "-c", "pgsnare.yaml"],
-            &["pgsnare", "healthcheck"],
-        ] {
-            assert_eq!(
-                run_from(arguments.iter().copied()),
-                FAILURE,
-                "{arguments:?}"
-            );
-        }
+        let arguments = ["pgsnare", "healthcheck"];
+        assert_eq!(run_from(arguments), FAILURE, "{arguments:?}");
     }
 
     #[test]

@@ -1,0 +1,2 @@
+matches honeytoken users-admin-backup: values[0], in hexadecimal
+matches honeytoken billing-canary: values[0], in another letter case

@@ -13,7 +13,14 @@
 //! randomness, and nothing on the command line leads to it. The command
 //! itself is run as well, to see that its values do differ from run to
 //! run.
+//!
+//! The commands that read a configuration are run as the binary, on files
+//! that each test writes with the access rights it means them to have.
 
+mod config_check;
 mod expected;
+mod fixture;
 mod sql;
 mod token_generate;
+mod token_list;
+mod token_test;

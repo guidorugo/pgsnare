@@ -1,0 +1,7 @@
+ID                  DATABASE  TABLE         COLUMN  RESPONSE                  ESCALATION               VALUES  LETTER CASE
+users-admin-backup  app       public.users  name    alert, kill               kill after 3 hits        1       exact
+notes-and-cards     shop      -             -       alert, tarpit, fake_data  -                        2       exact
+billing-canary      -         -             -       alert                     alert, kill after 1 hit  1       ignored
+from-a-token-file   -         café          -       alert                     -                        1       exact
+
+4 honeytokens, 5 values. Values are never shown.
