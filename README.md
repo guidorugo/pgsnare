@@ -3,7 +3,7 @@
 A PostgreSQL proxy that catches data theft with honeytokens.
 
 > [!IMPORTANT]
-> pgsnare is under construction. It cannot relay traffic yet, no version has been released, and nothing here is ready for use.
+> pgsnare is under construction. It relays traffic and detects nothing yet, no version has been released, and nothing here is ready for use.
 > [Status and roadmap](#status-and-roadmap) shows what exists today. The design is described in [docs/high-level-design.md](docs/high-level-design.md).
 
 ## What it is
@@ -91,8 +91,9 @@ Container images and the Helm chart will be published to the GitHub Container Re
 
 ## Status and roadmap
 
-pgsnare cannot be used yet. The groundwork is in place:
+pgsnare cannot be used yet: it relays traffic and does not look at it. What exists today:
 
+- **Relay.** `pgsnare run` puts a proxy between clients and a database: TLS on both legs, logins, simple and extended queries, COPY, replication, notifications, function calls and cancellation, for protocol 3.0 and 3.2. Tests compare what a client sees from PostgreSQL 15 to 18 directly and through pgsnare, in every supported TLS setup. It reads the honeytokens of a configuration and does nothing with them yet, and it has no event sinks, no health endpoint and no metrics.
 - **Wire protocol.** Framing, message views and encoders for protocol 3.0 and 3.2, tested against traffic captured from PostgreSQL 15 to 18.
 - **Honeytoken matcher.** It finds token values in a stream of bytes, however the stream is split.
 - **Configuration and events.** The configuration format, with a [complete example](examples/config/pgsnare.yaml), and the event format.
@@ -102,7 +103,7 @@ The steps to the first release:
 
 | Step | What it delivers | State |
 |---|---|---|
-| 1. Relay | A proxy that real clients cannot tell from the database | In progress |
+| 1. Relay | A proxy that real clients cannot tell from the database | Done |
 | 2. Detect and alert | Honeytokens, events and sinks. The first usable version | Not started |
 | 3. Respond | Kill, tarpit, fake data and exemptions | Not started |
 | 4. SQL rules | Optional checks on the statements themselves | Not started |
@@ -119,12 +120,14 @@ You need Docker with the Compose plugin, and `make`. Every build and test runs i
 | `make build` | Builds the workspace |
 | `make test` | Runs the tests of every crate, with and without the optional SQL rules |
 | `make lint` | Checks formatting, runs Clippy with warnings denied, and builds the API documentation |
-| `make itest` | Runs the integration tests against PostgreSQL 15 to 18 |
+| `make itest` | Builds pgsnare and runs it in front of PostgreSQL 15 to 18: the differential scenarios, the login table and the container checks |
 | `make fuzz` | Runs every fuzz target for a short time |
 | `make deny` | Checks the advisories, licences and sources of every dependency |
 | `make scan` | Scans for secrets and private network addresses |
 
 CI runs the last six on every pull request, and all of them must pass before it can be merged.
+
+`tests/bench.sh` runs a small benchmark, against PostgreSQL directly and through pgsnare. It gives a baseline for one machine and is not part of CI.
 
 ## Repository layout
 
@@ -134,7 +137,7 @@ CI runs the last six on every pull request, and all of them must pass before it 
 | `crates/pgsnare-core` | Session logic, detection, policy, actions and the event format. No I/O. |
 | `crates/pgsnare` | The runtime and the `pgsnare` command: listeners, TLS, configuration and sinks. |
 | `examples/config` | A complete configuration file, with every setting explained. |
-| `tests` | Integration tests, built to compare what a client sees from PostgreSQL directly and through pgsnare. |
+| `tests` | Integration tests. They compare what a client sees from PostgreSQL directly and through pgsnare, try every row of the login table, and check pgsnare as a container. |
 | `docs` | The design. |
 
 ## License

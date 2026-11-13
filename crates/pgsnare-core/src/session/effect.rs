@@ -29,6 +29,37 @@ pub enum Effect {
     Delay(Duration),
     /// Hand this event to the dispatcher, without waiting for it.
     Emit(Box<EventBody>),
+    /// Start TLS on the client connection, as its server side, once the
+    /// bytes queued for the client have been sent.
+    ///
+    /// The runtime answers with [`Report::ClientTlsEstablished`] when the
+    /// handshake succeeds, and ends the session when it fails. Until then
+    /// it hands the session no bytes from the client: everything the
+    /// client sends belongs to the handshake.
+    ///
+    /// [`Report::ClientTlsEstablished`]: super::Report::ClientTlsEstablished
+    AcceptTls {
+        /// Bytes the client has already sent that are the beginning of the
+        /// handshake. They are empty unless the client opened the
+        /// connection with a handshake, without asking first.
+        handshake: Vec<u8>,
+        /// Whether the handshake must select the ALPN protocol of the
+        /// protocol module. A handshake that does not is refused.
+        alpn_required: bool,
+    },
+    /// Open the connection to the database, with TLS as configured for the
+    /// listener.
+    ///
+    /// The runtime answers with [`Report::BackendConnected`] or
+    /// [`Report::BackendUnavailable`].
+    ///
+    /// [`Report::BackendConnected`]: super::Report::BackendConnected
+    /// [`Report::BackendUnavailable`]: super::Report::BackendUnavailable
+    ConnectBackend,
+    /// The database has accepted the login. The limits for clients that
+    /// have not logged in, such as the time allowed for it, no longer
+    /// apply to this session.
+    LoginFinished,
 }
 
 /// Everything one step of the session logic produced.
@@ -82,6 +113,12 @@ mod tests {
         out.to_client.extend_from_slice(b"abc");
         out.effects.push(Effect::Close(Leg::Client));
         out.effects.push(Effect::Delay(Duration::from_millis(5)));
+        out.effects.push(Effect::AcceptTls {
+            handshake: Vec::new(),
+            alpn_required: false,
+        });
+        out.effects.push(Effect::ConnectBackend);
+        out.effects.push(Effect::LoginFinished);
         assert!(!out.is_empty());
 
         out.clear();

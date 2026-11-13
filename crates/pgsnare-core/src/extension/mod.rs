@@ -30,5 +30,5 @@ mod protocol;
 mod sink;
 
 pub use login::{LoginDecision, LoginError, LoginExchange, LoginStrategy, Relay};
-pub use protocol::{ProtocolModule, ProtocolSession, SessionError};
+pub use protocol::{ProtocolModule, ProtocolSession, SessionError, TlsRequest};
 pub use sink::{EventSink, SinkError, SinkFuture};

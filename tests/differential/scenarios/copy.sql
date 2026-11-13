@@ -1,6 +1,6 @@
 -- SPDX-License-Identifier: Apache-2.0
 --
--- COPY in both directions, in text and CSV format.
+-- COPY in both directions, in text, CSV and binary format.
 
 CREATE TABLE item (id int, name text, note text);
 
@@ -28,3 +28,12 @@ not-a-number	zeta	broken
 \.
 
 SELECT count(*) AS items FROM item;
+
+-- Binary format: out through the client into a file, and in again.
+\copy item to '/tmp/pgsnare-scenario-items.bin' with (format binary)
+CREATE TABLE item_again (LIKE item);
+\copy item_again from '/tmp/pgsnare-scenario-items.bin' with (format binary)
+SELECT id, name, note FROM item_again ORDER BY id;
+
+-- Binary format, as the bytes the server sends.
+COPY (SELECT id, name FROM item ORDER BY id) TO STDOUT WITH (FORMAT binary);

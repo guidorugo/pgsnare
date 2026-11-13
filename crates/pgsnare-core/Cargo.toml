@@ -19,11 +19,13 @@ workspace = true
 
 [features]
 default = ["rules"]
-# Optional SQL rules. A build without this feature contains no C code.
+# Optional SQL rules. A build without this feature does not contain the SQL
+# parser, which is C code.
 rules = []
 
 [dependencies]
 aho-corasick.workspace = true
+pgsnare-proto.workspace = true
 serde.workspace = true
 
 [dev-dependencies]

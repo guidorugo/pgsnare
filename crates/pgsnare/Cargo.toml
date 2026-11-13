@@ -13,14 +13,23 @@ workspace = true
 
 [features]
 default = ["rules"]
-# Optional SQL rules. A build without this feature contains no C code.
+# Optional SQL rules. A build without this feature does not contain the SQL
+# parser, which is C code.
 rules = ["pgsnare-core/rules"]
 
 [dependencies]
 clap.workspace = true
 pgsnare-core.workspace = true
+rustix.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
 serde.workspace = true
 serde-saphyr.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+rcgen.workspace = true

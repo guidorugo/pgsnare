@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Fuzz targets for pgsnare-core, run with cargo-fuzz: `make fuzz`. This
+# package is not a member of the workspace: it needs a nightly toolchain and
+# has its own lock file.
+
+[package]
+name = "pgsnare-core-fuzz"
+description = "Fuzz targets for pgsnare-core."
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+repository = "https://github.com/guidorugo/pgsnare"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Keeps this package out of any workspace above it.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+pgsnare-core = { path = ".." }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# Fuzz builds keep integer overflow checks and debug assertions on.
+[profile.release]
+debug = 1
+overflow-checks = true
+debug-assertions = true
+
+[[bin]]
+name = "session"
+path = "fuzz_targets/session.rs"
+test = false
+doc = false
+bench = false
