@@ -390,3 +390,35 @@ pub async fn log_in(port: u16, user: &str, database: &str, application_name: &st
     soon(read_until_ready(&mut client)).await.unwrap();
     client
 }
+
+// ---------------------------------------------------------------------------
+// HTTP, by hand
+// ---------------------------------------------------------------------------
+
+/// Sends a `GET` to a port of this machine and returns the status and the
+/// body of the answer.
+pub async fn http_get(port: u16, path: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    stream
+        .write_all(format!("GET {path} HTTP/1.1\r\nhost: localhost\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut answer = Vec::new();
+    soon(stream.read_to_end(&mut answer)).await.unwrap();
+    let text = String::from_utf8(answer).unwrap();
+    let (head, body) = text.split_once("\r\n\r\n").expect("a head and a body");
+    let status = head
+        .strip_prefix("HTTP/1.1 ")
+        .and_then(|rest| rest.get(..3))
+        .and_then(|code| code.parse().ok())
+        .expect("a status line");
+    (status, body.to_owned())
+}
+
+/// The value of a metric without labels, or with exactly the labels given
+/// as they are written, such as `{sink="stdout-0"}`.
+pub fn metric(text: &str, series: &str) -> Option<f64> {
+    text.lines()
+        .filter(|line| !line.starts_with('#'))
+        .find_map(|line| line.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
+}

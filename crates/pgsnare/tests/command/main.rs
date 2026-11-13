@@ -8,5 +8,6 @@
 //! loopback interface of this machine. Keys and certificates are made when
 //! a test runs and are gone when it ends.
 
+mod health;
 mod stdout;
 mod support;

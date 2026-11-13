@@ -24,8 +24,11 @@ async fn an_event_of_a_session_is_one_line_of_json_on_standard_output() {
              inspection:\n  on_error: fail_open\n\
              events:\n  labels: {{ environment: test }}\n  labels_from_env: [POD_NAME]\n  \
              sinks:\n    - type: stdout\n\
+             admin:\n  listen: 127.0.0.1:{}\nmetrics:\n  listen: 127.0.0.1:{}\n\
              shutdown:\n  grace_period: 1s\n",
-            database.address
+            database.address,
+            free_port(),
+            free_port()
         )
         .as_bytes(),
     );

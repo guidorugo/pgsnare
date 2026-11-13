@@ -11,6 +11,7 @@
 //! It logs to standard error, one line for each thing worth knowing. No
 //! line contains anything a client or a database sent.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +22,7 @@ use pgsnare_core::policy::FixedPolicy;
 use pgsnare_core::session::postgres::Postgres;
 use tokio::signal::unix::{SignalKind, signal};
 
+use crate::admin;
 use crate::builder::{Proxy, ProxyBuilder};
 use crate::config::{self, Config, UpstreamTlsMode};
 use crate::redact::{Redaction, Redactor, RedactorBuilder};
@@ -120,7 +122,12 @@ fn start(args: &Args) -> Result<(), String> {
         .with_labels(labels(&config))
         .with_event_capacity(usize::try_from(config.events.queue_size).unwrap_or(usize::MAX))
         .with_dedup_window(config.events.dedup_window)
-        .with_redaction(redaction);
+        .with_redaction(redaction.clone());
+    let observed = Observed {
+        admin: config.admin.listen.socket_addr(),
+        metrics: config.metrics.listen.socket_addr(),
+        redaction,
+    };
 
     let workers = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -134,10 +141,29 @@ fn start(args: &Args) -> Result<(), String> {
         "starting, with one worker thread for each processor this process may use"
     );
     install_panic_hook();
-    runtime.block_on(serve(proxy, Arc::new(FixedPolicy::new(policy)), settings))
+    runtime.block_on(serve(
+        proxy,
+        Arc::new(FixedPolicy::new(policy)),
+        settings,
+        observed,
+    ))
 }
 
-async fn serve(proxy: Proxy, policy: Arc<FixedPolicy>, settings: Settings) -> Result<(), String> {
+/// Where the proxy can be watched from, and what its metrics pass through.
+struct Observed {
+    /// The address of the admin listener, with the health endpoints.
+    admin: SocketAddr,
+    /// The address of the metrics listener.
+    metrics: SocketAddr,
+    redaction: Redaction,
+}
+
+async fn serve(
+    proxy: Proxy,
+    policy: Arc<FixedPolicy>,
+    settings: Settings,
+    observed: Observed,
+) -> Result<(), String> {
     // The handlers are in place before the first client is accepted. As
     // process 1 of a container, pgsnare would otherwise not be stopped by
     // these signals at all.
@@ -157,7 +183,44 @@ async fn serve(proxy: Proxy, policy: Arc<FixedPolicy>, settings: Settings) -> Re
             "listening"
         );
     }
-    let bound = Runtime::new(proxy, policy, settings)
+    let runtime = Runtime::new(proxy, policy, settings);
+
+    // The health endpoints and the metrics answer from before the first
+    // client is accepted until after the last session has ended, so that
+    // a proxy that starts or stops can be told from one that is gone.
+    for (name, address) in [("admin", observed.admin), ("metrics", observed.metrics)] {
+        if !address.ip().is_loopback() {
+            tracing::warn!(
+                listener = name,
+                address = %address,
+                "this listener is not bound to the loopback interface: whoever can reach its \
+                 address can read what it serves, without encryption and without a login"
+            );
+        }
+    }
+    let watchers = admin::bind(
+        observed.admin,
+        observed.metrics,
+        runtime.status(),
+        observed.redaction,
+    )
+    .map_err(|error| {
+        format!(
+            "cannot open the admin listener or the metrics listener: {}",
+            error.kind()
+        )
+    })?;
+    tracing::info!(
+        admin = %observed.admin,
+        metrics = %observed.metrics,
+        "serving the health endpoints and the metrics"
+    );
+    let (stop_watchers, watchers_stopped) = tokio::sync::oneshot::channel::<()>();
+    let watching = tokio::spawn(watchers.serve(async move {
+        let _ = watchers_stopped.await;
+    }));
+
+    let bound = runtime
         .bind()
         .map_err(|error| format!("cannot open a listener: {}", error.kind()))?;
     bound.compare_certificates(CERTIFICATE_PROBE_TIMEOUT).await;
@@ -184,6 +247,8 @@ async fn serve(proxy: Proxy, policy: Arc<FixedPolicy>, settings: Settings) -> Re
             }
         })
         .await;
+    let _ = stop_watchers.send(());
+    let _ = watching.await;
     outcome(stopped)
 }
 

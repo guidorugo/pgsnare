@@ -746,6 +746,11 @@ impl Status {
         self.sink_panics.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// The code that serves the health endpoints or the metrics panicked.
+    pub(crate) fn admin_panicked(&self) {
+        self.admin_panics.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Makes the counters of the sinks of a proxy, one for each name and
     /// queue length, and keeps them for [`Status::sinks`]. The sinks a
     /// status knew before are forgotten.
@@ -860,6 +865,7 @@ mod tests {
         status.event_taken(EventKind::InspectionBypassed);
         status.event_deduplicated();
         status.sink_panicked();
+        status.admin_panicked();
 
         let counters = status.counters();
         assert_eq!(counters.event_queue_capacity, 8);
@@ -867,6 +873,7 @@ mod tests {
         assert_eq!(counters.events_by_kind, [1, 0, 0, 0, 2, 0]);
         assert_eq!(counters.events_deduplicated, 1);
         assert_eq!(counters.sink_panics, 1);
+        assert_eq!(counters.admin_panics, 1);
 
         // A queue is never emptier than empty.
         status.event_dequeued();

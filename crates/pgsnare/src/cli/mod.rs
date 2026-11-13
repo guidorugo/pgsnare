@@ -261,12 +261,28 @@ mod tests {
             panic!("expected healthcheck");
         };
         assert_eq!(args.config, None);
+        assert!(!args.ready);
 
         let Command::Healthcheck(args) = parse(&["healthcheck", "-c", "pgsnare.yaml"]).unwrap()
         else {
             panic!("expected healthcheck");
         };
         assert_eq!(args.config.as_deref(), Some(Path::new("pgsnare.yaml")));
+        assert!(!args.ready);
+
+        let Command::Healthcheck(args) =
+            parse(&["healthcheck", "--ready", "--config", "pgsnare.yaml"]).unwrap()
+        else {
+            panic!("expected healthcheck");
+        };
+        assert!(args.ready);
+        assert_eq!(args.config.as_deref(), Some(Path::new("pgsnare.yaml")));
+
+        // The address to ask is never an argument: it comes from the
+        // configuration, so that the check cannot be pointed elsewhere.
+        assert!(parse(&["healthcheck", "127.0.0.1:9641"]).is_err());
+        assert!(parse(&["healthcheck", "--address", "127.0.0.1:9641"]).is_err());
+        assert!(parse(&["healthcheck", "--url", "http://example.com/"]).is_err());
     }
 
     #[test]
@@ -276,7 +292,6 @@ mod tests {
             &["pgsnare", "token", "generate", "--kind", "email"],
             &["pgsnare", "token", "list", "-c", "pgsnare.yaml"],
             &["pgsnare", "token", "test", "-c", "pgsnare.yaml"],
-            &["pgsnare", "healthcheck"],
         ] {
             assert_eq!(
                 run_from(arguments.iter().copied()),
