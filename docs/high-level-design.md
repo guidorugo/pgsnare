@@ -280,7 +280,8 @@ Not supported in the first version: login with client certificates, GSSAPI encry
 - A token is one or more values with an id, an optional scope hint used only for reporting, and its response.
 - Values must be ASCII and at least 12 bytes. Matching then does not depend on the client's character encoding, and accidental matches are implausible.
 - Each value compiles to a small set of byte patterns: the raw value, its lowercase hex form (how `bytea` is printed in text format) and, if requested, a case-insensitive variant.
-- A token list in which data matching one value would also match another is rejected. That covers a value used twice and a value that contains a pattern of another. Every match then belongs to exactly one token.
+- A token list in which data matching one value would also match another is rejected. That covers a value used twice and a value that contains a pattern of another. Every match then belongs to exactly one token. The loader of the configuration applies this rule, so a configuration that loads is one the matcher compiles.
+- The values pgsnare generates follow these rules by construction: see [section 9.1](#91-bait).
 - All patterns are matched in one pass with the Aho-Corasick algorithm.
 
 ### 8.2 What is scanned
@@ -343,6 +344,28 @@ Result inspection cannot see everything, and the documentation must say so.
 - **Flagged sessions.** Once a session has triggered, each later statement emits a `session_activity` event, giving a timeline of what the session did next.
 - **Exemptions.** Hits from a listed database user or client address range are counted and trigger nothing. Without this, a backup, a replica or an ETL job that reads whole tables through pgsnare would fire every time. Address-based exemptions are only as trustworthy as the address pgsnare sees; see [section 14.5](#145-scaling-and-client-addresses).
 
+### 9.1 Bait
+
+Bait is a made-up value of a kind an intruder looks for. `pgsnare token generate` prints bait to plant as honeytokens, and the `fake_data` response puts bait into the rows it adds. Both use the same generators.
+
+| Kind | Value |
+|---|---|
+| Account | The name of a made-up service account, such as `svc.backup.` and twelve random characters, and its email address at a domain the operator supplies |
+| bcrypt | `$2a$12$` and 53 characters |
+| Argon2id | `$argon2id$v=19$m=65536,t=3,p=4$`, a salt and a hash |
+| SCRAM-SHA-256 | A verifier as PostgreSQL stores one: `SCRAM-SHA-256$4096:`, a salt, a stored key and a server key |
+| API key | 40 letters, digits, `-` and `_` |
+| Card number | 16 digits that begin with `99` and end with a Luhn check digit |
+| Marker | Four groups of four upper-case letters and digits, to put into free text |
+
+- **Every value is a valid honeytoken.** It is ASCII, at least 12 bytes long, and made of characters that none of the text formats of PostgreSQL escapes, so it is found wherever it is printed.
+- **Every value is new.** All of its randomness comes from the secure random generator of the operating system. If that fails, no value is made. Nothing makes the values predictable: there is no seed, as an option, in the environment or in the build.
+- **A hash is the hash of nothing.** It has the exact format of its kind, and random bytes where a real hash holds what was computed. No password belongs to it.
+- **No real person, domain or service.** An account name is made of ordinary words, an email address uses the domain of the operator, and an API key carries no prefix of a service that exists.
+- **A card number is kept away from the numbers of real cards.** No range of card numbers that is reserved for testing was found. The numbers stay out of the ranges of the payment schemes instead. The first digit of a card number names an industry, and the digits that include banking and finance are 2 to 6. These numbers begin with `99`. The digit 9 is left to national standards bodies, and what they assign continues, as far as could be found out, with a country code, of which none begins with 9. Whoever looks at the first digit can tell that such a number is not a payment card. See [section 18](#18-open-points).
+
+An account is one value in the configuration: its name. The email address contains the name, so data from either column sets the token off.
+
 ## 10. SQL rules
 
 Rules are optional. They flag suspicious statements before any data is read:
@@ -365,7 +388,7 @@ How they are built:
 - **Reload triggers.** `SIGHUP`, or a change to a watched file, including the atomic symlink swap Kubernetes uses for mounted volumes. Listener changes need a restart.
 - **One YAML file**, with honeytoken values optionally in separate files so they can be stored as a secret.
 - **Secrets** such as webhook signing keys come from environment variables or files, never from the configuration body.
-- **File permissions.** pgsnare refuses to start if a private key, token file or configuration file is open to other users, unless explicitly overridden. The rule is PostgreSQL's own: a file owned by the process user must not be readable by group or others, and a root-owned file may be group-readable. A file owned by anyone else is refused. The override is the option `--allow-insecure-file-permissions` of `pgsnare run`, and every file it lets through is named in the log.
+- **File permissions.** pgsnare refuses to start if a private key, token file or configuration file is open to other users, unless explicitly overridden. The rule is PostgreSQL's own: a file owned by the process user must not be readable by group or others, and a root-owned file may be group-readable. A file owned by anyone else is refused. The override is the option `--allow-insecure-file-permissions` of `pgsnare run`, and every file it lets through is named in the log. `pgsnare config check` takes the same option, and then reports such a file as a warning.
 
 The format is strict: an unknown field is an error, at least one sink is required, and a webhook sink must name its signing key.
 
@@ -407,6 +430,33 @@ events:
 admin:   { listen: 127.0.0.1:9641 }                  # health, loopback only
 metrics: { listen: 127.0.0.1:9642 }
 ```
+
+### 11.1 Commands
+
+| Command | What it does |
+|---|---|
+| `pgsnare run` | Runs the proxy |
+| `pgsnare config check` | Checks a configuration and reports every problem |
+| `pgsnare token generate` | Makes honeytokens, and prints the SQL that plants them and the token file that matches |
+| `pgsnare token list` | Lists the honeytokens of a configuration, without their values |
+| `pgsnare token test` | Says whether a value matches a honeytoken of a configuration |
+| `pgsnare healthcheck` | Asks a running proxy whether it is healthy |
+
+**`config check`** uses the code of `run`: the same loader, the same rule for the access rights of the same files, and the same functions to read certificates and keys. A configuration that passes starts, and one that fails does not, as far as that can be known without connecting to anything. The check opens no listener and no connection.
+
+- It reports every problem it can find in one run: unknown fields, honeytokens that are not valid, and files that are missing or open to other users.
+- It warns about settings that are valid and give up some protection: a database whose certificate is not verified, `fail_open`, a sink over plain HTTP, and an admin or metrics listener beyond loopback.
+- Any error gives a non-zero exit status. Warnings alone do not.
+
+**`token generate`** connects to nothing and writes nothing but its output. It prints one SQL script: an `INSERT` with a row for each honeytoken, and the token file for pgsnare inside an SQL comment. The operator reviews it, runs it, and gives the token file to pgsnare.
+
+- Names and values are quoted for the place they are printed in, so that no name of a table or a column can end the statement or begin another. A name with a control character is refused.
+- The script is plain ASCII whatever the names are made of. A name outside ASCII is written with the code points of its characters, so that the script reads the same in every client encoding.
+
+**`token list` and `token test`** never show the value of a honeytoken.
+
+- `token list` shows ids, scopes, responses, and how many values a token has.
+- `token test` reads a value from standard input, so that the value does not end up in the shell history or the process list. A terminal is refused, because what is typed there is shown. The command answers with the id of every token the value matches, and scans its input the way traffic is scanned.
 
 ## 12. Events and observability
 
@@ -553,6 +603,9 @@ An attacker with root on the pgsnare host is out of scope.
 - The admin and metrics listeners bind to loopback by default and are read-only. There is no remote administration interface.
 - Webhook sinks require HTTPS with certificate verification. Plain HTTP takes an explicit setting.
 - Token values, passwords and key material never reach logs, events or metrics.
+- No command shows the value of a honeytoken that exists. `pgsnare token generate` prints the values it makes, once, and keeps nothing.
+- Generated honeytokens take all their randomness from the secure random generator of the operating system. If it fails, nothing is generated.
+- `pgsnare config check` warns when a configuration departs from these defaults: verification of the database's certificate turned off, `fail_open`, a sink over plain HTTP, or an admin or metrics listener beyond loopback.
 
 ### 15.3 Hardening
 
@@ -613,9 +666,11 @@ These are design targets, not measurements.
 - **Property tests.** The scanner finds the same matches however the bytes are chunked.
 - **Fuzzing.** Framer, startup packets, the whole session logic with interleaved input, the configuration loader and the rule engine.
 - **Leak test.** No token value, password or key reaches a log, event or metric.
+- **Commands and bait.** The output of every command is compared with expected output. What `token generate` prints is run by PostgreSQL 15 to 18, with names that try to get out of their quotes. The SCRAM-SHA-256 bait is given to PostgreSQL as a password, and the bcrypt bait to its `pgcrypto` extension. Every configuration that `config check` refuses is given to `pgsnare run`, which must refuse it too.
 - **Benchmarks.** One reproducible script with pinned CPU sets.
 - **Container and Kubernetes tests.** The image runs with a read-only root filesystem and all capabilities dropped. The chart is installed into a namespace that enforces the restricted Pod Security Standard. Tests cover both Kubernetes patterns from install to first alert, a token added through the mounted Secret, a rolling update with drain, and NetworkPolicy isolation.
 
 ## 18. Open points
 
 - Whether the reference benchmark on a 16-core machine is a release gate, or a scaled-down run is accepted.
+- Whether card numbers stay among the kinds of bait. No range of card numbers that is reserved for testing was found, so the generated numbers begin with `99`, outside the ranges of the payment schemes. That is meant to keep them from being the number of a card, and it lets a careful reader tell them from one. The clauses of the numbering standard that would confirm the choice were not read.

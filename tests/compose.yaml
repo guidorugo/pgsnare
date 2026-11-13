@@ -14,12 +14,16 @@
 #             volume that pgsnare mounts too
 #   pglegacy  a database that speaks no TLS version above 1.1, to show
 #             that pgsnare refuses one
+#   offline   the pgsnare binary in a container without a network and
+#             without a place to write to, for `token generate`
 #   pgsnare   one proxy in front of all of them, with a listener for each
 #             database and each TLS setup. It runs the binary that
 #             `make itest` built, in a container with a read-only root
 #             filesystem and no capabilities.
 #   client    runs the test scripts, such as the differential runner
-#             tests/differential/run.sh, and is started once for each
+#             tests/differential/run.sh, and is started once for each. It
+#             has the pgsnare binary as well, for the checks of what the
+#             commands print: tests/bait/check.sh
 #
 # Every container runs as the user `postgres` of its image, which has the
 # same id in all of them. A file one of them writes to a volume therefore
@@ -125,6 +129,23 @@ services:
     cpus: 2
     healthcheck:
       disable: true
+
+  # The binary once more, in a container without a network and without a
+  # place to write to, for the commands that must need neither.
+  offline:
+    image: postgres:18.6-trixie@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
+    profiles:
+      - offline
+    user: postgres
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    network_mode: none
+    entrypoint: ["/usr/local/bin/pgsnare"]
+    volumes:
+      - ${ITEST_BINARY:?run the tests with make itest}:/usr/local/bin/pgsnare:ro
 
   pg15:
     <<: *postgres
@@ -236,6 +257,10 @@ services:
     environment:
       PGPASSWORD: ${PGSNARE_ITEST_PASSWORD:?run the tests with make itest}
     volumes:
+      # The binary under test, for the checks of what its commands print:
+      # tests/bait/check.sh.
+      - ${ITEST_BINARY:?run the tests with make itest}:/usr/local/bin/pgsnare:ro
+      - ./bait:/bait:ro
       - ./differential:/differential:ro
       - ./login:/login:ro
       - state:/state:ro
