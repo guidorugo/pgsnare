@@ -6,22 +6,20 @@
 //! Each test starts a proxy on a free port of this machine, in front of a
 //! database that is a few lines of test code.
 
-mod support;
-
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::support::{
+    A_WHILE, Database, GSSENC_REQUEST, ProxyOptions, Running, SSL_REQUEST, TempDir, answer,
+    cancel_request, error_fields, frame, policy, query, read_frame, read_packet, read_to_end,
+    read_until_ready, serve_queries, serve_session, soon, startup_message, until, welcome,
+};
 use pgsnare::runtime::Upstream;
 use pgsnare_core::event::EventKind;
 use pgsnare_core::extension::{LoginStrategy, ProtocolModule, ProtocolSession, SessionError};
 use pgsnare_core::policy::{OnError, PolicySnapshot};
 use pgsnare_core::session::{Direction, Effect, Leg, Output, Report, SessionOrigin};
-use support::{
-    A_WHILE, Database, GSSENC_REQUEST, ProxyOptions, Running, SSL_REQUEST, TempDir, answer,
-    cancel_request, error_fields, frame, policy, query, read_frame, read_packet, read_to_end,
-    read_until_ready, serve_queries, serve_session, soon, startup_message, until, welcome,
-};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener};
 
@@ -406,6 +404,43 @@ async fn a_client_that_stops_reading_holds_back_the_database_and_loses_nothing()
             .chunks(64 * 1024)
             .all(|row| row[0] == b'D' && row[5..] == [7u8; 64 * 1024 - 5])
     );
+}
+
+#[tokio::test]
+async fn a_session_gives_back_its_buffers_when_it_goes_quiet() {
+    // What a quiet session reads into, for both directions together, and
+    // what a busy direction reads into.
+    const QUIET: u64 = 2 * 1024;
+    const BUSY: u64 = 64 * 1024;
+
+    let database = Database::echo().await;
+    let proxy = Running::start(Running::listener(database.upstream())).await;
+    let held = || proxy.status.counters().read_buffer_bytes;
+    assert_eq!(held(), 0);
+
+    let (mut client, _) = proxy.log_in().await;
+    assert_eq!(held(), QUIET);
+
+    // A megabyte in each direction: both buffers grow.
+    let sql = "z".repeat(1024 * 1024);
+    client.write_all(&query(&sql)).await.unwrap();
+    let reply = soon(read_until_ready(&mut client)).await.unwrap();
+    assert!(reply == answer(sql.as_bytes()));
+    assert_eq!(held(), 2 * BUSY);
+
+    // Nothing happens for a while: the session is down to what a quiet
+    // one holds, and it still works.
+    until(|| held() == QUIET).await;
+    client.write_all(&query("SELECT 1")).await.unwrap();
+    assert_eq!(
+        soon(read_until_ready(&mut client)).await.unwrap(),
+        answer(b"SELECT 1")
+    );
+    assert_eq!(held(), QUIET);
+
+    // A session that is over holds nothing.
+    drop(client);
+    until(|| held() == 0).await;
 }
 
 #[tokio::test]

@@ -4,8 +4,6 @@
 //! made of a few lines, a client that speaks just enough of the protocol,
 //! and certificates that exist only while a test runs.
 
-#![allow(dead_code)]
-
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;

@@ -8,22 +8,20 @@
 //! peer would not: speak before the handshake, leave out the ALPN
 //! extension, or present the wrong certificate.
 
-mod support;
-
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
+use crate::support::{
+    self, Authority, Database, Identity, Running, SSL_REQUEST, TempDir, answer, error_fields,
+    query, read_packet, read_to_end, read_until_ready, serve_session, soon, startup_message,
+    tls_legs, until, welcome, yaml_path,
+};
 use pgsnare::runtime::{ListenerSettings, Upstream};
 use pgsnare::tls::{self, BackendLeg, BackendTlsUse, ClientLeg, TlsError};
 use pgsnare_core::session::TlsPolicy;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
-use support::{
-    Authority, Database, Identity, Running, SSL_REQUEST, TempDir, answer, error_fields, query,
-    read_packet, read_to_end, read_until_ready, serve_session, soon, startup_message, tls_legs,
-    until, welcome, yaml_path,
-};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -389,6 +387,18 @@ async fn a_connection_that_opens_with_a_handshake_must_name_the_protocol() {
             "the connection was closed during the handshake"
         };
         assert_eq!(tls::describe(&refused), expected, "{refused:?}");
+        if versions.len() == 1 {
+            // The alert is the one PostgreSQL sends in this case.
+            let alert = refused
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<rustls::Error>());
+            assert_eq!(
+                alert,
+                Some(&rustls::Error::AlertReceived(
+                    rustls::AlertDescription::NoApplicationProtocol
+                ))
+            );
+        }
     }
     // The same holds after a request for TLS.
     let config = client_config(&pki.authority, both_versions(), &[b"h2"]);
@@ -521,6 +531,40 @@ async fn a_certificate_that_does_not_verify_stops_the_login() {
         let (_client, greeting) = proxy.log_in().await;
         assert_eq!(greeting, welcome());
     }
+}
+
+#[tokio::test]
+async fn the_name_of_the_database_is_looked_for_in_the_alternative_names_only() {
+    let pki = Pki::new();
+    let by_name = |database: &Database| Upstream::Tcp {
+        host: "localhost".to_owned(),
+        port: database.address.port(),
+    };
+
+    // A certificate that names the database among its alternative names.
+    let database = tls_database(&pki.authority.issue(&pki.dir, "named", &["localhost"])).await;
+    let proxy = Running::start(listener(
+        by_name(&database),
+        "{ mode: disable }",
+        &pki.verified(),
+    ))
+    .await;
+    let (_client, greeting) = proxy.log_in().await;
+    assert_eq!(greeting, welcome());
+
+    // A certificate that carries the same name in its common name and has
+    // no alternative names: the common name does not count.
+    let database = tls_database(&pki.authority.issue(&pki.dir, "localhost", &[])).await;
+    let proxy = Running::start(listener(
+        by_name(&database),
+        "{ mode: disable }",
+        &pki.verified(),
+    ))
+    .await;
+    let mut client = proxy.connect().await;
+    client.write_all(&startup_message()).await.unwrap();
+    assert_eq!(error_fields(&read_to_end(&mut client).await)[2].1, "57P03");
+    assert_eq!(proxy.status.counters().backend_failures, 1);
 }
 
 #[tokio::test]
