@@ -83,9 +83,10 @@ fn install_panic_hook() {
 }
 
 fn start(args: &Args) -> Result<(), String> {
+    // Before the first secret is read: the token files hold some.
+    disable_core_dumps();
     let loaded = config::load(&args.config).map_err(|error| error.to_string())?;
     check_permissions(&loaded, args.allow_insecure_file_permissions)?;
-    disable_core_dumps();
 
     let config = loaded.config;
     let policy = config.policy(1).map_err(|error| error.to_string())?;
