@@ -25,9 +25,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use pgsnare_core::actions::TarpitPlaces;
+use pgsnare_core::bait::Entropy;
 use pgsnare_core::event::Labels;
 use pgsnare_core::extension::Relay;
-use pgsnare_core::session::postgres::Postgres;
+use pgsnare_core::session::postgres::{Postgres, Responses};
 use tokio::signal::unix::{SignalKind, signal};
 
 use crate::admin;
@@ -35,7 +37,9 @@ use crate::builder::{Proxy, ProxyBuilder};
 use crate::config::{self, Config, UpstreamTlsMode};
 use crate::redact::{Redaction, Redactor, RedactorBuilder, Sha256};
 use crate::reload::{self, Reloader, SharedPolicy, Started};
-use crate::runtime::{ListenerSettings, Runtime, Settings, Stopped, Upstream, permissions};
+use crate::runtime::{
+    ListenerSettings, OsEntropy, Runtime, Settings, Stopped, Upstream, permissions,
+};
 use crate::sinks;
 use crate::tls::{BackendLeg, ClientLeg};
 
@@ -104,7 +108,12 @@ fn start(args: &Args, redaction: &Redaction) -> Result<(), String> {
             .map_err(|error| error.to_string())?,
     );
     let policy = config.policy(1).map_err(|error| error.to_string())?;
-    let module = Postgres::scanning(Arc::new(Sha256));
+    let entropy = OsEntropy::new().map_err(|error| error.to_string())?;
+    let responses = Responses::new(
+        move || -> Box<dyn Entropy + Send> { Box::new(entropy) },
+        Arc::new(TarpitPlaces::new()),
+    );
+    let module = Postgres::responding(Arc::new(Sha256), responses);
     let listeners = listeners(&config, &module)?;
 
     // The sinks add what they must keep to themselves to what the redactor

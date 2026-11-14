@@ -123,7 +123,8 @@ use std::sync::Arc;
 use pgsnare_proto::startup::StartupMessage;
 use pgsnare_proto::{Chunk, Frame, FrameHeader, backend, frontend};
 
-use crate::actions;
+use crate::actions::{self, Tarpit, TarpitPlaces};
+use crate::bait::Entropy;
 use crate::detect::{Match, Matcher, ScanError, StreamScanner};
 use crate::event::{EventBody, EventKind, Query, StatementDigest};
 use crate::policy::{Action, ActionSet, PolicySnapshot, TokenId};
@@ -193,15 +194,18 @@ impl Half {
 /// The most tokens whose hits a scanner counts one by one.
 pub(super) const MAX_COUNTED_TOKENS: usize = 1024;
 
-/// The responses that are built.
-const BUILT: [Action; 2] = [Action::Alert, Action::Kill];
+/// The responses every scanner can carry out.
+const ALWAYS_BUILT: [Action; 2] = [Action::Alert, Action::Kill];
 
 /// The responses that are carried out, of those the policy decided: the
-/// built ones, or `alert` when none of them is built.
-fn carried_out(decided: ActionSet) -> ActionSet {
+/// ones in `built`, or `alert` when none of them is. `kill` ends the
+/// session, so with it nothing is slowed down or added.
+fn carried_out(decided: ActionSet, built: ActionSet) -> ActionSet {
+    let kill = decided.contains(Action::Kill);
     let mut actions = ActionSet::EMPTY;
-    for action in BUILT {
-        if decided.contains(action) {
+    for action in decided.iter() {
+        let ended = kill && matches!(action, Action::Tarpit | Action::FakeData);
+        if built.contains(action) && !ended {
             actions.insert(action);
         }
     }
@@ -209,6 +213,69 @@ fn carried_out(decided: ActionSet) -> ActionSet {
         ActionSet::ALERT
     } else {
         actions
+    }
+}
+
+/// What a scanner needs for the responses that go beyond `alert` and
+/// `kill`: a source of randomness for each session, and the places for
+/// tarpitted sessions of the whole proxy.
+#[derive(Clone)]
+pub struct Responses {
+    entropy: Arc<dyn Fn() -> Box<dyn Entropy + Send> + Send + Sync>,
+    tarpits: Arc<TarpitPlaces>,
+}
+
+impl Responses {
+    /// Responses whose sessions each draw from a source `entropy` makes,
+    /// and share `tarpits`.
+    #[must_use]
+    pub fn new(
+        entropy: impl Fn() -> Box<dyn Entropy + Send> + Send + Sync + 'static,
+        tarpits: Arc<TarpitPlaces>,
+    ) -> Self {
+        Self {
+            entropy: Arc::new(entropy),
+            tarpits,
+        }
+    }
+}
+
+impl fmt::Debug for Responses {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Responses")
+            .field("tarpitted", &self.tarpits.held())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The state of the responses of one session.
+struct Responder {
+    entropy: Box<dyn Entropy + Send>,
+    tarpits: Arc<TarpitPlaces>,
+    /// Set once the session is tarpitted.
+    tarpit: Option<Tarpit>,
+}
+
+impl Responder {
+    fn built() -> ActionSet {
+        ActionSet::of(&[Action::Alert, Action::Kill, Action::Tarpit])
+    }
+
+    /// Tarpits the session, unless it is already. Returns `false` when no
+    /// place is free.
+    fn tarpit(&mut self, context: &Context<'_>, out: &mut Output) -> bool {
+        if self.tarpit.is_some() {
+            return true;
+        }
+        let settings = context.policy.actions().tarpit;
+        let Some(tarpit) = Tarpit::start(&self.tarpits, settings) else {
+            return false;
+        };
+        out.effects.push(Effect::Tarpit {
+            max_duration: tarpit.max_duration(),
+        });
+        self.tarpit = Some(tarpit);
+        true
     }
 }
 
@@ -257,6 +324,8 @@ struct Place<'a> {
 /// to report one.
 struct Ledger {
     digest: Arc<dyn StatementDigest>,
+    /// `None` when only `alert` and `kill` are built.
+    responder: Option<Responder>,
     /// How often the session has hit each token.
     hits: BTreeMap<TokenId, u64>,
     /// Whether the session has had a hit that was not exempt.
@@ -369,7 +438,24 @@ impl Ledger {
         let decided = policy
             .token(&token_id)
             .map_or(ActionSet::ALERT, |token| token.actions_for_hit(number));
-        let actions = carried_out(decided);
+        let built = match self.responder {
+            Some(_) => Responder::built(),
+            None => ActionSet::of(&ALWAYS_BUILT),
+        };
+        let mut actions = carried_out(decided, built);
+        if actions.contains(Action::Tarpit)
+            && !self
+                .responder
+                .as_mut()
+                .is_some_and(|responder| responder.tarpit(context, out))
+        {
+            // Every place is taken: the session is killed, not queued.
+            let mut killed = ActionSet::of(&[Action::Kill]);
+            if actions.contains(Action::Alert) {
+                killed.insert(Action::Alert);
+            }
+            actions = killed;
+        }
 
         let mut body = self.body(EventKind::TokenHit, place);
         body.token_id = Some(token_id.clone());
@@ -418,12 +504,28 @@ impl Scanner {
     /// the fingerprint of a statement.
     #[must_use]
     pub fn new(digest: Arc<dyn StatementDigest>) -> Self {
+        Self::build(digest, None)
+    }
+
+    /// A scanner that also carries out `tarpit`, with `responses`.
+    #[must_use]
+    pub fn with_responses(digest: Arc<dyn StatementDigest>, responses: &Responses) -> Self {
+        let responder = Responder {
+            entropy: (responses.entropy)(),
+            tarpits: Arc::clone(&responses.tarpits),
+            tarpit: None,
+        };
+        Self::build(digest, Some(responder))
+    }
+
+    fn build(digest: Arc<dyn StatementDigest>, responder: Option<Responder>) -> Self {
         Self {
             from_client: Half::default(),
             from_server: Half::default(),
             tracker: Tracker::default(),
             ledger: Ledger {
                 digest,
+                responder,
                 hits: BTreeMap::new(),
                 flagged: false,
             },
@@ -441,6 +543,14 @@ impl fmt::Debug for Scanner {
             .field("server_chunked", &self.from_server.chunked.is_some())
             .field("flagged", &self.ledger.flagged)
             .field("tokens_hit", &self.ledger.hits.len())
+            .field(
+                "tarpitted",
+                &self
+                    .ledger
+                    .responder
+                    .as_ref()
+                    .is_some_and(|responder| responder.tarpit.is_some()),
+            )
             .field("tracker", &self.tracker)
             .finish()
     }
@@ -613,6 +723,19 @@ impl Inspector for Scanner {
         let client_can_be_told =
             direction == Direction::FromClient && self.from_server.chunked.is_none();
         raised.respond(client_can_be_told, context, out)
+    }
+
+    fn after_read(&mut self, direction: Direction, to_client: usize, out: &mut Output) {
+        let Some(responder) = self.ledger.responder.as_mut() else {
+            return;
+        };
+        if direction == Direction::FromServer
+            && to_client > 0
+            && let Some(tarpit) = &responder.tarpit
+        {
+            let delay = tarpit.delay(to_client, &mut *responder.entropy);
+            out.effects.push(Effect::Delay(delay));
+        }
     }
 
     fn copy_started(&mut self, direction: Direction) {

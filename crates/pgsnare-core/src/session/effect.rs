@@ -28,6 +28,14 @@ pub enum Effect {
     },
     /// Wait this long before sending the queued bytes to the client.
     Delay(Duration),
+    /// The session is tarpitted from now on, for `max_duration` at most.
+    /// Past it the runtime reports [`Report::TarpitOver`].
+    ///
+    /// [`Report::TarpitOver`]: super::Report::TarpitOver
+    Tarpit {
+        /// The longest time the session may stay tarpitted.
+        max_duration: Duration,
+    },
     /// Hand this event to the dispatcher, without waiting for it.
     Emit(Box<EventBody>),
     /// Start TLS on the client connection, as its server side, once the

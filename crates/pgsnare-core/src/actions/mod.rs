@@ -9,5 +9,7 @@
 //! [`Output`]: crate::session::Output
 
 mod kill;
+mod tarpit;
 
 pub use kill::kill;
+pub use tarpit::{Tarpit, TarpitPlace, TarpitPlaces};

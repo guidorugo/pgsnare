@@ -250,6 +250,8 @@ struct Driver {
     login_deadline: Instant,
     /// Nothing is written to the client before this moment.
     hold_client_until: Option<Instant>,
+    /// When the session stops being tarpitted, and is killed.
+    tarpit_until: Option<Instant>,
     /// When the oldest bytes were read whose outcome has not been written
     /// to the client in full, and the same for the database.
     to_client_since: Option<Instant>,
@@ -297,6 +299,7 @@ pub(crate) async fn run(
         logged_in: false,
         login_deadline,
         hold_client_until: None,
+        tarpit_until: None,
         to_client_since: None,
         to_backend_since: None,
         linger_until: None,
@@ -350,7 +353,9 @@ impl Driver {
             // Reading produces bytes for the other side, so a direction is
             // read only while the other side keeps up.
             let read_client = client_reader.is_some() && to_backend < HIGH_WATER;
-            let read_backend = backend_reader.is_some() && to_client < HIGH_WATER;
+            // Nor is the server while the client is held back, so a
+            // tarpitted session holds no more than one read.
+            let read_backend = backend_reader.is_some() && to_client < HIGH_WATER && !client_held;
             let (flush_client, flush_backend) = (
                 to_client == 0 && self.client_unflushed,
                 to_backend == 0 && self.backend_unflushed,
@@ -398,6 +403,13 @@ impl Driver {
                 }
                 () = sleep_until_some(self.hold_client_until), if client_held => {
                     self.hold_client_until = None;
+                }
+                () = sleep_until_some(self.tarpit_until), if self.tarpit_until.is_some() => {
+                    // The kill is not held back.
+                    self.tarpit_until = None;
+                    self.hold_client_until = None;
+                    self.report(Report::TarpitOver);
+                    self.carry_out().await;
                 }
                 () = &mut idle, if !shrunk => {
                     if active {
@@ -603,6 +615,14 @@ impl Driver {
                     let until = Instant::now() + delay;
                     self.hold_client_until =
                         Some(self.hold_client_until.map_or(until, |held| held.max(until)));
+                }
+                Effect::Tarpit { max_duration } => {
+                    if self.tarpit_until.is_none() {
+                        // A moment the clock cannot name ends the tarpit
+                        // at once.
+                        let now = Instant::now();
+                        self.tarpit_until = Some(now.checked_add(max_duration).unwrap_or(now));
+                    }
                 }
                 Effect::LoginFinished => {
                     if !self.logged_in {

@@ -85,6 +85,8 @@ mod scan;
 #[cfg(test)]
 mod scan_tests;
 mod session;
+#[cfg(test)]
+mod tarpit_tests;
 mod track;
 #[cfg(test)]
 mod track_tests;
@@ -93,7 +95,7 @@ mod track_tests;
 mod tests;
 
 pub use inspect::{Context, InspectionError, Inspector, InspectorFactory, PassThrough, Verdict};
-pub use scan::Scanner;
+pub use scan::{Responses, Scanner};
 pub use session::PostgresSession;
 
 /// The name PostgreSQL uses for itself in the ALPN extension of a TLS
@@ -128,6 +130,15 @@ impl Postgres {
     pub fn scanning(digest: Arc<dyn StatementDigest>) -> Self {
         Self::with_inspectors(move |_: &SessionOrigin| -> Box<dyn Inspector> {
             Box::new(Scanner::new(Arc::clone(&digest)))
+        })
+    }
+
+    /// A scanning module whose sessions also carry out `tarpit` with
+    /// `responses`.
+    #[must_use]
+    pub fn responding(digest: Arc<dyn StatementDigest>, responses: Responses) -> Self {
+        Self::with_inspectors(move |_: &SessionOrigin| -> Box<dyn Inspector> {
+            Box::new(Scanner::with_responses(Arc::clone(&digest), &responses))
         })
     }
 

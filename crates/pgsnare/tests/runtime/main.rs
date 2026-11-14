@@ -12,4 +12,5 @@ mod relay;
 mod reload;
 mod scan;
 mod support;
+mod tarpit;
 mod tls;

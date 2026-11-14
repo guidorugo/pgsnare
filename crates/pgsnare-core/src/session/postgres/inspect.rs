@@ -202,6 +202,12 @@ pub trait Inspector: Send {
         let _ = direction;
     }
 
+    /// Called when all the bytes of one read from `direction` have been
+    /// handled, with the number of bytes that read queued for the client.
+    fn after_read(&mut self, direction: Direction, to_client: usize, out: &mut Output) {
+        let _ = (direction, to_client, out);
+    }
+
     /// Called when the COPY in `direction` has ended, whichever side ended
     /// it and however.
     fn copy_ended(&mut self, direction: Direction) {
