@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Only the listed clients reach the proxy, and only the listed scrapers
-# reach the metrics. Runs after sinks.sh, and last: it deletes the
-# NetworkPolicy of the release at the end.
+# Only the listed clients reach the proxy, only the listed scrapers reach
+# the metrics, and a pod of pgsnare reaches nothing that is not listed.
+# Runs after sinks.sh, and last: it deletes the NetworkPolicy of the
+# release at the end.
 #
 #   deploy/tests/kubernetes/isolation.sh
 #
@@ -15,8 +16,15 @@
 #   outsider (client label, other ns)     no                no
 #   scraper  (listed, pgsnare-monitoring) no                yes, and answers
 #
-# Then the NetworkPolicy is deleted, and the stranger and the outsider get
-# through: so the refusals above were the policy's.
+# Outwards, each pod of pgsnare opens a TCP connection to a pod of the
+# name service: to its port 53, which the policy lists, and to the port of
+# that pod's own metrics, which it does not. The address is the same and
+# the namespace of the name service has no policy, so the difference is the
+# egress rule.
+#
+# Then the NetworkPolicy is deleted, and the stranger, the outsider and the
+# connection to the unlisted port get through: so the refusals above were
+# the policy's.
 
 set -euo pipefail
 
@@ -33,6 +41,14 @@ metrics_port=9642
 # HOST:PORT within 4 seconds.
 reach() {
     k --namespace "$1" exec "$2" -- timeout 4 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$3" "$4" > /dev/null 2>&1
+}
+
+# out POD ADDRESS PORT: whether POD of the release opens a TCP connection
+# to ADDRESS:PORT within 3 seconds. The image of pgsnare has no bash; its
+# base has nc, which ends when the other side closes the connection that
+# it was given nothing to read on.
+out() {
+    k --namespace "$namespace" exec "$1" -- timeout 8 nc -w 3 "$2" "$3" > /dev/null 2>&1
 }
 
 # scrape NAMESPACE POD HOST: what POD gets from /metrics of HOST.
@@ -95,10 +111,38 @@ for ip in $ips; do
 done
 say "ok: the stranger, the outsider and the scraper do not reach the proxy; only the scraper reaches the metrics"
 
+# --- Outwards -----------------------------------------------------------------------
+
+dns_port=53
+unlisted_port=9153
+dns_ip="$(k --namespace kube-system get pods --selector k8s-app=kube-dns \
+    --output 'jsonpath={range .items[*]}{.status.phase} {.status.podIP}{"\n"}{end}' \
+    | awk '$1 == "Running" && NF == 2 { print $2; exit }')"
+[[ -n "$dns_ip" ]] || die "no running pod of the name service has an address"
+release_pods="$(pods_of_release | awk '{ print $1 }')"
+[[ "$(wc -w <<<"$release_pods")" -eq 2 ]] || die "expected 2 pods of the release: $release_pods"
+
+# The unlisted port is open: a pod that no policy selects reaches it.
+eventually reach "$other_namespace" outsider "$dns_ip" "$unlisted_port" \
+    || die "nothing listens on port $unlisted_port of the name service, so a refusal there would prove nothing"
+for pod in $release_pods; do
+    # The same command, to the listed port of the same address: so a
+    # failure of the next one is not a failure to run the command.
+    eventually out "$pod" "$dns_ip" "$dns_port" \
+        || die "$pod cannot reach the name service on port $dns_port"
+    ! out "$pod" "$dns_ip" "$unlisted_port" \
+        || die "$pod reaches port $unlisted_port of the name service, which the policy does not list"
+done
+say "ok: the pods of pgsnare reach the name service on its port and not on a port that is not listed"
+
 # --- Without the policy -------------------------------------------------------------
 
 say "deleting the NetworkPolicy of the release"
 k --namespace "$namespace" delete networkpolicy "$fullname" >&2
+for pod in $release_pods; do
+    eventually out "$pod" "$dns_ip" "$unlisted_port" \
+        || die "without the policy $pod still cannot reach port $unlisted_port of the name service, so its refusal proved nothing"
+done
 eventually reach "$namespace" stranger "$proxy_host" 5432 \
     || die "without the policy the stranger still cannot reach the proxy, so its refusal proved nothing"
 eventually reach "$other_namespace" outsider "$proxy_host" 5432 \
@@ -106,6 +150,6 @@ eventually reach "$other_namespace" outsider "$proxy_host" 5432 \
 first_ip="${ips%% *}"
 eventually reach "$namespace" stranger "$first_ip" "$metrics_port" \
     || die "without the policy the stranger still cannot reach the metrics, so its refusal proved nothing"
-say "ok: without the policy the refused pods get through"
+say "ok: without the policy the refused pods and the refused connection outwards get through"
 
 say "passed"
