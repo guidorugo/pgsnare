@@ -66,13 +66,16 @@ pub fn run(args: &Args) -> u8 {
     // tests, keeps the first log.
     let redaction = Redaction::default();
     crate::log::install(redaction.clone());
-    match start(args, &redaction) {
+    let status = match start(args, &redaction) {
         Ok(()) => SUCCESS,
         Err(reason) => {
             tracing::error!(reason = %reason, "pgsnare cannot go on");
             FAILURE
         }
-    }
+    };
+    // The last lines are written before the process ends.
+    crate::log::flush(Duration::from_secs(2));
+    status
 }
 
 /// A panic is logged with the place it happened and nothing else: its
