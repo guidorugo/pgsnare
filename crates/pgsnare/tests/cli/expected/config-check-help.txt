@@ -16,12 +16,20 @@ Options:
           Print version
 
 The check loads the configuration and its token files, looks at the access
-rights of the files that hold secrets, and reads the certificates and keys, with
-the code that `pgsnare run` uses. It reports every problem it finds, and warns
-about settings that are valid and give up some protection.
+rights of the files that hold secrets, reads the certificates and keys, and
+builds the event sinks, with the code that `pgsnare run` uses. It reports every
+problem it finds, and warns about settings that are valid and give up some
+protection.
 
-Nothing is connected to and no listener is opened. Whether an address is free
-and whether a database answers is therefore not checked.
+The check reads the files and the environment variables the configuration
+names, such as the signing key of a webhook. Run it as the user and with the
+environment pgsnare runs with.
+
+Nothing is connected to, no listener is opened and no file is created or
+written. So the check cannot know whether an address is free, whether a
+database, a webhook receiver or a syslog server answers, or whether the file of
+a file sink that is not there yet can be created. `pgsnare run` can still fail
+on these after a check that passed.
 
 The exit status is 0 if pgsnare would start with this configuration, also when
 there are warnings, and 1 if it would not.

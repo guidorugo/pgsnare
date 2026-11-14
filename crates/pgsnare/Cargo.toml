@@ -18,21 +18,28 @@ default = ["rules"]
 rules = ["pgsnare-core/rules"]
 
 [dependencies]
+aho-corasick.workspace = true
+aws-lc-rs.workspace = true
 clap.workspace = true
 getrandom.workspace = true
+hyper.workspace = true
 pgsnare-core.workspace = true
 rustix.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 serde.workspace = true
 serde-saphyr.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
 rcgen.workspace = true
 # A pseudo-terminal, for the test that `token test` refuses a terminal.
 rustix = { workspace = true, features = ["pty"] }
+# Tests stop the clock, so that a window of a minute takes no time.
+tokio = { workspace = true, features = ["test-util"] }

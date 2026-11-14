@@ -40,10 +40,12 @@ use crate::policy::{ActionSet, QueryRedaction, RuleId, TokenId};
 use crate::session::{Direction, SessionOrigin};
 
 mod id;
+mod statement;
 mod text;
 mod timestamp;
 
 pub use id::{EventId, ParseIdError, SessionId};
+pub use statement::{MAX_STATEMENT_BYTES, StatementDigest};
 pub use text::{MAX_NAME_BYTES, TRUNCATION_MARK, text_from_wire};
 pub use timestamp::{ParseTimestampError, Timestamp};
 

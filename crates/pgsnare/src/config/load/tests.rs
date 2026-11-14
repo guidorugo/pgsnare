@@ -480,18 +480,15 @@ events:
             // two listeners share is one file.
             dir.path("certs/server.key").as_path(),
             Path::new("/etc/pgsnare/other.key"),
+            // What a webhook reads its signing key and its URL from.
+            dir.path("hook-secret").as_path(),
+            dir.path("hook-url").as_path(),
         ]
     );
-    // Certificates and authorities are public, and the files of a sink are
-    // not read by the loader.
+    // Certificates and authorities are public, and the file of a file sink
+    // is written by pgsnare and holds nothing that is read.
     let listed = loaded.secret_files();
-    for other in [
-        "certs/server.crt",
-        "certs/root.crt",
-        "events.jsonl",
-        "hook-url",
-        "hook-secret",
-    ] {
+    for other in ["certs/server.crt", "certs/root.crt", "events.jsonl"] {
         assert!(!listed.contains(&dir.path(other).as_path()), "{other}");
     }
 }

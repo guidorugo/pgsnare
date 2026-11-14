@@ -8,22 +8,32 @@
 //! sessions finish for the grace period of the configuration and exits
 //! with status 0.
 //!
-//! It logs to standard error, one line for each thing worth knowing. No
-//! line contains anything a client or a database sent.
+//! A listener that fails while the proxy runs stops it in the same way,
+//! and the command then exits with status 1.
+//!
+//! It logs to standard error, one JSON object for each line: see
+//! [`crate::log`]. No line contains anything a client or a database sent.
+//! A proxy that cannot start says why in the same log, and exits with
+//! status 1. Events go to the sinks of the configuration, and standard
+//! output carries nothing but the events of a `stdout` sink.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pgsnare_core::event::{Event, Labels};
-use pgsnare_core::extension::{EventSink, Relay, SinkFuture};
+use pgsnare_core::event::Labels;
+use pgsnare_core::extension::Relay;
 use pgsnare_core::policy::FixedPolicy;
 use pgsnare_core::session::postgres::Postgres;
 use tokio::signal::unix::{SignalKind, signal};
 
+use crate::admin;
 use crate::builder::{Proxy, ProxyBuilder};
 use crate::config::{self, Config, UpstreamTlsMode};
-use crate::runtime::{ListenerSettings, Runtime, Settings, Upstream, permissions};
+use crate::redact::{Redaction, Redactor, RedactorBuilder};
+use crate::runtime::{ListenerSettings, Runtime, Settings, Stopped, Upstream, permissions};
+use crate::sinks;
 use crate::tls::{BackendLeg, ClientLeg};
 
 use super::{FAILURE, SUCCESS};
@@ -48,27 +58,18 @@ pub struct Args {
 /// Runs the command and returns its exit status.
 #[must_use]
 pub fn run(args: &Args) -> u8 {
-    install_log();
-    match start(args) {
+    // The log comes first, and what it must not show follows as soon as
+    // the configuration has been read. A second call in one process, as in
+    // tests, keeps the first log.
+    let redaction = Redaction::default();
+    crate::log::install(redaction.clone());
+    match start(args, &redaction) {
         Ok(()) => SUCCESS,
-        Err(message) => {
-            // The log may not be what the operator is looking at when the
-            // proxy does not even start.
-            eprintln!("pgsnare run: {message}");
+        Err(reason) => {
+            tracing::error!(reason = %reason, "pgsnare cannot go on");
             FAILURE
         }
     }
-}
-
-/// Makes log lines visible: one line each, on standard error.
-fn install_log() {
-    // A second call in one process, as in tests, keeps the first setup.
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .with_target(false)
-        .with_max_level(tracing::Level::INFO)
-        .try_init();
 }
 
 /// A panic is logged with the place it happened and nothing else: its
@@ -82,34 +83,54 @@ fn install_panic_hook() {
     }));
 }
 
-fn start(args: &Args) -> Result<(), String> {
+fn start(args: &Args, redaction: &Redaction) -> Result<(), String> {
     // Before the first secret is read: the token files hold some.
     disable_core_dumps();
     let loaded = config::load(&args.config).map_err(|error| error.to_string())?;
     check_permissions(&loaded, args.allow_insecure_file_permissions)?;
 
     let config = loaded.config;
+    // From here on no line of the log can show a honeytoken value.
+    redaction.replace(
+        redactor(&config)
+            .build()
+            .map_err(|error| error.to_string())?,
+    );
     let policy = config.policy(1).map_err(|error| error.to_string())?;
     let module = Postgres::new();
     let listeners = listeners(&config, &module)?;
-    let proxy = ProxyBuilder::new()
+
+    // The sinks add what they must keep to themselves to what the redactor
+    // looks for, so the redactor is complete once they are built.
+    let (sinks, redactor) =
+        sinks::from_config(&config.events, redactor(&config)).map_err(|error| error.to_string())?;
+    redaction.replace(redactor.build().map_err(|error| error.to_string())?);
+    let mut builder = ProxyBuilder::new()
         .protocol_module(Arc::new(module))
-        .login_strategy(Arc::new(Relay))
-        .event_sink(Arc::new(LogSink))
-        .build()
-        .map_err(|error| error.to_string())?;
+        .login_strategy(Arc::new(Relay));
+    for built in sinks {
+        builder = builder.event_sink_with(built.sink, built.options);
+    }
+    let proxy = builder.build().map_err(|error| error.to_string())?;
 
     tracing::warn!(
         tokens = config.tokens.len(),
         sinks = config.events.sinks.len(),
-        "this build relays traffic and detects nothing: honeytoken detection, responses and \
-         event sinks are not built yet, and events are written to this log only"
+        "this build relays traffic and detects nothing: honeytoken detection and responses \
+         are not built yet, so the only events are those of sessions that inspection gave up on"
     );
 
     let settings = Settings::new(listeners)
         .with_grace_period(config.shutdown.grace_period)
         .with_labels(labels(&config))
-        .with_event_capacity(usize::try_from(config.events.queue_size).unwrap_or(usize::MAX));
+        .with_event_capacity(usize::try_from(config.events.queue_size).unwrap_or(usize::MAX))
+        .with_dedup_window(config.events.dedup_window)
+        .with_redaction(redaction.clone());
+    let observed = Observed {
+        admin: config.admin.listen.socket_addr(),
+        metrics: config.metrics.listen.socket_addr(),
+        redaction: redaction.clone(),
+    };
 
     let workers = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -123,10 +144,29 @@ fn start(args: &Args) -> Result<(), String> {
         "starting, with one worker thread for each processor this process may use"
     );
     install_panic_hook();
-    runtime.block_on(serve(proxy, Arc::new(FixedPolicy::new(policy)), settings))
+    runtime.block_on(serve(
+        proxy,
+        Arc::new(FixedPolicy::new(policy)),
+        settings,
+        observed,
+    ))
 }
 
-async fn serve(proxy: Proxy, policy: Arc<FixedPolicy>, settings: Settings) -> Result<(), String> {
+/// Where the proxy can be watched from, and what its metrics pass through.
+struct Observed {
+    /// The address of the admin listener, with the health endpoints.
+    admin: SocketAddr,
+    /// The address of the metrics listener.
+    metrics: SocketAddr,
+    redaction: Redaction,
+}
+
+async fn serve(
+    proxy: Proxy,
+    policy: Arc<FixedPolicy>,
+    settings: Settings,
+    observed: Observed,
+) -> Result<(), String> {
     // The handlers are in place before the first client is accepted. As
     // process 1 of a container, pgsnare would otherwise not be stopped by
     // these signals at all.
@@ -146,13 +186,50 @@ async fn serve(proxy: Proxy, policy: Arc<FixedPolicy>, settings: Settings) -> Re
             "listening"
         );
     }
-    let bound = Runtime::new(proxy, policy, settings)
+    let runtime = Runtime::new(proxy, policy, settings);
+
+    // The health endpoints and the metrics answer from before the first
+    // client is accepted until after the last session has ended, so that
+    // a proxy that starts or stops can be told from one that is gone.
+    for (name, address) in [("admin", observed.admin), ("metrics", observed.metrics)] {
+        if !address.ip().is_loopback() {
+            tracing::warn!(
+                listener = name,
+                address = %address,
+                "this listener is not bound to the loopback interface: whoever can reach its \
+                 address can read what it serves, without encryption and without a login"
+            );
+        }
+    }
+    let watchers = admin::bind(
+        observed.admin,
+        observed.metrics,
+        runtime.status(),
+        observed.redaction,
+    )
+    .map_err(|error| {
+        format!(
+            "cannot open the admin listener or the metrics listener: {}",
+            error.kind()
+        )
+    })?;
+    tracing::info!(
+        admin = %observed.admin,
+        metrics = %observed.metrics,
+        "serving the health endpoints and the metrics"
+    );
+    let (stop_watchers, watchers_stopped) = tokio::sync::oneshot::channel::<()>();
+    let watching = tokio::spawn(watchers.serve(async move {
+        let _ = watchers_stopped.await;
+    }));
+
+    let bound = runtime
         .bind()
         .map_err(|error| format!("cannot open a listener: {}", error.kind()))?;
     bound.compare_certificates(CERTIFICATE_PROBE_TIMEOUT).await;
 
-    bound
-        .serve(async move {
+    let stopped = bound
+        .run(async move {
             loop {
                 tokio::select! {
                     _ = terminate.recv() => {
@@ -173,7 +250,33 @@ async fn serve(proxy: Proxy, policy: Arc<FixedPolicy>, settings: Settings) -> Re
             }
         })
         .await;
-    Ok(())
+    let _ = stop_watchers.send(());
+    let _ = watching.await;
+    outcome(stopped)
+}
+
+/// What the command makes of the way the runtime stopped. A runtime that
+/// stopped without having been asked to is a failure: the exit status then
+/// tells whatever supervises the process to start it again.
+fn outcome(stopped: Stopped) -> Result<(), String> {
+    match stopped {
+        Stopped::Asked => Ok(()),
+        _ => Err("a listener stopped accepting clients while the proxy was running".to_owned()),
+    }
+}
+
+/// What must never be written anywhere, as far as the configuration says
+/// it: the values of the honeytokens.
+pub(super) fn redactor(config: &Config) -> RedactorBuilder {
+    let mut builder = Redactor::builder();
+    for token in &config.tokens {
+        builder = builder.token(
+            token.id.as_str(),
+            token.values.iter().map(config::TokenValue::expose),
+            token.case_insensitive,
+        );
+    }
+    builder
 }
 
 /// Refuses to start when a file that holds secrets is open to other users,
@@ -287,30 +390,6 @@ fn labels(config: &Config) -> Labels {
     labels
 }
 
-/// Writes events to the log: what happened, in which session and to which
-/// client. The texts of an event that come from the network are left out.
-struct LogSink;
-
-impl EventSink for LogSink {
-    fn name(&self) -> &str {
-        "log"
-    }
-
-    fn deliver<'a>(&'a self, event: &'a Event) -> SinkFuture<'a> {
-        Box::pin(async move {
-            tracing::warn!(
-                kind = ?event.body.kind,
-                event_id = %event.event_id,
-                session_id = %event.body.session_id,
-                client = %event.body.client_ip,
-                client_port = event.body.client_port,
-                "event"
-            );
-            Ok(())
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,7 +401,50 @@ mod tests {
             allow_insecure_file_permissions: false,
         };
         assert_eq!(run(&args), FAILURE);
-        let error = start(&args).unwrap_err();
+        let error = start(&args, &Redaction::default()).unwrap_err();
         assert!(error.contains("cannot read the file"), "{error}");
+    }
+
+    #[test]
+    fn a_runtime_that_stopped_by_itself_fails_the_command() {
+        assert_eq!(outcome(Stopped::Asked), Ok(()));
+        let error = outcome(Stopped::ListenerFailed).unwrap_err();
+        assert!(
+            error.contains("a listener stopped accepting clients"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_values_of_the_tokens_are_what_must_never_be_written() {
+        let config = Config::from_yaml(
+            "listeners:\n  - name: main\n    listen: 127.0.0.1:5432\n    upstream: db.example.com:5432\n    \
+             client_tls: { mode: disable }\n    upstream_tls: { mode: disable }\n\
+             tokens:\n  - id: users-admin-backup\n    values: [\"svc.backup.8f3k2q@mail.example\"]\n\
+             \x20 - id: billing-canary\n    values: [\"Canary.Invoice.000417\"]\n    case_insensitive: true\n\
+             events:\n  sinks:\n    - type: stdout\n",
+        )
+        .unwrap();
+        let built = redactor(&config).build().unwrap();
+        assert_eq!(
+            built.text("user svc.backup.8f3k2q@mail.example"),
+            "user [redacted]"
+        );
+        assert_eq!(built.text("CANARY.INVOICE.000417"), "[redacted]");
+
+        // A token list the matcher refuses is refused when the
+        // configuration is read, so no redactor is ever built from one. The
+        // reason names the place of a value and never the value.
+        let error = Config::from_yaml(
+            "listeners:\n  - name: main\n    listen: 127.0.0.1:5432\n    upstream: db.example.com:5432\n    \
+             client_tls: { mode: disable }\n    upstream_tls: { mode: disable }\n\
+             tokens:\n  - id: inner\n    values: [\"svc.backup.8f3k2q@mail.example\"]\n\
+             \x20 - id: outer\n    values: [\"x-svc.backup.8f3k2q@mail.example-x\"]\n\
+             events:\n  sinks:\n    - type: stdout\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains("svc.backup"), "{error}");
+        assert!(error.contains("contains another value"), "{error}");
     }
 }

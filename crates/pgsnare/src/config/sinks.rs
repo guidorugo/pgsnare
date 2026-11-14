@@ -42,6 +42,27 @@ pub enum Sink {
 }
 
 impl Sink {
+    /// The files this sink reads a secret from: for a webhook, the file
+    /// with its signing key and the file with its URL, where the
+    /// configuration names files for them. The other sinks read none.
+    ///
+    /// The file a `file` sink writes events to is not among them: the sink
+    /// creates it closed to other users by itself.
+    #[must_use]
+    pub fn secret_files(&self) -> Vec<&std::path::Path> {
+        let Self::Webhook(webhook) = self else {
+            return Vec::new();
+        };
+        let mut files = Vec::new();
+        if let SecretRef::File(file) = &webhook.hmac_secret {
+            files.push(file.as_path());
+        }
+        if let UrlSource::File(file) = &webhook.url {
+            files.push(file.as_path());
+        }
+        files
+    }
+
     /// The name of the sink type, as written in the configuration.
     #[must_use]
     pub const fn kind(&self) -> &'static str {

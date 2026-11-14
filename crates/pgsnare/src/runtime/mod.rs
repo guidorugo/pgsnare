@@ -40,7 +40,20 @@
 //! accepting clients and reports that it is not ready. Open sessions go on
 //! for the grace period. Those that are still open then are told to end:
 //! the session logic says to the client what the protocol has for that,
-//! and both connections are closed.
+//! and both connections are closed. Last, the events that still wait for a
+//! sink get a moment to be delivered.
+//!
+//! # A listener that fails
+//!
+//! A listener that stops accepting clients while the runtime is meant to
+//! run must not go unnoticed: the process would live on, look healthy and
+//! serve nobody on that address. The runtime watches the tasks of its
+//! listeners. When one ends that should not have, the runtime logs an
+//! error, counts the failure, reports that it is neither ready nor
+//! healthy, and stops in the way described above, grace period included.
+//! [`Bound::run`] then returns [`Stopped::ListenerFailed`], which the
+//! `pgsnare run` command turns into an exit status that is not zero, so
+//! that whatever supervises the process starts it again.
 //!
 //! # What it reports
 //!
@@ -48,6 +61,7 @@
 //! counters. Health and metrics endpoints are built on that and are not
 //! part of the runtime.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -58,9 +72,10 @@ use pgsnare_core::event::Labels;
 use pgsnare_core::policy::PolicySource;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tokio::task::JoinSet;
+use tokio::task::{Id, JoinSet};
 
 use crate::builder::Proxy;
+use crate::redact::Redaction;
 use crate::tls::{BackendLeg, ClientLeg};
 
 mod backend;
@@ -72,10 +87,10 @@ mod status;
 mod stream;
 
 pub use backend::Upstream;
-pub use status::{Counters, Status};
+pub use status::{Counters, DropReason, Histogram, HitCounters, SinkCounters, SinkStatus, Status};
 
 use backend::Connector;
-use events::Events;
+use events::{EventSettings, Events};
 use session::{ListenerContext, Stage};
 
 /// The default for [`Settings::grace_period`].
@@ -87,6 +102,15 @@ pub const DEFAULT_EVENT_CAPACITY: usize = 1024;
 /// After the grace period, sessions get this long to send their last
 /// bytes before the runtime gives up on them.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// When every session has ended, the events that still wait for a sink get
+/// this long to be delivered. It is short, so that a sink that is down
+/// does not keep a proxy from stopping in the time it was given.
+const EVENT_DRAIN: Duration = Duration::from_secs(2);
+
+/// How often a runtime that stops because a listener failed looks whether
+/// the sessions that listener left behind have ended.
+const ORPHAN_POLL: Duration = Duration::from_millis(20);
 
 /// One listener: where clients connect, and the database behind it.
 #[derive(Clone, Debug)]
@@ -163,9 +187,15 @@ pub struct Settings {
     pub grace_period: Duration,
     /// The labels every event carries.
     pub labels: Labels,
-    /// How many deliveries of events may be under way at once. Events
-    /// beyond that are dropped and counted.
+    /// How many events may wait between the sessions and the dispatcher.
+    /// Events beyond that are dropped and counted. A session never waits.
     pub event_capacity: usize,
+    /// How long repeated hits of one token in one session are folded into
+    /// a single event. Zero turns that off.
+    pub dedup_window: Duration,
+    /// What removes from events what must not be shown: honeytoken values
+    /// above all. The default knows nothing to remove.
+    pub redaction: Redaction,
 }
 
 impl Settings {
@@ -177,6 +207,8 @@ impl Settings {
             grace_period: DEFAULT_GRACE_PERIOD,
             labels: Labels::new(),
             event_capacity: DEFAULT_EVENT_CAPACITY,
+            dedup_window: crate::config::DEFAULT_DEDUP_WINDOW,
+            redaction: Redaction::default(),
         }
     }
 
@@ -194,10 +226,25 @@ impl Settings {
         self
     }
 
-    /// Sets how many deliveries of events may be under way at once.
+    /// Sets how many events may wait between the sessions and the
+    /// dispatcher.
     #[must_use]
     pub const fn with_event_capacity(mut self, event_capacity: usize) -> Self {
         self.event_capacity = event_capacity;
+        self
+    }
+
+    /// Sets how long repeated hits are folded into a single event.
+    #[must_use]
+    pub const fn with_dedup_window(mut self, dedup_window: Duration) -> Self {
+        self.dedup_window = dedup_window;
+        self
+    }
+
+    /// Sets what removes from events what must not be shown.
+    #[must_use]
+    pub fn with_redaction(mut self, redaction: Redaction) -> Self {
+        self.redaction = redaction;
         self
     }
 }
@@ -261,10 +308,20 @@ impl Runtime {
                 ),
             ));
         }
+        let sinks = proxy
+            .event_sinks()
+            .iter()
+            .cloned()
+            .zip(proxy.sink_options().iter().cloned())
+            .collect();
         let events = Arc::new(Events::new(
-            proxy.event_sinks().to_vec(),
-            settings.labels,
-            settings.event_capacity,
+            sinks,
+            EventSettings {
+                capacity: settings.event_capacity,
+                dedup_window: settings.dedup_window,
+                labels: settings.labels,
+                redaction: settings.redaction,
+            },
             Arc::clone(&status),
         ));
         let module = Arc::clone(proxy.protocol_module());
@@ -302,6 +359,7 @@ impl Runtime {
             listeners,
             grace_period: settings.grace_period,
             status,
+            events,
         })
     }
 }
@@ -328,6 +386,19 @@ pub struct Bound {
     listeners: Vec<BoundListener>,
     grace_period: Duration,
     status: Arc<Status>,
+    events: Arc<Events>,
+}
+
+/// Why a runtime stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Stopped {
+    /// It was asked to.
+    Asked,
+    /// One of its listeners stopped accepting clients while the runtime
+    /// was meant to run. The runtime is at fault, and whatever started it
+    /// should start it again.
+    ListenerFailed,
 }
 
 impl Bound {
@@ -377,46 +448,129 @@ impl Bound {
     /// Serves clients until `stop` resolves, then stops as the
     /// [module documentation](self) describes. Returns when every session
     /// has ended.
+    ///
+    /// A listener that fails stops the runtime too. [`Bound::run`] does
+    /// the same and says which of the two it was.
     pub async fn serve(self, stop: impl Future<Output = ()>) {
+        self.run(stop).await;
+    }
+
+    /// Serves clients until `stop` resolves or a listener fails, then
+    /// stops as the [module documentation](self) describes. Returns why
+    /// it stopped, once every session has ended.
+    pub async fn run(self, stop: impl Future<Output = ()>) -> Stopped {
         let Self {
             listeners,
             grace_period,
             status,
+            events,
         } = self;
         let (stage, _) = watch::channel(Stage::Running);
         let mut tasks = JoinSet::new();
+        let mut names = HashMap::with_capacity(listeners.len());
         for listener in listeners {
-            tasks.spawn(listener::serve(
+            let name = listener.context.name.clone();
+            let task = tasks.spawn(listener::serve(
                 listener.socket,
                 listener.context,
                 listener.max_connections,
                 stage.subscribe(),
             ));
+            names.insert(task.id(), name);
         }
-        status.set_ready(true);
+        let supervised = Supervised {
+            tasks,
+            names,
+            stage,
+            grace_period,
+            status,
+        };
+        let stopped = supervised.run(stop).await;
+        events.close(EVENT_DRAIN).await;
+        tracing::info!("stopped");
+        stopped
+    }
+}
 
-        stop.await;
+/// The tasks of the listeners of a runtime that is being served, and what
+/// it takes to watch over them and to stop them.
+struct Supervised {
+    tasks: JoinSet<()>,
+    /// The name of the listener behind each task.
+    names: HashMap<Id, String>,
+    stage: watch::Sender<Stage>,
+    grace_period: Duration,
+    status: Arc<Status>,
+}
 
-        status.set_ready(false);
+impl Supervised {
+    /// Runs until `stop` resolves or a listener fails, and then stops the
+    /// listeners and their sessions.
+    async fn run(mut self, stop: impl Future<Output = ()>) -> Stopped {
+        self.status.set_ready(true);
+        let stopped = tokio::select! {
+            () = stop => Stopped::Asked,
+            // A listener only ends when it is told to stop, and nobody has
+            // told it to.
+            Some(ended) = self.tasks.join_next_with_id() => {
+                self.listener_failed(&ended);
+                Stopped::ListenerFailed
+            }
+        };
+
+        self.status.set_ready(false);
         tracing::info!(
-            grace_period_seconds = grace_period.as_secs(),
-            sessions = status.counters().sessions_active,
+            grace_period_seconds = self.grace_period.as_secs(),
+            sessions = self.status.counters().sessions_active,
             "stopping: no new clients are accepted and open sessions may finish"
         );
-        stage.send_replace(Stage::Draining);
-        let all_ended = async { while tasks.join_next().await.is_some() {} };
-        if tokio::time::timeout(grace_period, all_ended).await.is_err() {
+        self.stage.send_replace(Stage::Draining);
+        let orphans = stopped == Stopped::ListenerFailed;
+        if tokio::time::timeout(self.grace_period, self.all_ended(orphans))
+            .await
+            .is_err()
+        {
             tracing::info!(
-                sessions = status.counters().sessions_active,
+                sessions = self.status.counters().sessions_active,
                 "the grace period is over: the sessions that are still open are closed"
             );
-            stage.send_replace(Stage::Stopping);
-            let all_ended = async { while tasks.join_next().await.is_some() {} };
-            if tokio::time::timeout(STOP_TIMEOUT, all_ended).await.is_err() {
-                tasks.shutdown().await;
+            self.stage.send_replace(Stage::Stopping);
+            if tokio::time::timeout(STOP_TIMEOUT, self.all_ended(orphans))
+                .await
+                .is_err()
+            {
+                self.tasks.shutdown().await;
             }
         }
-        tracing::info!("stopped");
+        stopped
+    }
+
+    /// Notes that the task of a listener has ended while the runtime was
+    /// meant to run.
+    fn listener_failed(&self, ended: &Result<(Id, ()), tokio::task::JoinError>) {
+        let (id, panicked) = match ended {
+            Ok((id, ())) => (*id, false),
+            Err(error) => (error.id(), error.is_panic()),
+        };
+        self.status.listener_failed(panicked);
+        tracing::error!(
+            listener = self.names.get(&id).map_or("unknown", String::as_str),
+            panicked,
+            "a listener stopped accepting clients while the proxy was meant to run: the proxy \
+             stops, so that whatever supervises it can start it again"
+        );
+    }
+
+    /// Resolves when every listener has ended, and every session with it.
+    ///
+    /// A listener that was told to stop waits for its sessions. One that
+    /// failed could not, and left them behind: with `orphans`, those are
+    /// waited for too.
+    async fn all_ended(&mut self, orphans: bool) {
+        while self.tasks.join_next().await.is_some() {}
+        while orphans && self.status.counters().sessions_active > 0 {
+            tokio::time::sleep(ORPHAN_POLL).await;
+        }
     }
 }
 
@@ -426,5 +580,174 @@ impl std::fmt::Debug for Bound {
             .field("listeners", &self.local_addrs())
             .field("grace_period", &self.grace_period)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::oneshot;
+    use tokio::time::Instant;
+
+    use super::*;
+
+    /// What a listener does when it works: nothing, until it is told to
+    /// stop.
+    async fn obedient(mut stage: watch::Receiver<Stage>) {
+        while *stage.borrow_and_update() == Stage::Running {
+            if stage.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// A listener that ends when a test says so, with a panic or without.
+    async fn doomed(end: oneshot::Receiver<bool>) {
+        if end.await.unwrap_or(false) {
+            panic!("a panic that a test asked for");
+        }
+    }
+
+    /// Waits for a runtime to stop by itself. A runtime that does not
+    /// notice that a listener has failed would run for ever. The clock of
+    /// these tests jumps ahead when everything waits, so that shows as a
+    /// failure here and not as a test that never ends.
+    async fn stopped(running: tokio::task::JoinHandle<Stopped>) -> Stopped {
+        tokio::time::timeout(Duration::from_secs(24 * 3600), running)
+            .await
+            .expect("the runtime stops when one of its listeners has failed")
+            .unwrap()
+    }
+
+    /// A runtime with two listeners, one of which a test can end.
+    fn supervised(grace_period: Duration) -> (Supervised, oneshot::Sender<bool>, Arc<Status>) {
+        let (stage, _) = watch::channel(Stage::Running);
+        let status = Arc::new(Status::new());
+        let (end, ended) = oneshot::channel();
+        let mut tasks = JoinSet::new();
+        let mut names = HashMap::new();
+        names.insert(
+            tasks.spawn(obedient(stage.subscribe())).id(),
+            "steady".to_owned(),
+        );
+        names.insert(tasks.spawn(doomed(ended)).id(), "doomed".to_owned());
+        (
+            Supervised {
+                tasks,
+                names,
+                stage,
+                grace_period,
+                status: Arc::clone(&status),
+            },
+            end,
+            status,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_runtime_that_is_asked_to_stop_was_not_at_fault() {
+        let (supervised, _end, status) = supervised(Duration::from_secs(25));
+        let (stop, stopped) = oneshot::channel::<()>();
+        let running = tokio::spawn(supervised.run(async {
+            let _ = stopped.await;
+        }));
+
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        assert!(status.is_ready());
+        assert!(status.is_healthy());
+        assert!(!running.is_finished());
+
+        // Both listeners are told to stop. The one that does not listen is
+        // given up on when the time is over.
+        let asked = Instant::now();
+        stop.send(()).unwrap();
+        assert_eq!(running.await.unwrap(), Stopped::Asked);
+        assert_eq!(
+            asked.elapsed(),
+            Duration::from_secs(25) + STOP_TIMEOUT,
+            "the grace period, and then the time to stop"
+        );
+        assert!(!status.is_ready());
+        assert!(status.is_healthy());
+        assert_eq!(status.counters().listener_failures, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listener_that_panics_is_noticed_counted_and_stops_the_runtime() {
+        let (supervised, end, status) = supervised(Duration::from_secs(25));
+        // Nobody asks this runtime to stop.
+        let running = tokio::spawn(supervised.run(std::future::pending()));
+
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        assert!(status.is_ready());
+        assert!(!running.is_finished());
+
+        let failed = Instant::now();
+        end.send(true).unwrap();
+        assert_eq!(stopped(running).await, Stopped::ListenerFailed);
+
+        assert!(!status.is_ready());
+        assert!(!status.is_healthy());
+        let counters = status.counters();
+        assert_eq!(counters.listener_failures, 1);
+        assert_eq!(counters.listener_panics, 1);
+        // The listener that works was told to stop and did, at once.
+        assert_eq!(failed.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listener_that_ends_without_a_panic_has_failed_all_the_same() {
+        let (supervised, end, status) = supervised(Duration::from_secs(25));
+        let running = tokio::spawn(supervised.run(std::future::pending()));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        end.send(false).unwrap();
+        assert_eq!(stopped(running).await, Stopped::ListenerFailed);
+        assert!(!status.is_healthy());
+        assert_eq!(status.counters().listener_failures, 1);
+        assert_eq!(status.counters().listener_panics, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_sessions_a_failed_listener_left_behind_get_the_grace_period() {
+        let (supervised, end, status) = supervised(Duration::from_secs(25));
+        // A session of the listener that is about to fail.
+        status.session_accepted();
+        let running = tokio::spawn(supervised.run(std::future::pending()));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let failed = Instant::now();
+        end.send(true).unwrap();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        // The listener is gone and its session is not: the runtime waits.
+        assert!(!running.is_finished());
+        assert!(!status.is_ready());
+
+        // The session ends by itself, and with it the runtime.
+        status.session_ended();
+        assert_eq!(stopped(running).await, Stopped::ListenerFailed);
+        let waited = failed.elapsed();
+        assert!(waited >= Duration::from_secs(10), "{waited:?}");
+        assert!(waited < Duration::from_secs(11), "{waited:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_session_that_never_ends_does_not_keep_a_failed_runtime_alive() {
+        let (supervised, end, status) = supervised(Duration::from_secs(25));
+        status.session_accepted();
+        let running = tokio::spawn(supervised.run(std::future::pending()));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let failed = Instant::now();
+        end.send(true).unwrap();
+        assert_eq!(stopped(running).await, Stopped::ListenerFailed);
+        let waited = failed.elapsed();
+        assert!(
+            waited >= Duration::from_secs(25) + STOP_TIMEOUT,
+            "{waited:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(25) + STOP_TIMEOUT + Duration::from_secs(1),
+            "{waited:?}"
+        );
     }
 }

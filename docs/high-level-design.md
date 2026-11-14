@@ -147,7 +147,7 @@ flowchart TB
 |---|---|---|
 | `pgsnare-proto` | The wire format: framing, typed views of the messages pgsnare must understand, and encoders for the few messages it injects. | None |
 | `pgsnare-core` | The session state machine, detection, policy, actions, optional SQL rules, the event schema and bait generators. | None |
-| `pgsnare` | The runtime as a library with a thin binary on top: listeners, TLS, configuration and reload, sinks, admin and metrics listeners, and the CLI. | All of it |
+| `pgsnare` | The runtime as a library with a thin binary on top: listeners, TLS, configuration and reload, the event dispatcher and its sinks, the admin and metrics listeners, the log, the redaction layer, and the CLI. | All of it |
 
 The session logic takes bytes in and returns bytes out plus *effects*: close a connection, send a cancel request, delay, emit an event, start TLS on the client leg, open the connection to the database. The runtime carries them out and reports back what the session logic cannot see for itself: that a handshake succeeded, that the database is connected or cannot be reached, that the proxy is shutting down. The session logic never touches a socket or a clock.
 
@@ -388,7 +388,7 @@ How they are built:
 - **Reload triggers.** `SIGHUP`, or a change to a watched file, including the atomic symlink swap Kubernetes uses for mounted volumes. Listener changes need a restart.
 - **One YAML file**, with honeytoken values optionally in separate files so they can be stored as a secret.
 - **Secrets** such as webhook signing keys come from environment variables or files, never from the configuration body.
-- **File permissions.** pgsnare refuses to start if a private key, token file or configuration file is open to other users, unless explicitly overridden. The rule is PostgreSQL's own: a file owned by the process user must not be readable by group or others, and a root-owned file may be group-readable. A file owned by anyone else is refused. The override is the option `--allow-insecure-file-permissions` of `pgsnare run`, and every file it lets through is named in the log. `pgsnare config check` takes the same option, and then reports such a file as a warning.
+- **File permissions.** pgsnare refuses to start if a private key, a token file, the configuration file, or a file from which a webhook sink reads its signing key or its URL is open to other users, unless explicitly overridden. The rule is PostgreSQL's own: a file owned by the process user must not be readable by group or others, and a root-owned file may be group-readable. A file owned by anyone else is refused. The override is the option `--allow-insecure-file-permissions` of `pgsnare run`, and every file it lets through is named in the log. `pgsnare config check` takes the same option, and then reports such a file as a warning.
 
 The format is strict: an unknown field is an error, at least one sink is required, and a webhook sink must name its signing key.
 
@@ -442,10 +442,13 @@ metrics: { listen: 127.0.0.1:9642 }
 | `pgsnare token test` | Says whether a value matches a honeytoken of a configuration |
 | `pgsnare healthcheck` | Asks a running proxy whether it is healthy |
 
-**`config check`** uses the code of `run`: the same loader, the same rule for the access rights of the same files, and the same functions to read certificates and keys. A configuration that passes starts, and one that fails does not, as far as that can be known without connecting to anything. The check opens no listener and no connection.
+**`config check`** uses the code of `run`: the same loader, the same rule for the access rights of the same files, the same functions to read certificates and keys, and the same code to build the sinks. A configuration that passes starts, and one that fails does not, as far as that can be known without connecting to anything, opening a listener or writing a file.
 
-- It reports every problem it can find in one run: unknown fields, honeytokens that are not valid, and files that are missing or open to other users.
-- It warns about settings that are valid and give up some protection: a database whose certificate is not verified, `fail_open`, a sink over plain HTTP, and an admin or metrics listener beyond loopback.
+- It reports every problem it can find in one run: unknown fields, honeytokens that are not valid, files that are missing or open to other users, and sinks that cannot be built, such as a webhook whose signing key is not there or whose URL cannot be used.
+- It warns about settings that are valid and give up some protection: a database whose certificate is not verified, `fail_open`, a sink over plain HTTP, an admin or metrics listener beyond loopback, a signing key shorter than 32 bytes, and a file for events that other users can read.
+- It reads the files and the environment variables that the configuration names, the signing key of a webhook among them. It therefore says what `run` would do on the same machine, as the same user and with the same environment.
+- It creates no file. For a `file` sink whose file is not there yet, it asks whether the directory would take one.
+- `run` can still fail after a check that passed: when the address of a listener, the admin and metrics listeners included, is taken or is not an address of the machine, and when the file of a `file` sink cannot be created after all. A database, a webhook receiver or a syslog server that does not answer does not keep `run` from starting. It shows with the first connection or the first event.
 - Any error gives a non-zero exit status. Warnings alone do not.
 
 **`token generate`** connects to nothing and writes nothing but its output. It prints one SQL script: an `INSERT` with a row for each honeytoken, and the token file for pgsnare inside an SQL comment. The operator reviews it, runs it, and gives the token file to pgsnare.
@@ -460,22 +463,136 @@ metrics: { listen: 127.0.0.1:9642 }
 
 ## 12. Events and observability
 
+What this section describes is built, except where it says otherwise. Nothing detects yet, so the only event that real traffic raises today is `inspection_bypassed`. The hits in the tests of this section are made by the tests.
+
+### 12.1 Events
+
 Events are versioned JSON objects.
 
 | Group | Fields |
 |---|---|
-| Identity | `event_id`, `timestamp`, `kind`, `session_id`, instance labels |
+| Identity | `schema_version`, `event_id`, `timestamp`, `kind`, `session_id`, instance labels |
 | What fired | `token_id` or `rule_id`, `action_taken`, `hit_count`, `direction`, `message_type` |
 | Who | `client_ip`, `client_port`, `db_user`, `database`, `application_name`, `tls` |
 | Context | `query` (redacted as configured), `rows_so_far`, `session_flagged` |
 
 Event kinds are `token_hit`, `rule_hit`, `parse_failure`, `session_activity` and `inspection_bypassed`.
 
-- **Token values never appear** in events, logs or metrics; only token ids do. Passwords and key material are never logged. Bind parameters and full query text are off by default.
-- **Delivery never blocks traffic.** The data path hands events to a bounded queue without waiting. A dispatcher deduplicates, rate-limits and fans out to sinks, each with its own bounded queue and retry with backoff. Dropped events are counted.
-- **Sinks:** webhook (HTTPS, with an HMAC-SHA256 signature header), standard output, file, and syslog (RFC 5424).
-- **Metrics** are exposed in Prometheus format on their own listener: connections, queries, bytes, hits, actions, parse failures, queue depth and drops, and a histogram of added latency.
-- **Health.** `/healthz` and `/readyz` are served on a loopback-only admin listener and queried by the built-in `pgsnare healthcheck` command.
+- **Token values never appear** in events, logs or metrics; only token ids do. Passwords and key material are never logged. Bind parameters are never part of an event.
+- **The statement of an event** follows `events.query_redaction`. `full` shows the text, cut at 4,096 bytes. `fingerprint`, the default, shows the SHA-256 hash of the text as it was sent, constants included. `none` shows nothing. A reader of events who knows a statement except for a short constant in it can try every value against a fingerprint. The plan is that a build with the SQL parser leaves constants out of the fingerprint. Until then, `none` is the mode that tells nothing. The function that applies the mode exists and is tested, and nothing raises an event with a statement yet.
+- **Instance labels** come from `events.labels` and from the environment variables that `events.labels_from_env` names. A variable that is not set, or whose value is empty, too long or contains a control character, gives no label, and pgsnare says so in its log.
+- **Identifiers.** `event_id` and `session_id` are 128 bits from the secure random generator of the TLS library. They tell events and sessions apart, and they are not secrets: nothing is granted to whoever knows or guesses one. Should that generator ever report a failure, an identifier is made from the clock and a hash instead, which is enough to tell two of them apart and would not be enough for a secret.
+
+### 12.2 From a session to a sink
+
+- **A session never waits.** It puts an event into a queue of fixed length (`events.queue_size`, 1,024 by default) and goes on. It takes no lock. When the queue is full, the event is dropped and counted.
+- **The dispatcher** takes events from that queue in a task of its own. It removes what must not be shown (see [section 12.6](#126-logs-and-redaction)), folds repeated hits, seals the event with an identifier, the time it was raised and the instance labels, and puts it into the queue of every sink. A sink whose queue is full loses that event, which is counted, and the other sinks still get it.
+- **Deduplication.** The first hit of a token in a session is delivered at once. Later hits of the same token in the same session within `events.dedup_window` (60 seconds by default; `0s` turns it off) are folded: they are not delivered, and when the window closes, one event reports the last of them with their number as its `hit_count`. A hit that was answered with other responses is delivered at once. Only `token_hit` events are folded. At most 4,096 windows are open at a time, and a hit that would need one more is delivered as it is.
+- **Each sink has a worker** with a queue of its own (`queue_size`, 1,024 by default), an optional rate limit (`max_events_per_second`), a time limit for each attempt and retries. A failed attempt that may succeed later is made again after a pause that starts at 250 ms and doubles up to 30 seconds, shortened at random by up to half. When the retries are used up (`max_retries` for a webhook, 5 for the other sinks), the event is dropped. A sink that refuses an event for good is not asked again. A panic in a sink ends one attempt.
+- **When the proxy stops**, the sinks get 2 seconds to deliver what waits. What is left is dropped.
+
+Every drop is counted in a metric, by sink and by reason. A sink that is slow, down or never answers costs events and never a delayed query.
+
+### 12.3 Sinks
+
+The four sinks implement the public sink interface (see [section 13](#13-extension-points)). A sink makes one attempt to deliver one event. Queueing, the rate limit, the retries and the counting are the dispatcher's, for every sink alike.
+
+| Sink | What it does with an event |
+|---|---|
+| `webhook` | Posts it as a signed request over HTTPS |
+| `stdout` | Writes it to standard output as one line of JSON. Standard output carries nothing else: the log goes to standard error |
+| `file` | Appends it to a file as one line of JSON |
+| `syslog` | Sends it as one message in the format of RFC 5424 |
+
+**Webhook.**
+
+- **HTTPS, verified.** The certificate of the receiver must chain to an authority of the system's certificate store and carry the host name of the URL. TLS 1.2 is the floor. A plain `http` URL is refused unless the sink sets `allow_insecure_http`, and pgsnare then says in its log that events travel unencrypted.
+- **One request for each attempt**, as an HTTP/1.1 `POST` on a connection of its own. No redirect is followed, and no proxy is used, whatever the environment says.
+- **Limits.** An attempt has `timeout` (5 seconds by default) from resolving the name to the end of the answer. The head of the answer may have 16 KiB, and at most 64 KiB of its body are read, and thrown away.
+- **The answer.** A `2xx` status means delivered. `408`, `425`, `429` and `5xx` mean not now, and the attempt is made again later. Any other status, a redirect included, drops the event.
+- **The signing key** comes from an environment variable or a file, never from the configuration. At most 4,096 bytes are read, and one line break at the end of a file is not part of the key. The bytes that were read are wiped once the cryptographic library holds the key. A key shorter than 32 bytes is used, with a warning. The value of an environment variable stays in the environment of the process for as long as it runs; a file does not.
+- **The URL** can come from an environment variable or a file too, because some webhook URLs are secrets. Neither the URL nor the key is part of any log line or error.
+
+Every request carries three headers:
+
+| Header | Content |
+|---|---|
+| `x-pgsnare-timestamp` | The time of the attempt, in seconds since 1970-01-01T00:00:00Z, as decimal digits |
+| `x-pgsnare-signature` | `v1=` and 64 lowercase hexadecimal digits: the HMAC-SHA256, with the key of the sink, of the timestamp as it stands in its header, one full stop (the byte `0x2e`) and the body, byte for byte |
+| `x-pgsnare-event-id` | The `event_id` of the body, as a convenience. It is not signed |
+
+Nothing has to be parsed to check a signature. A receiver must do four things:
+
+1. Reject a request without both headers, with a timestamp that is not a decimal number, or with a signature that is not `v1=` and 64 hexadecimal digits.
+2. Reject a request whose timestamp is further from its own clock than it tolerates, five minutes for example. A recorded request cannot be sent again later.
+3. Compute the HMAC over the timestamp, the full stop and the body as received, and compare it with the signature in constant time. Whoever does not hold the key cannot make a signature that matches.
+4. Remember the `event_id` of the body of every request it accepted, for as long as it tolerates old requests, and reject a repetition. Without this, a recorded request passes the first three checks until its timestamp is too old.
+
+A retry carries the same event and `event_id` under a new timestamp and signature. A receiver whose answer was lost sees the event twice, and the fourth check also makes that harmless.
+
+**File.**
+
+- The file is created with mode `0600`. A file that is there keeps its mode, and pgsnare says in its log when others than the owner can read or write it.
+- If the last part of the path is a symbolic link, the file is not opened. Only a regular file is written to. The directories on the way are the operator's to protect.
+- **Rotation.** Before each event the sink looks at what the path leads to. After a rename or a removal, the next event goes to a new file at the path, which the sink creates if nothing else has. After the file was emptied in place, the sink goes on at its new end. Nothing has to tell pgsnare.
+- A write that fails is tried again like any failed delivery. If only a part of a line reached the file, the next write starts with a line break, so that the broken line does not run into the next event.
+
+**Syslog.**
+
+- The message is `<PRI>1 TIMESTAMP HOSTNAME pgsnare PROCID MSGID - MSG`. `MSGID` is the kind of the event, there is no structured data, and `MSG` is the event as JSON. The facility comes from the configuration (`local0` by default). The severity is 1 (alert) for `token_hit`, 4 (warning) for `rule_hit` and `inspection_bypassed`, and 5 (notice) for the other kinds.
+- **An event cannot forge a record.** Nothing of an event goes into the header. `MSG` is printable ASCII from its first byte to its last: the JSON encoder escapes control characters, and the sink writes every character outside ASCII as an escape too. No text of an event, such as a user name with a line break in it, can end a record and begin another.
+- **Transport.** Over UDP, or a datagram socket of the system such as `/dev/log`, one message is one datagram, as RFC 5426 requires, and an event that does not fit into a datagram is dropped. Over TCP, or a stream socket of the system, each message is preceded by its length and a space, the octet counting that RFC 6587 describes. The connection is kept between events and opened again when it fails.
+- **What syslog does not give.** A message is not encrypted. A syslog server sends no answer, so an event that was written to a connection the server has just closed is lost without the sink knowing. And a message is as long as its event: RFC 5424 obliges a receiver to accept 480 bytes and recommends 2,048, and allows it to cut or drop what is longer. An event with long names is longer than that, and one that shows a statement in full can exceed 4,096 bytes, so the limit of the receiver has to be set for it. Where a delivery must be confirmed, the webhook sink is the one that gets an answer.
+
+### 12.4 Metrics
+
+Metrics are served on a listener of their own (`metrics.listen`, `127.0.0.1:9642` by default) at `/metrics`, in the text format of Prometheus. pgsnare writes that text itself from its counters.
+
+| What | Metrics |
+|---|---|
+| State | `pgsnare_build_info`, `pgsnare_ready`, `pgsnare_healthy` |
+| Connections | `pgsnare_connections_accepted_total`, `pgsnare_connections_refused_total`, `pgsnare_connections_active`, `pgsnare_sessions_failed_total`, `pgsnare_logins_total`, `pgsnare_login_timeouts_total`, `pgsnare_backend_connection_failures_total`, `pgsnare_cancel_requests_forwarded_total` |
+| Bytes | `pgsnare_bytes_total` by direction, `pgsnare_read_buffer_bytes` |
+| Events | `pgsnare_events_raised_total`, `pgsnare_events_total` by kind, `pgsnare_events_deduplicated_total`, `pgsnare_event_queue_depth`, `pgsnare_event_queue_capacity`, `pgsnare_events_dropped_total` |
+| Sinks | `pgsnare_sink_queue_depth`, `pgsnare_sink_queue_capacity`, `pgsnare_sink_events_delivered_total`, `pgsnare_sink_delivery_attempts_failed_total`, and `pgsnare_sink_events_dropped_total` by reason, each by sink |
+| Faults | `pgsnare_panics_total` by where the panic happened, `pgsnare_listener_failures_total` |
+| Added latency | The histogram `pgsnare_added_latency_seconds`: the time bytes spend in the proxy once a client has logged in, from reading something from one connection to having written everything that came of it to the other |
+| No source yet | `pgsnare_queries_total`, `pgsnare_hits_total`, `pgsnare_token_hits_total`, `pgsnare_rule_hits_total`, `pgsnare_actions_total`, `pgsnare_parse_failures_total`, `pgsnare_reload_failures_total`. They are exported and say zero until detection, responses and reload are built |
+
+- **Labels are bounded.** A label value is a fixed word of the code, the name of a sink, which is its type and its place in the configuration, such as `webhook-0`, or the id of a token or a rule from the configuration. It passes through the redaction layer, keeps only ASCII letters, digits and `.`, `_`, `:`, `-`, and is cut at 128 bytes. Nothing a client or a database sent becomes a label or part of a name.
+- **No list of tokens.** A token gets a series of its own only once it was hit, and by then its id has been in an event.
+
+### 12.5 Health
+
+The admin listener (`admin.listen`, `127.0.0.1:9641` by default) serves two paths:
+
+| Path | Answer |
+|---|---|
+| `/healthz` | `200` while the proxy works as it should, `503` once one of its listeners has failed |
+| `/readyz` | `200` while the proxy accepts clients, `503` before that, while it stops, and once a listener has failed |
+
+The admin and the metrics listener have the same limits and the same rules:
+
+- **Read-only.** They answer `GET` on their paths and nothing else: another method gets `405`, another path `404`. They show a state and numbers: no configuration, no address of a client and no list of tokens.
+- **Plain HTTP, without a login.** Both are bound to loopback by default. When one is given another address, whoever can reach it can read what it serves, and pgsnare says so in its log when it starts.
+- **Limits.** One request for each connection. A connection has 10 seconds in all, so a client that sends nothing, sends slowly, never stops sending or does not read its answer is dropped. The head of a request may have 8,192 bytes and 64 headers, and its body is never read. A listener holds at most 32 connections, and one more is closed at once.
+- **When they fail.** An address that cannot be opened keeps the proxy from starting. A panic while a request is answered ends that connection. A panic in the loop that accepts connections ends the loop, which is started again after a moment. Both are counted and logged. Database traffic does not depend on either listener.
+
+`pgsnare healthcheck` asks the admin listener: see [section 14.2](#142-lifecycle).
+
+### 12.6 Logs and redaction
+
+**The log** goes to standard error, one JSON object for each line, with `timestamp`, `level`, `message` and the fields of the line.
+
+- The message and the names of the fields are fixed texts of the code. The values are counts, addresses of sockets, and names and paths from the configuration. Nothing a client or a database sent is written to the log, and neither is a secret. That is a rule for every line of code that logs.
+- Two things do not depend on that rule being kept. Every text of a line passes through the redaction layer. And every line is written by the JSON encoder, so a value with a line break or a quotation mark in it is still one field of one line.
+- A text is cut at 4,096 bytes and a line has at most 32 fields. A panic is logged with the place it happened and without its message.
+
+**Redaction** is one module that everything passes through before it leaves the process: the dispatcher gives it every event before any sink sees it, the log gives it every text of a line, and a name becomes a metric label through it and in no other way.
+
+- **What it removes.** Honeytoken values in every form the matcher finds them in: as written, as lowercase hexadecimal digits and, for a token that asks for it, in any letter case. The patterns are the matcher's own, so what detection finds, redaction removes. It also removes the beginning of a value where a name was cut inside it, and the URL of every webhook. Each is replaced by `[redacted]`. If the search itself fails, nothing of the text is shown.
+- **What it does not look for.** Key material: a signing key and a private key are handed to the cryptographic library, and no error, log line or event is built from them. Looking for them would mean keeping a second copy of every key. Passwords and bind parameters: pgsnare relays them without keeping them, and no event, log line or metric has a place for one.
+- **Where it ends.** A value that was written in another form, such as base64, is not recognised. The rule for the code that logs stays the first protection, and the leak test of [section 17](#17-verification) searches for those forms. The URL of a webhook is known to the redaction layer once all sinks are built, and the code that builds them logs no URL.
 
 ## 13. Extension points
 
@@ -500,9 +617,15 @@ Extensions are compiled in. There is no runtime plugin loading, no dynamic libra
 ### 14.2 Lifecycle
 
 - pgsnare runs correctly as process 1 of a container.
-- On `SIGTERM` it stops accepting connections, reports not-ready, lets open sessions finish for a configurable grace period, then closes the rest with the same error the database sends on an administrator shutdown. `SIGINT` does the same. It then exits with status 0.
+- **Start.** `pgsnare run` builds the sinks, opens the admin and metrics listeners, and then opens the listeners for clients. When a sink cannot be built or a listener cannot be opened, it says why in its log and exits with status 1. Until the listeners for clients are served, the proxy is healthy and not ready.
+- **Stop.** On `SIGTERM` it stops accepting connections, reports not-ready, lets open sessions finish for a configurable grace period, then closes the rest with the same error the database sends on an administrator shutdown. `SIGINT` does the same. The sinks then get 2 seconds to deliver the events that wait. The health endpoints and the metrics answer until all of that is done, and a proxy that stops is healthy and not ready. It then exits with status 0.
 - A session that cannot read an error at that moment is closed without one: a client that has not sent its startup message yet, or one that is in the middle of a message that is being passed on in chunks.
-- `pgsnare healthcheck` asks the loopback admin listener and exits 0 or 1. It backs the image's health check and Kubernetes exec probes, so no health port has to be exposed.
+- **A listener that fails.** If a listener stops accepting clients while the proxy is meant to run, which takes a defect in pgsnare such as a panic in the loop that accepts them, the proxy logs an error, counts the failure, reports that it is neither ready nor healthy, and stops as it does on `SIGTERM`. The open sessions of every listener, the failed one included, get the grace period. `pgsnare run` then exits with status 1, so that whatever supervises the process starts it again. No traffic passes uninspected in either case. The point is that a proxy which serves nobody on one of its addresses must not go on reporting that it is healthy.
+- **`pgsnare healthcheck`** asks `/healthz` of the admin listener and exits 0 or 1. With `--ready` it asks `/readyz`. It writes nothing on success and one line to standard error on failure, and it needs nothing but the binary, so it works in an image without a shell.
+  - It asks the address that the configuration given with `--config` names for the admin listener, or the default address. A listener that is bound to every address is asked over loopback. No option takes an address or a URL.
+  - It connects from the very address it connects to. Linux allows that only for an address of the machine itself, unless the system was set to let a process bind to an address that is not its own (`net.ipv4.ip_nonlocal_bind`, or the setting of the same name for IPv6). The request therefore stays on the machine.
+  - It follows no redirect, and the whole check has 2 seconds.
+  - It is meant to back the health check of the image and Kubernetes exec probes, so that no health port has to be exposed. The image and the chart are not built yet.
 - Worker threads follow the container's CPU limit.
 
 ### 14.3 Standalone container
@@ -600,9 +723,9 @@ An attacker with root on the pgsnare host is out of scope.
 - Inspection errors end the session (`fail_closed`). The alternative, `fail_open`, turns the session into an uninspected tunnel and emits an `inspection_bypassed` event; it must be chosen explicitly. It applies only to a session the database has accepted: before that, a connection that cannot be followed is closed whatever the setting.
 - TLS 1.2 is the floor and 1.3 is preferred. When upstream TLS is on, the certificate is verified. Turning verification off takes an explicit setting and is logged at startup.
 - Private keys, token files and the configuration file must not be open to other users (see [section 11](#11-policy-configuration-and-reload)).
-- The admin and metrics listeners bind to loopback by default and are read-only. There is no remote administration interface.
-- Webhook sinks require HTTPS with certificate verification. Plain HTTP takes an explicit setting.
-- Token values, passwords and key material never reach logs, events or metrics.
+- The admin and metrics listeners bind to loopback by default and are read-only. There is no remote administration interface. They speak plain HTTP and ask for no login, so an address beyond loopback shows health or metrics to whoever can reach it. pgsnare says so in its log when one is configured.
+- Webhook sinks require HTTPS with certificate verification against the system's certificate store, and follow no redirect. Plain HTTP takes an explicit setting and is named in the log.
+- Token values, passwords and key material never reach logs, events or metrics. [Section 12.6](#126-logs-and-redaction) says how that is enforced and where it ends.
 - No command shows the value of a honeytoken that exists. `pgsnare token generate` prints the values it makes, once, and keeps nothing.
 - Generated honeytokens take all their randomness from the secure random generator of the operating system. If it fails, nothing is generated.
 - `pgsnare config check` warns when a configuration departs from these defaults: verification of the database's certificate turned off, `fail_open`, a sink over plain HTTP, or an admin or metrics listener beyond loopback.
@@ -613,14 +736,14 @@ An attacker with root on the pgsnare host is out of scope.
 - The image has no shell or package manager, has its base pinned by digest, and is scanned for known vulnerabilities on every build and nightly.
 - Every size or count taken from the network is bounded.
 - Key material stays in memory only and is wiped when dropped where the libraries allow. Core dumps are disabled.
-- A panic ends one session, not the process, and is counted. The count must stay at zero in fuzzing and soak tests.
+- A panic ends one session, one delivery attempt of a sink or one connection to the admin or metrics listener, not the process, and is counted by where it happened. A panic in the loop that accepts clients for a listener stops the proxy, which then exits with a status that is not zero (see [section 14.2](#142-lifecycle)). The counts must stay at zero in fuzzing and soak tests.
 
 ### 15.4 Code safety
 
 - `unsafe` code is forbidden in all pgsnare crates.
 - In the protocol and core crates, lints deny `unwrap`, `expect`, `panic!`, slice indexing and unchecked arithmetic outside tests. Integer overflow checks stay on in release builds.
 - Every parser has a fuzz target. A fuzz crash blocks release.
-- Not everything in a build is Rust. The TLS protocol is handled by `rustls`, which is Rust, but its cryptographic primitives come from `aws-lc-rs`, a library in C and assembly that is part of every build. The optional SQL parser is C and is isolated as [section 10](#10-sql-rules) describes. Like most Rust programs, pgsnare also calls the C library of the system.
+- Not everything in a build is Rust. The TLS protocol is handled by `rustls`, which is Rust, but its cryptographic primitives come from `aws-lc-rs`, a library in C and assembly that is part of every build. pgsnare calls the same library for the HMAC-SHA256 of a webhook signature and the SHA-256 of a statement fingerprint, so a build holds one cryptographic library. HTTP, for the webhook sink, the admin and metrics listeners and `pgsnare healthcheck`, is handled by `hyper`, which is Rust, and pgsnare parses none of it by hand. The optional SQL parser is C and is isolated as [section 10](#10-sql-rules) describes. Like most Rust programs, pgsnare also calls the C library of the system.
 
 ### 15.5 Supply chain
 
@@ -665,7 +788,8 @@ These are design targets, not measurements.
 - **Detection corpus.** Each case is labelled as a hit or a known gap and run in simple, extended-text and extended-binary modes. Known gaps are asserted as misses, so the documentation stays honest.
 - **Property tests.** The scanner finds the same matches however the bytes are chunked.
 - **Fuzzing.** Framer, startup packets, the whole session logic with interleaved input, the configuration loader and the rule engine.
-- **Leak test.** No token value, password or key reaches a log, event or metric.
+- **Events and observability.** The dispatcher is tested with a clock the tests control: a sink that never answers costs events and never a wait. The webhook sink is tested against a receiver made for the test, over TLS with certificates made for the run: a receiver written from the documentation alone tells a forged and a repeated request from a real one, and a certificate that is not trusted or carries another name gets no event. One test makes the code of a real listener panic and expects the proxy to stop with the grace period. Other tests start the `pgsnare` binary with a configuration file and look at what it writes and how it ends.
+- **Leak test.** A `pgsnare` process is started with honeytokens, a password, a bind parameter, signing keys, a private key and a webhook URL that is a secret, all made for the run, and with every way out it has: each kind of sink, the log, the metrics, the health endpoints and what `pgsnare healthcheck` prints. Traffic that carries the secrets passes through it. Everything that came out is then searched for every secret, as it is and in the forms a careless line of code could have written it in. The test also shows that the search finds what it looks for, that every secret was where it could leak from, and that every output was written to. Detection is not built, so the complete system has not been through this test yet.
 - **Commands and bait.** The output of every command is compared with expected output. What `token generate` prints is run by PostgreSQL 15 to 18, with names that try to get out of their quotes. The SCRAM-SHA-256 bait is given to PostgreSQL as a password, and the bcrypt bait to its `pgcrypto` extension. Every configuration that `config check` refuses is given to `pgsnare run`, which must refuse it too.
 - **Benchmarks.** One reproducible script with pinned CPU sets.
 - **Container and Kubernetes tests.** The image runs with a read-only root filesystem and all capabilities dropped. The chart is installed into a namespace that enforces the restricted Pod Security Standard. Tests cover both Kubernetes patterns from install to first alert, a token added through the mounted Secret, a rolling update with drain, and NetworkPolicy isolation.
