@@ -78,6 +78,8 @@ use pgsnare_proto::{Frame, backend};
 
 use crate::event::{Query, StatementDigest};
 use crate::policy::QueryRedaction;
+#[cfg(feature = "rules")]
+use crate::rules::{Analysis, ParseFailure};
 
 use super::scan::single_select;
 
@@ -107,6 +109,10 @@ pub(super) struct Kept {
     full: OnceLock<Query>,
     /// What an event shows of the text under `fingerprint`.
     fingerprint: OnceLock<Query>,
+    /// What the parser made of the text, or why it made nothing. Empty
+    /// until the answer is there, and for a text nobody asked about.
+    #[cfg(feature = "rules")]
+    analysis: OnceLock<Result<Arc<Analysis>, ParseFailure>>,
 }
 
 #[cfg(test)]
@@ -119,6 +125,38 @@ thread_local! {
 }
 
 impl Kept {
+    fn new(text: &[u8], used: Arc<AtomicUsize>) -> Self {
+        Self {
+            bytes: text.into(),
+            used,
+            single_select: OnceLock::new(),
+            full: OnceLock::new(),
+            fingerprint: OnceLock::new(),
+            #[cfg(feature = "rules")]
+            analysis: OnceLock::new(),
+        }
+    }
+
+    /// A text that no tracker counts: for a statement that is held for
+    /// its analysis and that the tracker had no room for.
+    #[cfg(feature = "rules")]
+    pub(super) fn uncounted(text: &[u8]) -> Arc<Self> {
+        Arc::new(Self::new(text, Arc::new(AtomicUsize::new(text.len()))))
+    }
+
+    /// Keeps the answer of the parser with the text. The first answer
+    /// stays.
+    #[cfg(feature = "rules")]
+    pub(super) fn analysed(&self, outcome: Result<Arc<Analysis>, ParseFailure>) {
+        let _ = self.analysis.set(outcome);
+    }
+
+    /// The answer of the parser, once there is one.
+    #[cfg(all(test, feature = "rules"))]
+    pub(super) fn analysis(&self) -> Option<&Result<Arc<Analysis>, ParseFailure>> {
+        self.analysis.get()
+    }
+
     fn scan_single_select(&self) -> bool {
         #[cfg(test)]
         SINGLE_SELECT_SCANS.with(|count| count.set(count.get().saturating_add(1)));
@@ -129,6 +167,13 @@ impl Kept {
         #[cfg(test)]
         QUERIES_MADE.with(|count| count.set(count.get().saturating_add(1)));
         Query::from_statement(&self.bytes, redaction, digest)
+    }
+}
+
+#[cfg(feature = "rules")]
+impl AsRef<[u8]> for Kept {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
@@ -146,7 +191,14 @@ pub(super) enum Statement<'a> {
     /// Not known.
     Unknown,
     /// The message carries it.
-    Own(&'a [u8]),
+    Own {
+        /// The text, in the message.
+        bytes: &'a [u8],
+        /// The same text as the tracker holds it from now on, when it had
+        /// room for it.
+        #[cfg(feature = "rules")]
+        kept: Text,
+    },
     /// The tracker holds it.
     Kept(Arc<Kept>),
 }
@@ -157,7 +209,7 @@ impl Statement<'_> {
     pub(super) fn single_select(&self) -> bool {
         match self {
             Self::Unknown => false,
-            Self::Own(bytes) => single_select(bytes),
+            Self::Own { bytes, .. } => single_select(bytes),
             Self::Kept(kept) => *kept.single_select.get_or_init(|| kept.scan_single_select()),
         }
     }
@@ -168,7 +220,7 @@ impl Statement<'_> {
     pub(super) fn query(&self, redaction: QueryRedaction, digest: &dyn StatementDigest) -> Query {
         match self {
             Self::Unknown => Query::unknown(redaction),
-            Self::Own(bytes) => Query::from_statement(bytes, redaction, digest),
+            Self::Own { bytes, .. } => Query::from_statement(bytes, redaction, digest),
             Self::Kept(kept) => {
                 let made = match redaction {
                     QueryRedaction::Full => &kept.full,
@@ -178,6 +230,24 @@ impl Statement<'_> {
                 made.get_or_init(|| kept.make_query(redaction, digest))
                     .clone()
             }
+        }
+    }
+
+    /// What the parser made of the statement, or why it made nothing.
+    /// `None` when nobody asked, when the answer is not there yet, and
+    /// when the tracker does not hold the text.
+    ///
+    /// The answer was worked out once, when the statement arrived: a
+    /// message that names the statement costs nothing for it.
+    ///
+    /// Nothing but the tests reads it yet: the rules that judge a statement
+    /// when it runs are still to come.
+    #[cfg(all(test, feature = "rules"))]
+    pub(super) fn analysis(&self) -> Option<&Result<Arc<Analysis>, ParseFailure>> {
+        match self {
+            Self::Unknown => None,
+            Self::Own { kept, .. } => kept.as_ref().and_then(|kept| kept.analysis()),
+            Self::Kept(kept) => kept.analysis(),
         }
     }
 }
@@ -434,15 +504,27 @@ impl Tracker {
                 let sql = frontend::Query::from_frame(frame)
                     .map_err(|_| Unexpected)?
                     .sql();
-                (Some(Pending::Query(self.keep(sql))), Statement::Own(sql))
+                let text = self.keep(sql);
+                let own = Statement::Own {
+                    bytes: sql,
+                    #[cfg(feature = "rules")]
+                    kept: text.clone(),
+                };
+                (Some(Pending::Query(text)), own)
             }
             tag::PARSE => {
                 let parse = frontend::Parse::from_frame(frame).map_err(|_| Unexpected)?;
+                let text = self.keep(parse.sql());
+                let own = Statement::Own {
+                    bytes: parse.sql(),
+                    #[cfg(feature = "rules")]
+                    kept: text.clone(),
+                };
                 let entry = Pending::Parse {
                     name: name(parse.statement())?,
-                    text: self.keep(parse.sql()),
+                    text,
                 };
-                (Some(entry), Statement::Own(parse.sql()))
+                (Some(entry), own)
             }
             tag::BIND => {
                 let bind = frontend::Bind::from_frame(frame).map_err(|_| Unexpected)?;
@@ -540,13 +622,7 @@ impl Tracker {
             return None;
         }
         self.used.fetch_add(text.len(), Ordering::Relaxed);
-        Some(Arc::new(Kept {
-            bytes: text.into(),
-            used: Arc::clone(&self.used),
-            single_select: OnceLock::new(),
-            full: OnceLock::new(),
-            fingerprint: OnceLock::new(),
-        }))
+        Some(Arc::new(Kept::new(text, Arc::clone(&self.used))))
     }
 
     /// The statement that runs a COPY the server has announced.

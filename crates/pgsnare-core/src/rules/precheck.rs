@@ -86,7 +86,8 @@ pub enum ParseFailure {
     TooDeep,
     /// The parser rejected the statement: it is not valid SQL.
     Rejected,
-    /// The parser read the statement and its result could not be used.
+    /// The parser read the statement and its result could not be used, or
+    /// the message that carries the statement is malformed.
     Unreadable,
     /// The statement names more relations, functions or kinds of statement
     /// than an analysis holds.
@@ -95,6 +96,15 @@ pub enum ParseFailure {
     Busy,
     /// The parser thread panicked on this statement.
     Panicked,
+    /// The message that carries the statement arrived in parts, because it
+    /// is larger than a session holds.
+    Streamed,
+    /// The database reads the statement in a way the parser does not: the
+    /// session's `client_encoding` is not `UTF8`, or was never reported,
+    /// or `standard_conforming_strings` is off.
+    Encoding,
+    /// No answer came from the parser threads in the time allowed.
+    TimedOut,
 }
 
 impl ParseFailure {
@@ -111,6 +121,9 @@ impl ParseFailure {
             Self::Incomplete => "incomplete",
             Self::Busy => "busy",
             Self::Panicked => "panicked",
+            Self::Streamed => "streamed",
+            Self::Encoding => "encoding",
+            Self::TimedOut => "timed_out",
         }
     }
 }

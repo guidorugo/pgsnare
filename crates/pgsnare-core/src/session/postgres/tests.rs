@@ -1138,14 +1138,14 @@ fn a_report_that_does_not_fit_ends_the_session() {
         // Nothing was asked for yet.
         let mut harness = Harness::new(TlsPolicy::Optional);
         assert_eq!(
-            harness.report(report).unwrap_err().reason(),
+            harness.report(report.clone()).unwrap_err().reason(),
             "a report that does not fit the state of the session"
         );
         assert!(harness.session.is_closed());
 
         // An established session asked for nothing either.
         let mut harness = Harness::established(TlsPolicy::Optional);
-        assert!(harness.report(report).is_err());
+        assert!(harness.report(report.clone()).is_err());
 
         // A session that has ended ignores what still comes in.
         let mut harness = Harness::new(TlsPolicy::Optional);

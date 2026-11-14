@@ -129,9 +129,13 @@ use crate::bait::Entropy;
 use crate::detect::{Match, Matcher, ScanError, StreamScanner};
 use crate::event::{EventBody, EventKind, StatementDigest};
 use crate::policy::{Action, ActionSet, PolicySnapshot, TokenId};
+#[cfg(feature = "rules")]
+use crate::rules::{Analysis, ParseFailure};
 use crate::session::{Direction, Effect, Output};
 
 use super::names::{STARTUP_MESSAGE, message_name};
+#[cfg(feature = "rules")]
+use super::rules::{self, Hook};
 use super::track::{Statement, Tracker};
 use super::{Context, InspectionError, Inspector, Verdict};
 
@@ -160,6 +164,11 @@ struct Chunked {
     /// For a `CopyData`: which COPY of its direction the scanner belongs
     /// to, so that it is handed back only if that COPY is still running.
     copy: Option<u64>,
+    /// Whether the message is a statement that must not reach the
+    /// database: none of it is passed on, and the session ends with its
+    /// last part.
+    #[cfg(feature = "rules")]
+    blocked: bool,
 }
 
 /// What a scanner keeps for one direction.
@@ -458,21 +467,34 @@ impl Raised {
 }
 
 /// Where the bytes that are searched come from.
-struct Place<'a> {
-    direction: Direction,
-    name: Option<&'static str>,
+pub(super) struct Place<'a> {
+    pub(super) direction: Direction,
+    pub(super) name: Option<&'static str>,
     /// Whether a statement can be behind the message. Not so at startup.
-    in_session: bool,
+    pub(super) in_session: bool,
     /// That statement, as far as the tracker knows it.
-    statement: &'a Statement<'a>,
+    pub(super) statement: &'a Statement<'a>,
     /// Whether made-up rows can be added to the result the message is in.
-    rows: bool,
-    context: &'a Context<'a>,
+    pub(super) rows: bool,
+    pub(super) context: &'a Context<'a>,
+}
+
+/// Whether the policy exempts the session, so that what is found in it is
+/// counted and triggers nothing else.
+pub(super) fn exempts(context: &Context<'_>) -> bool {
+    // Until the database has accepted the login, the user is what the
+    // client claims, and a claim exempts nobody.
+    let user = if context.authenticated {
+        context.db_user
+    } else {
+        None
+    };
+    context.policy.is_exempt(user, context.origin.client_ip)
 }
 
 /// What a scanner remembers of the hits of its session, and what it needs
 /// to report one.
-struct Ledger {
+pub(super) struct Ledger {
     digest: Arc<dyn StatementDigest>,
     /// `None` when only `alert` and `kill` are built.
     responder: Option<Responder>,
@@ -499,7 +521,7 @@ impl Ledger {
     }
 
     /// An event about the message at `place`.
-    fn body(&self, kind: EventKind, place: &Place<'_>) -> EventBody {
+    pub(super) fn body(&self, kind: EventKind, place: &Place<'_>) -> EventBody {
         let context = place.context;
         let redaction = context.policy.query_redaction();
         let mut body = EventBody::new(kind, context.origin);
@@ -570,14 +592,7 @@ impl Ledger {
         let context = place.context;
         let policy = context.policy;
 
-        // Until the database has accepted the login, the user is what the
-        // client claims, and a claim exempts nobody.
-        let user = if context.authenticated {
-            context.db_user
-        } else {
-            None
-        };
-        if policy.is_exempt(user, context.origin.client_ip) {
+        if exempts(context) {
             out.effects.push(Effect::TokenHit {
                 token_id,
                 exempt: true,
@@ -654,6 +669,8 @@ pub struct Scanner {
     from_server: Half,
     tracker: Tracker,
     ledger: Ledger,
+    #[cfg(feature = "rules")]
+    rules: Hook,
 }
 
 impl Scanner {
@@ -689,6 +706,8 @@ impl Scanner {
                 hits: BTreeMap::new(),
                 flagged: false,
             },
+            #[cfg(feature = "rules")]
+            rules: Hook::default(),
         }
     }
 }
@@ -712,7 +731,22 @@ impl fmt::Debug for Scanner {
                     .is_some_and(|responder| responder.tarpit.is_some()),
             )
             .field("tracker", &self.tracker)
+            .field("awaits_analysis", &self.awaits_analysis())
             .finish()
+    }
+}
+
+impl Scanner {
+    /// Whether a statement of the session waits for its analysis.
+    const fn awaits_analysis(&self) -> bool {
+        #[cfg(feature = "rules")]
+        {
+            self.rules.is_waiting()
+        }
+        #[cfg(not(feature = "rules"))]
+        {
+            false
+        }
     }
 }
 
@@ -779,6 +813,10 @@ impl Inspector for Scanner {
     ) -> Result<Verdict, InspectionError> {
         let direction = from_wire(frame.direction());
         let tag = frame.tag();
+        #[cfg(feature = "rules")]
+        if direction == Direction::FromServer {
+            self.rules.server(frame);
+        }
         let statement = match direction {
             Direction::FromClient => self.tracker.client(frame, context.in_copy),
             Direction::FromServer => self.tracker.server(tag, Some(frame.body())),
@@ -820,6 +858,15 @@ impl Inspector for Scanner {
         // A whole message from the server is never inside another one.
         let client_can_be_told = self.from_server.chunked.is_none();
         let verdict = raised.respond(client_can_be_told, context, out)?;
+        // The message has been searched. Only now, and only if it would be
+        // passed on, do the rules ask about its statement.
+        #[cfg(feature = "rules")]
+        let verdict = if verdict == Verdict::Forward && direction == Direction::FromClient {
+            self.rules
+                .client(frame, &place, &self.ledger, client_can_be_told, out)
+        } else {
+            verdict
+        };
         // The made-up rows end with a `CommandComplete` of their own.
         Ok(match verdict {
             Verdict::Forward if replaced => Verdict::Withhold,
@@ -840,18 +887,27 @@ impl Inspector for Scanner {
             Direction::FromClient => self.tracker.client_chunked(tag, context.in_copy),
             Direction::FromServer => self.tracker.server(tag, None),
         };
+        let place = Place {
+            direction,
+            name,
+            in_session: true,
+            statement: &statement,
+            rows: false,
+            context,
+        };
         if is_statement(direction, tag) {
             out.effects.push(Effect::QuerySeen);
-            let place = Place {
-                direction,
-                name,
-                in_session: true,
-                statement: &statement,
-                rows: false,
-                context,
-            };
             self.ledger.activity(&place, out);
         }
+        // A statement that arrives in parts cannot be held for the rules.
+        #[cfg(feature = "rules")]
+        let blocked = match direction {
+            Direction::FromClient => Hook::client_chunked(tag, &place, &self.ledger, out),
+            Direction::FromServer => {
+                self.rules.server_chunked(tag);
+                false
+            }
+        };
         let half = half_of(&mut self.from_client, &mut self.from_server, direction);
         let (stream, copy) = if is_copy_data(direction, tag) {
             (half.take_copy(context.policy), Some(half.copies_ended))
@@ -863,7 +919,15 @@ impl Inspector for Scanner {
             stream,
             statement,
             copy,
+            #[cfg(feature = "rules")]
+            blocked,
         });
+        // What is blocked is still searched, part by part, and none of it
+        // is passed on.
+        #[cfg(feature = "rules")]
+        if blocked {
+            return Ok(Verdict::Withhold);
+        }
         Ok(Verdict::Forward)
     }
 
@@ -888,6 +952,8 @@ impl Inspector for Scanner {
             rows: false,
             context,
         };
+        #[cfg(feature = "rules")]
+        let blocked = chunked.blocked;
         let matches = chunked.stream.scanner.feed(chunk.data());
         let raised = self.ledger.raise(matches, &place, out);
         if chunk.is_last()
@@ -901,6 +967,17 @@ impl Inspector for Scanner {
         // that this chunk belongs to, or is in the middle of another one.
         let client_can_be_told =
             direction == Direction::FromClient && self.from_server.chunked.is_none();
+        // A statement that must not reach the database: the session ends
+        // with its last part, or as soon as a part cannot be dealt with,
+        // and never goes on without it.
+        #[cfg(feature = "rules")]
+        if blocked && !raised.kill {
+            return Ok(if chunk.is_last() || raised.error.is_some() {
+                rules::block(context, client_can_be_told, out)
+            } else {
+                Verdict::Withhold
+            });
+        }
         raised.respond(client_can_be_told, context, out)
     }
 
@@ -929,5 +1006,20 @@ impl Inspector for Scanner {
         half.pinned = false;
         half.copy = None;
         half.copies_ended = half.copies_ended.wrapping_add(1);
+    }
+
+    #[cfg(feature = "rules")]
+    fn analysed(
+        &mut self,
+        id: u64,
+        outcome: Result<Arc<Analysis>, ParseFailure>,
+        context: &Context<'_>,
+        out: &mut Output,
+    ) -> Result<Option<Verdict>, InspectionError> {
+        // A whole message from the server is never inside another one.
+        let client_can_be_told = self.from_server.chunked.is_none();
+        Ok(self
+            .rules
+            .answer(id, outcome, &self.ledger, context, client_can_be_told, out))
     }
 }

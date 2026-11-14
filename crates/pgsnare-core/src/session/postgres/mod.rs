@@ -83,6 +83,10 @@ mod inspect;
 mod kill_tests;
 mod messages;
 mod names;
+#[cfg(feature = "rules")]
+mod rules;
+#[cfg(test)]
+mod rules_tests;
 mod scan;
 #[cfg(test)]
 mod scan_tests;

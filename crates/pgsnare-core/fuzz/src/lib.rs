@@ -434,7 +434,7 @@ impl Run {
                 }
             }
             Step::Bytes(from, bytes) => self.bytes(*from, bytes),
-            Step::Report(report) => self.report(*report),
+            Step::Report(report) => self.report(report.clone()),
             Step::Policy(on_error, max_buffered_frame) => {
                 self.policy = policy(*on_error, *max_buffered_frame);
                 self.largest_limit = self.largest_limit.max(*max_buffered_frame);
