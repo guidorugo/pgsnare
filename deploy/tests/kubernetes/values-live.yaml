@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# What sinks.sh adds to values.yaml for the tests that follow the install:
+# a webhook to the receiver of the run, a second token Secret that the
+# tests change, a scraper, and a grace period long enough for the
+# rolling-update test.
+tokens:
+  secretNames:
+    - pgsnare-tokens
+    - pgsnare-tokens-live
+sinks:
+  stdout: true
+  webhooks:
+    - secretName: pgsnare-webhook
+      port: 8443
+      peers:
+        - namespace: pgsnare-sink
+          podLabels:
+            app.kubernetes.io/name: receiver
+      config:
+        timeout: 5s
+  webhookCA:
+    secretName: pgsnare-webhook-ca
+metrics:
+  scrapers:
+    - namespace: pgsnare-monitoring
+      podLabels:
+        app.kubernetes.io/name: scraper
+shutdown:
+  gracePeriodSeconds: 60

@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# What a build of deploy/Dockerfile may read, when it is built from the root
+# of the repository: the workspace and nothing else. Everything is left out,
+# and then the workspace is let back in.
+*
+!Cargo.toml
+!Cargo.lock
+!crates
+crates/*/fuzz
+**/target

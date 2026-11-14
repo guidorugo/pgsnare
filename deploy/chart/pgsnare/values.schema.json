@@ -1,0 +1,470 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Values of the pgsnare chart",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "image",
+    "replicaCount",
+    "proxy",
+    "clients",
+    "database",
+    "dns",
+    "tokens",
+    "sinks",
+    "metrics",
+    "config",
+    "shutdown",
+    "resources"
+  ],
+  "properties": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "digest"],
+      "properties": {
+        "repository": {
+          "description": "Registry and path, without a tag and without a digest.",
+          "type": "string",
+          "pattern": "^[a-z0-9]+([._-][a-z0-9]+)*(:[0-9]+)?(/[a-z0-9]+([._-][a-z0-9]+)*)+$"
+        },
+        "digest": {
+          "description": "Required. The image is named by digest only.",
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"]
+        }
+      }
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": { "$ref": "#/definitions/objectName" }
+    },
+    "nameOverride": { "$ref": "#/definitions/nameOverride" },
+    "fullnameOverride": { "$ref": "#/definitions/nameOverride" },
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100
+    },
+    "proxy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["port", "clientTLS"],
+      "properties": {
+        "port": { "$ref": "#/definitions/unprivilegedPort" },
+        "maxConnections": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "loginTimeout": { "$ref": "#/definitions/duration" },
+        "clientTLS": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["disable", "prefer", "require"]
+            },
+            "secretName": { "$ref": "#/definitions/optionalObjectName" },
+            "minVersion": { "$ref": "#/definitions/tlsVersion" }
+          }
+        }
+      }
+    },
+    "clients": {
+      "description": "Who may connect to the proxy. An empty list means nobody.",
+      "type": "array",
+      "maxItems": 64,
+      "items": { "$ref": "#/definitions/pods" }
+    },
+    "database": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "port", "tls", "peers"],
+      "properties": {
+        "host": {
+          "description": "Required. A host name or an address, without a port.",
+          "type": "string",
+          "pattern": "^([A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?|[0-9A-Fa-f]{0,4}:[0-9A-Fa-f:]{1,37})$"
+        },
+        "port": { "$ref": "#/definitions/port" },
+        "tls": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["disable", "prefer", "require", "verify-full"]
+            },
+            "caSecretName": { "$ref": "#/definitions/optionalObjectName" },
+            "serverName": {
+              "type": "string",
+              "pattern": "^([A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)?$"
+            },
+            "minVersion": { "$ref": "#/definitions/tlsVersion" }
+          }
+        },
+        "peers": {
+          "description": "Where the database is, for the NetworkPolicy. An empty list means nowhere.",
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/definitions/peer" }
+        },
+        "peerPort": {
+          "description": "The port the database itself listens on. 0: the same as port.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        }
+      }
+    },
+    "dns": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["port", "peers"],
+      "properties": {
+        "port": { "$ref": "#/definitions/port" },
+        "peers": {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "$ref": "#/definitions/peer" }
+        }
+      }
+    },
+    "tokens": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["secretNames"],
+      "properties": {
+        "secretNames": {
+          "description": "Existing Secrets with honeytoken files. Required, at least one.",
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "$ref": "#/definitions/objectName" }
+        }
+      }
+    },
+    "sinks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stdout", "webhooks"],
+      "properties": {
+        "stdout": { "type": "boolean" },
+        "webhooks": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["secretName"],
+            "properties": {
+              "secretName": { "$ref": "#/definitions/objectName" },
+              "port": { "$ref": "#/definitions/port" },
+              "peers": {
+                "type": "array",
+                "maxItems": 64,
+                "items": { "$ref": "#/definitions/peer" }
+              },
+              "config": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "timeout": { "$ref": "#/definitions/duration" },
+                  "max_retries": { "type": "integer", "minimum": 0 },
+                  "queue_size": { "type": "integer", "minimum": 1 },
+                  "max_events_per_second": { "type": "integer", "minimum": 1 }
+                }
+              }
+            }
+          }
+        },
+        "webhookCA": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "secretName": { "$ref": "#/definitions/optionalObjectName" }
+          }
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["port", "scrapers"],
+      "properties": {
+        "port": { "$ref": "#/definitions/unprivilegedPort" },
+        "scrapers": {
+          "description": "Who may read the metrics. An empty list means nobody.",
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/definitions/pods" }
+        }
+      }
+    },
+    "config": {
+      "description": "Settings copied into the configuration file, under its own names.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "inspection": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "on_error": {
+              "type": "string",
+              "enum": ["fail_closed", "fail_open"]
+            },
+            "max_buffered_frame": { "$ref": "#/definitions/size" }
+          }
+        },
+        "exemptions": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "minProperties": 1,
+            "properties": {
+              "db_user": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "client_cidr": {
+                "type": "string",
+                "pattern": "^[0-9A-Fa-f:.]{2,45}/[0-9]{1,3}$"
+              }
+            }
+          }
+        },
+        "actions": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kill": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "sqlstate": {
+                  "type": "string",
+                  "pattern": "^[0-9A-Z]{5}$"
+                },
+                "message": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 1024
+                }
+              }
+            },
+            "tarpit": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "delay": {
+                  "type": "string",
+                  "pattern": "^[0-9]{1,9}(ms|s|m|h|d)(-[0-9]{1,9}(ms|s|m|h|d))?$"
+                },
+                "max_duration": { "$ref": "#/definitions/duration" },
+                "max_sessions": { "type": "integer", "minimum": 0 },
+                "max_bytes_per_second": { "$ref": "#/definitions/size" }
+              }
+            },
+            "fake_data": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "rows": { "type": "integer", "minimum": 0 }
+              }
+            }
+          }
+        },
+        "events": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "query_redaction": {
+              "type": "string",
+              "enum": ["full", "fingerprint", "none"]
+            },
+            "dedup_window": { "$ref": "#/definitions/duration" },
+            "queue_size": { "type": "integer", "minimum": 1 },
+            "labels": {
+              "type": "object",
+              "maxProperties": 30,
+              "additionalProperties": false,
+              "patternProperties": {
+                "^[A-Za-z_][A-Za-z0-9_.-]{0,62}$": {
+                  "type": "string",
+                  "maxLength": 256
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "shutdown": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gracePeriodSeconds", "preStopSleepSeconds"],
+      "properties": {
+        "gracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3600
+        },
+        "preStopSleepSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 300
+        }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requests", "limits"],
+      "properties": {
+        "requests": { "$ref": "#/definitions/resourceList" },
+        "limits": { "$ref": "#/definitions/resourceList" }
+      }
+    },
+    "podLabels": { "$ref": "#/definitions/labels" },
+    "podAnnotations": {
+      "type": "object",
+      "maxProperties": 64,
+      "additionalProperties": false,
+      "patternProperties": {
+        "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$": {
+          "type": "string"
+        }
+      }
+    },
+    "nodeSelector": { "$ref": "#/definitions/labels" },
+    "priorityClassName": { "$ref": "#/definitions/optionalObjectName" }
+  },
+  "definitions": {
+    "objectName": {
+      "description": "The name of an object of the cluster.",
+      "type": "string",
+      "pattern": "^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$"
+    },
+    "optionalObjectName": {
+      "type": "string",
+      "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$"
+    },
+    "nameOverride": {
+      "type": "string",
+      "pattern": "^([a-z0-9]([-a-z0-9]{0,51}[a-z0-9])?)?$"
+    },
+    "namespace": {
+      "type": "string",
+      "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
+    },
+    "port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "unprivilegedPort": {
+      "description": "A port that a process without privileges can open.",
+      "type": "integer",
+      "minimum": 1024,
+      "maximum": 65535
+    },
+    "duration": {
+      "description": "A whole number and a unit, as in the configuration file.",
+      "type": "string",
+      "pattern": "^[0-9]{1,9}(ms|s|m|h|d)$"
+    },
+    "size": {
+      "description": "A whole number and a unit, as in the configuration file.",
+      "type": "string",
+      "pattern": "^[0-9]{1,12}(B|KiB|MiB|GiB)$"
+    },
+    "tlsVersion": {
+      "type": "string",
+      "enum": ["tls1.2", "tls1.3"]
+    },
+    "cidr": {
+      "description": "An address range. A prefix of 0, which is every address, is refused.",
+      "type": "string",
+      "pattern": "^(([0-9]{1,3}\\.){3}[0-9]{1,3}/([1-9]|[12][0-9]|3[0-2])|[0-9A-Fa-f]{0,4}:[0-9A-Fa-f:]{1,37}/([1-9]|[1-9][0-9]|1[01][0-9]|12[0-8]))$"
+    },
+    "labels": {
+      "type": "object",
+      "maxProperties": 64,
+      "additionalProperties": false,
+      "patternProperties": {
+        "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$": {
+          "type": "string",
+          "pattern": "^([A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?)?$"
+        }
+      }
+    },
+    "selectorLabels": {
+      "description": "Labels that select pods. At least one: no label would select every pod.",
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 16,
+      "additionalProperties": false,
+      "patternProperties": {
+        "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$": {
+          "type": "string",
+          "pattern": "^([A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?)?$"
+        }
+      }
+    },
+    "pods": {
+      "description": "Pods with all of these labels, in one namespace: the one named, or the namespace of the release.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["podLabels"],
+      "properties": {
+        "namespace": { "$ref": "#/definitions/namespace" },
+        "podLabels": { "$ref": "#/definitions/selectorLabels" }
+      }
+    },
+    "addresses": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cidr"],
+      "properties": {
+        "cidr": { "$ref": "#/definitions/cidr" }
+      }
+    },
+    "peer": {
+      "description": "Pods of the cluster, or a range of addresses.",
+      "oneOf": [
+        { "$ref": "#/definitions/pods" },
+        { "$ref": "#/definitions/addresses" }
+      ]
+    },
+    "resourceList": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu", "memory"],
+      "properties": {
+        "cpu": {
+          "type": ["string", "number"],
+          "pattern": "^[0-9]+(\\.[0-9]+)?m?$",
+          "exclusiveMinimum": 0
+        },
+        "memory": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*(Ki|Mi|Gi|k|M|G)?$"
+        }
+      }
+    }
+  }
+}

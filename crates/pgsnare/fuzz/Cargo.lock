@@ -411,7 +411,7 @@ checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
 
 [[package]]
 name = "pgsnare"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "aho-corasick",
  "aws-lc-rs",
@@ -434,7 +434,7 @@ dependencies = [
 
 [[package]]
 name = "pgsnare-core"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "aho-corasick",
  "pgsnare-proto",
@@ -451,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "pgsnare-proto"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "bytes",
 ]

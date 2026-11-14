@@ -1,0 +1,200 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# pgsnare as a native sidecar of an application pod (Kubernetes 1.29 and
+# later): an init container with `restartPolicy: Always`. It starts before
+# the application, which starts only once pgsnare accepts clients (its
+# startup probe runs `pgsnare healthcheck --ready`), and it stops after the
+# application. README.md in this directory explains every part.
+#
+# Replace before use:
+#   - the image: ${PGSNARE_IMAGE} must be the pgsnare image by digest;
+#   - the container `app`, which stands in for your application: it only
+#     has psql and waits. Your application connects to 127.0.0.1:5432;
+#   - db.example.com, the address of your database, in the ConfigMap.
+#
+# Create first, in the namespace of the pod (README.md has the commands):
+#   - Secret pgsnare-sidecar-tokens: token files (keys ending in .yaml);
+#   - Secret pgsnare-sidecar-webhook: keys url and hmac-secret;
+#   - Secret pgsnare-sidecar-webhook-ca: key ca.crt, only when the
+#     receiver's certificate is not signed by an authority of the image;
+#     otherwise remove its volume, its mount and SSL_CERT_FILE;
+#   - Secret app-database: key password, for the stand-in application.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pgsnare-sidecar
+data:
+  pgsnare.yaml: |
+    listeners:
+      - name: sidecar
+        # Loopback only: the application in the same pod is the only client.
+        listen: 127.0.0.1:5432
+        upstream: db.example.com:5432
+        # The client is in the same pod and its traffic never leaves it.
+        client_tls:
+          mode: disable
+        upstream_tls:
+          mode: verify-full
+    token_files:
+      - /etc/pgsnare-secrets/tokens/*.yaml
+    events:
+      labels_from_env: [POD_NAME, POD_NAMESPACE]
+      sinks:
+        - type: stdout
+        - type: webhook
+          url_file: /etc/pgsnare-secrets/webhook/url
+          hmac_secret_file: /etc/pgsnare-secrets/webhook/hmac-secret
+    shutdown:
+      grace_period: 25s
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+  labels:
+    app.kubernetes.io/name: app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: app
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: app
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # The 25 s of shutdown.grace_period, 2 s for the sinks, and a margin.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        # The mounted files belong to root and to this group. pgsnare
+        # refuses a file that anybody else can read.
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: pgsnare
+          image: ${PGSNARE_IMAGE:?the pgsnare image by digest}
+          restartPolicy: Always
+          args: ["run", "--config", "/etc/pgsnare/pgsnare.yaml"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # The name of a file, not a secret.
+            - name: SSL_CERT_FILE
+              value: /etc/pgsnare-secrets/webhook-ca/ca.crt
+          # The application starts when this probe passes: pgsnare accepts
+          # clients. The probes run the binary, which asks the admin
+          # listener on loopback and reads no file.
+          startupProbe:
+            exec:
+              command: ["/usr/local/bin/pgsnare", "healthcheck", "--ready"]
+            periodSeconds: 1
+            timeoutSeconds: 3
+            failureThreshold: 30
+          livenessProbe:
+            exec:
+              command: ["/usr/local/bin/pgsnare", "healthcheck"]
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["/usr/local/bin/pgsnare", "healthcheck", "--ready"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            runAsNonRoot: true
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          # Whole volumes, never subPath: a Secret that changes reaches the
+          # pod, and pgsnare reloads its tokens without a restart.
+          volumeMounts:
+            - name: pgsnare-config
+              mountPath: /etc/pgsnare
+              readOnly: true
+            - name: pgsnare-tokens
+              mountPath: /etc/pgsnare-secrets/tokens
+              readOnly: true
+            - name: pgsnare-webhook
+              mountPath: /etc/pgsnare-secrets/webhook
+              readOnly: true
+            - name: pgsnare-webhook-ca
+              mountPath: /etc/pgsnare-secrets/webhook-ca
+              readOnly: true
+      containers:
+        # Stands in for the application: replace it with yours, pointed at
+        # 127.0.0.1:5432.
+        - name: app
+          image: postgres:18.6-trixie@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
+          command: ["sleep", "infinity"]
+          env:
+            - name: PGHOST
+              value: 127.0.0.1
+            - name: PGPORT
+              value: "5432"
+            - name: PGUSER
+              value: postgres
+            - name: PGDATABASE
+              value: postgres
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: app-database
+                  key: password
+          securityContext:
+            runAsUser: 999
+            runAsGroup: 999
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+      # Mode 288 is 0440: the owner and the group may read, nobody else.
+      volumes:
+        - name: pgsnare-config
+          configMap:
+            name: pgsnare-sidecar
+            defaultMode: 288
+        - name: pgsnare-tokens
+          secret:
+            secretName: pgsnare-sidecar-tokens
+            defaultMode: 288
+        - name: pgsnare-webhook
+          secret:
+            secretName: pgsnare-sidecar-webhook
+            defaultMode: 288
+        - name: pgsnare-webhook-ca
+          secret:
+            secretName: pgsnare-sidecar-webhook-ca
+            defaultMode: 288

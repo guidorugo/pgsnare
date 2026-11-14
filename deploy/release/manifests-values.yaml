@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The values with which a release renders its plain manifests,
+# pgsnare-VERSION-manifests.yaml: the chart as it is, for a namespace named
+# `pgsnare`, with the image of the release by digest.
+#
+# These are the least that renders, and they are examples: the names and
+# the address are reserved for documentation. Whoever applies the manifests
+# without the chart edits them first:
+#
+#   - the database: `database.host` here, and the address its NetworkPolicy
+#     rule allows
+#   - the clients: none is listed, so the NetworkPolicy lets nobody connect
+#   - the Secrets, which must exist before the manifests are applied:
+#     `pgsnare-tokens` with the token files, and `pgsnare-client-tls` with
+#     the certificate and key that clients see
+#
+# With the chart, the same is done with values and nothing is edited.
+
+proxy:
+  clientTLS:
+    mode: require
+    secretName: pgsnare-client-tls
+database:
+  host: db.example.com
+  peers:
+    - cidr: 192.0.2.10/32
+tokens:
+  secretNames:
+    - pgsnare-tokens

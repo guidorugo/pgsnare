@@ -1,0 +1,19 @@
+pgsnare is installed as {{ include "pgsnare.fullname" . }} in the namespace {{ .Release.Namespace }}.
+
+Applications connect to {{ include "pgsnare.fullname" . }}.{{ .Release.Namespace }}.svc on port {{ int .Values.proxy.port }}, in place of the database.
+{{- if not .Values.clients }}
+
+No client is listed, so the NetworkPolicy lets nobody connect to the proxy.
+Name the pods that may in the value `clients`.
+{{- end }}
+{{- if not .Values.database.peers }}
+
+No peer is listed for the database, so the NetworkPolicy lets the proxy
+connect to no database. Name where the database is in `database.peers`.
+{{- end }}
+
+Honeytokens are read from the Secrets {{ join ", " .Values.tokens.secretNames }}. A change of
+one of them takes effect in the running pods within a few minutes. A change
+of any other Secret needs new pods:
+
+  kubectl --namespace {{ .Release.Namespace }} rollout restart deployment/{{ include "pgsnare.fullname" . }}
