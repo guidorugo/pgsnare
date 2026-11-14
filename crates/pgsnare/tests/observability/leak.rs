@@ -751,10 +751,21 @@ async fn nothing_that_went_in_as_a_secret_comes_out_anywhere() {
     // ------------------------------------------------------------------
     // Everything that comes out
     // ------------------------------------------------------------------
-    // Two events, to six sinks.
-    until(|| pgsnare.stdout.lines().len() == 2).await;
-    until(|| first_receiver.count() == 3 && second_receiver.count() == 2).await;
-    until(|| std::fs::read_to_string(&events_file).is_ok_and(|text| text.lines().count() == 2))
+    // The two events of the messages that could not be followed, and the
+    // hits the honeytokens in this traffic raised, to six sinks. How many
+    // events the hits make depends on how they are folded, so the counts
+    // are the least there can be.
+    until(|| pgsnare.stdout.lines().len() >= 2).await;
+    until(|| {
+        pgsnare
+            .stdout
+            .lines()
+            .iter()
+            .any(|line| line.contains("\"kind\":\"token_hit\""))
+    })
+    .await;
+    until(|| first_receiver.count() >= 3 && second_receiver.count() >= 2).await;
+    until(|| std::fs::read_to_string(&events_file).is_ok_and(|text| text.lines().count() >= 2))
         .await;
     until(|| {
         syslog_datagrams
@@ -763,7 +774,7 @@ async fn nothing_that_went_in_as_a_secret_comes_out_anywhere() {
             .iter()
             .filter(|byte| **byte == b'\n')
             .count()
-            == 2
+            >= 2
     })
     .await;
     until(|| contains(&syslog_stream.lock().unwrap(), b"\"tls\":true")).await;

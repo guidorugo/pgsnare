@@ -118,8 +118,9 @@ async fn a_running_proxy_answers_its_health_check_and_serves_its_metrics() {
         number("pgsnare_added_latency_seconds_bucket{le=\"+Inf\"}"),
         number("pgsnare_added_latency_seconds_count")
     );
-    // Nothing detects yet, so these have no source and say zero.
-    assert_eq!(number("pgsnare_queries_total"), 0.0);
+    // The one statement was counted. The configuration has no honeytoken,
+    // so nothing was hit and nothing answered.
+    assert_eq!(number("pgsnare_queries_total"), 1.0);
     assert_eq!(number("pgsnare_hits_total{kind=\"token\"}"), 0.0);
     assert_eq!(number("pgsnare_actions_total{action=\"kill\"}"), 0.0);
     assert_eq!(number("pgsnare_parse_failures_total"), 0.0);
