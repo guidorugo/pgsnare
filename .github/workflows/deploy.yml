@@ -1,0 +1,150 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The container image: built for x86_64 and aarch64, tested as a registry
+# hands it out, and scanned for known vulnerabilities.
+#
+# Nothing here is published. An image goes from the job that builds it to
+# the jobs that use it as an archive, and those jobs push it to a registry
+# that runs inside the runner and is gone with the job. From there it is
+# pulled and named by digest.
+#
+# The workflow uses no secret and its token can only read, so it runs the
+# same way for a pull request from a fork. No expression is written into a
+# script: a value reaches a script through `env`.
+#
+# The jobs:
+#
+#   rules        the repository rules for images and jobs refuse what they
+#                must, and the tool installer installs nothing whose
+#                checksum is wrong
+#   image-build  deploy/Dockerfile, natively on each architecture
+#   image-test   deploy/tests/image/test.sh
+#   image-scan   deploy/tests/scan/scan.sh, on every build and every night
+
+name: deploy
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Every night, on the default branch: a vulnerability that became known
+    # after the last change is found without one.
+    - cron: "23 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  rules:
+    name: rules
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The rules for images and jobs refuse what they must
+        run: deploy/tests/rules/repo.sh
+      - name: The tool installer refuses a faulty list and a wrong checksum
+        run: deploy/tests/rules/tools.sh --online
+
+  image-build:
+    name: image-build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the image and export the binary
+        run: deploy/tests/image/build.sh "$RUNNER_TEMP/image" "$ARCH"
+      - name: Hand the image to the other jobs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-${{ matrix.arch }}
+          path: ${{ runner.temp }}/image/
+          if-no-files-found: error
+          retention-days: 7
+
+  image-test:
+    name: image-test (${{ matrix.arch }})
+    needs: image-build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Take the image from the build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-${{ matrix.arch }}
+          path: ${{ runner.temp }}/image
+      - name: Check the archive against its sums
+        working-directory: ${{ runner.temp }}/image
+        run: sha256sum --check --strict "SHA256SUMS-$ARCH"
+      - name: Test the image as the registry hands it out
+        run: |
+          deploy/tests/registry/start.sh
+          image="$(deploy/tests/registry/load.sh "$RUNNER_TEMP/image/pgsnare-image-$ARCH.tar")"
+          deploy/tests/image/test.sh "$image" "$RUNNER_TEMP/image/pgsnare-$ARCH"
+
+  image-scan:
+    name: image-scan (${{ matrix.arch }})
+    needs: image-build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Take the image from the build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-${{ matrix.arch }}
+          path: ${{ runner.temp }}/image
+      - name: Check the archive against its sums
+        working-directory: ${{ runner.temp }}/image
+        run: sha256sum --check --strict "SHA256SUMS-$ARCH"
+      - name: Install the scanner from the tool list
+        run: deploy/tools/install.sh "$RUNNER_TEMP/bin" grype
+      - name: Scan the image for known vulnerabilities
+        run: |
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          deploy/tests/registry/start.sh
+          image="$(deploy/tests/registry/load.sh "$RUNNER_TEMP/image/pgsnare-image-$ARCH.tar")"
+          deploy/tests/scan/scan.sh "$image"

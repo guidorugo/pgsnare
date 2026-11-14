@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# A registry inside the CI runner. The jobs of the deploy workflow push the
+# image they were given to it and pull it back by digest, so what they test
+# is an image as a registry hands it out. deploy/tests/registry/start.sh
+# starts it and deploy/tests/registry/load.sh fills it.
+#
+# The registry listens on the loopback interface of the runner only, speaks
+# plain HTTP, keeps its data in the container and is gone with the job. It
+# is not a way to publish anything.
+
+name: pgsnare-registry
+
+services:
+  registry:
+    image: registry:3.1.2@sha256:82f6ff4a7f982960c8aa51617fea3aabc485df6e55cce80d22deb1de36f1bc3c
+    container_name: pgsnare-registry
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "127.0.0.1:${PGSNARE_REGISTRY_PORT:-5000}:5000"
