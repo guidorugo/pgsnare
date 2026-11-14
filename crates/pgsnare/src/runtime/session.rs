@@ -618,7 +618,8 @@ impl Driver {
                     self.context.status.actions_taken(actions);
                 }
                 Effect::Delay(delay) => {
-                    let until = Instant::now() + delay;
+                    let now = Instant::now();
+                    let until = now.checked_add(delay).unwrap_or(now);
                     self.hold_client_until =
                         Some(self.hold_client_until.map_or(until, |held| held.max(until)));
                 }
