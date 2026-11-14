@@ -15,8 +15,8 @@
 # The jobs:
 #
 #   rules        the repository rules for images and jobs refuse what they
-#                must, and the tool installer installs nothing whose
-#                checksum is wrong
+#                must, the tool installer installs nothing whose checksum is
+#                wrong, and the release workflow keeps to its rules
 #   image-build  deploy/Dockerfile, natively on each architecture
 #   image-test   deploy/tests/image/test.sh
 #   image-scan   deploy/tests/scan/scan.sh, on every build and every night
@@ -30,6 +30,10 @@
 #                the NetworkPolicy: deploy/tests/kubernetes/
 #   example      the Compose example from `up` to a verified alert:
 #                examples/compose/smoke.sh
+#   release-rehearsal
+#                the scripts of a release against the registry of the
+#                runner, signing with a key made in the job, and then what
+#                the verification must refuse: deploy/tests/release/
 
 name: deploy
 
@@ -61,6 +65,8 @@ jobs:
         run: deploy/tests/rules/repo.sh
       - name: The tool installer refuses a faulty list and a wrong checksum
         run: deploy/tests/rules/tools.sh --online
+      - name: The release workflow and the check of a release tag keep to their rules
+        run: deploy/tests/rules/release.sh
 
   image-build:
     name: image-build (${{ matrix.arch }})
@@ -76,12 +82,19 @@ jobs:
     timeout-minutes: 45
     env:
       ARCH: ${{ matrix.arch }}
+    outputs:
+      sums_amd64: ${{ steps.sums.outputs.sums_amd64 }}
+      sums_arm64: ${{ steps.sums.outputs.sums_arm64 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Build the image and export the binary
         run: deploy/tests/image/build.sh "$RUNNER_TEMP/image" "$ARCH"
+      - name: Report the sum of the sums to the rehearsal of a release
+        id: sums
+        working-directory: ${{ runner.temp }}/image
+        run: echo "sums_$ARCH=$(sha256sum "SHA256SUMS-$ARCH" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - name: Hand the image to the other jobs
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -265,3 +278,33 @@ jobs:
           deploy/tests/registry/start.sh
           image="$(deploy/tests/registry/load.sh "$RUNNER_TEMP/image/pgsnare-image-amd64.tar")"
           PGSNARE_IMAGE="$image" examples/compose/smoke.sh
+
+  release-rehearsal:
+    name: release-rehearsal
+    needs: image-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      BUILD_SUMS_AMD64: ${{ needs.image-build.outputs.sums_amd64 }}
+      BUILD_SUMS_ARM64: ${{ needs.image-build.outputs.sums_arm64 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Take the amd64 image from the build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-amd64
+          path: ${{ runner.temp }}/image
+      - name: Take the arm64 image from the build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-arm64
+          path: ${{ runner.temp }}/image
+      - name: Install the release tools from the tool list
+        run: deploy/tools/install.sh "$RUNNER_TEMP/bin" crane cosign syft helm
+      - name: Publish to the registry of this runner, verify, and try what must be refused
+        run: |
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          deploy/tests/registry/start.sh
+          deploy/tests/release/rehearse.sh "$RUNNER_TEMP/image"
