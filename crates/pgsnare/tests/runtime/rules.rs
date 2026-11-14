@@ -509,3 +509,146 @@ async fn a_statement_that_sets_off_a_rule_is_counted_reported_and_answered() {
     assert_eq!(counters.actions, [0, 0, 0, 0]);
     assert!(proxy.rule_events().is_empty());
 }
+
+/// How long the worst of the hostile statements below may take, from the
+/// first byte sent to the answer.
+const BOUND: Duration = Duration::from_secs(60);
+
+/// A policy with every rule on, each answered with `alert`.
+fn every_rule(on_failure: OnParseFailure) -> PolicySnapshot {
+    let tables = ["users".to_owned()];
+    let everybody = RuleScope::default;
+    let rules = RuleSet::builder()
+        .on_parse_failure(on_failure)
+        .catalog_enumeration(ActionSet::ALERT, everybody())
+        .unwrap()
+        .unbounded_read(&tables, ActionSet::ALERT, everybody())
+        .unwrap()
+        .row_threshold(&tables, 1000, ActionSet::ALERT, everybody())
+        .unwrap()
+        .functions(&["pg_sleep".to_owned()], ActionSet::ALERT, everybody())
+        .unwrap()
+        .build();
+    PolicySnapshot::builder()
+        .inspection(Inspection::new(OnError::FailClosed, 1024 * 1024))
+        .token(TokenPolicy::new(TokenId::new(TOKEN_ID).unwrap()))
+        .matcher(Matcher::build(&[TokenSpec::new(TOKEN_ID, [VALUE])]).unwrap())
+        .rules(rules)
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn hostile_statements_end_in_time_and_leave_the_proxy_working() {
+    let seen = Arc::new(Seen::default());
+    let database = database(&seen).await;
+    let pool = pool(2, 16);
+    let proxy = Proxied::start(
+        &database,
+        every_rule(OnParseFailure::Alert),
+        Some(&pool),
+        PATIENCE,
+    )
+    .await;
+    let nested = |open: &str, close: &str| {
+        format!("SELECT {}1{}", open.repeat(10_000), close.repeat(10_000))
+    };
+    let many_tables: String = (0..1000)
+        .map(|at| format!("SELECT * FROM t{at};"))
+        .collect();
+    // Each but one has no analysis: too deep, not UTF-8, malformed, or
+    // with more tables than an analysis holds.
+    let cases: [(&str, Vec<u8>, bool); 8] = [
+        ("brackets", query(&nested("(", ")")), true),
+        (
+            "NOT",
+            query(&format!("SELECT {}true", "NOT ".repeat(10_000))),
+            true,
+        ),
+        (
+            "minus",
+            query(&format!("SELECT {}1", "- ".repeat(10_000))),
+            true,
+        ),
+        ("arrays", query(&nested("ARRAY[", "]")), true),
+        ("not UTF-8", frame(b'Q', b"SELECT '\xff\xfe'\0"), true),
+        ("a NUL inside", frame(b'Q', b"SELECT 1\0SELECT 2\0"), true),
+        (
+            "thousands of statements",
+            query(&"SELECT 1;".repeat(5_000)),
+            false,
+        ),
+        ("too many tables", query(&many_tables), true),
+    ];
+    let mut client = proxy.log_in().await;
+    let mut failures = 0;
+    for (name, message, fails) in &cases {
+        let started = Instant::now();
+        client.write_all(message).await.unwrap();
+        tokio::time::timeout(BOUND, read_until_ready(&mut client))
+            .await
+            .unwrap_or_else(|_| panic!("{name} is answered in time"))
+            .unwrap();
+        assert!(started.elapsed() < BOUND, "{name}");
+        failures += u64::from(*fails);
+        assert_eq!(proxy.status.counters().parse_failures, failures, "{name}");
+    }
+    // Under `alert`, every one of them went on.
+    let sent: Vec<Vec<u8>> = cases.iter().map(|case| case.1.clone()).collect();
+    assert_eq!(seen.messages(), sent);
+    let stats = pool.stats();
+    assert_eq!(stats.panicked, 0);
+    assert!(stats.cache_bytes <= ParserSettings::default().cache_bytes);
+
+    // The session and the proxy go on.
+    client.write_all(&query("SELECT 1")).await.unwrap();
+    soon(read_until_ready(&mut client)).await.unwrap();
+    let mut other = proxy.log_in().await;
+    other.write_all(&query("SELECT 2")).await.unwrap();
+    soon(read_until_ready(&mut other)).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_statement_of_64_mib_is_read_to_its_end_and_blocked() {
+    let seen = Arc::new(Seen::default());
+    let database = database(&seen).await;
+    let pool = pool(1, 16);
+    let proxy = Proxied::start(
+        &database,
+        every_rule(OnParseFailure::Block),
+        Some(&pool),
+        PATIENCE,
+    )
+    .await;
+    let client = proxy.log_in().await;
+    let (mut reader, mut writer) = client.into_split();
+    let mut body = vec![b' '; 64 * 1024 * 1024];
+    body[..6].copy_from_slice(b"SELECT");
+    body.push(0);
+    let started = Instant::now();
+    let sending = tokio::spawn(async move {
+        let _ = writer.write_all(&frame(b'Q', &body)).await;
+        writer
+    });
+    let mut received = Vec::new();
+    tokio::time::timeout(
+        BOUND,
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut received),
+    )
+    .await
+    .expect("the session ends in time")
+    .unwrap();
+    assert!(started.elapsed() < BOUND);
+    assert!(is_fatal(&received));
+    drop(sending.await.unwrap());
+    until(|| seen.ended.load(Ordering::SeqCst) == 1).await;
+    assert!(seen.messages().is_empty());
+    assert_eq!(proxy.status.counters().parse_failures, 1);
+    // Nothing of it was handed to the parser.
+    assert_eq!(pool.stats().analysed, 0);
+
+    // The proxy goes on.
+    let mut other = proxy.log_in().await;
+    other.write_all(&query("SELECT 1")).await.unwrap();
+    soon(read_until_ready(&mut other)).await.unwrap();
+}
