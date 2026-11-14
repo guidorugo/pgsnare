@@ -287,6 +287,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # These are the files as `publish` handed them on inside this workflow,
+      # not as the draft of the release holds them: reading a draft needs a
+      # token that can write, which this job does not get. The owner
+      # verifies the files of the draft before publishing it
+      # (docs/releasing.md).
       - name: Take the files of the release
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:

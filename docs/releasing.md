@@ -19,9 +19,11 @@ This is the procedure for the owner of the repository. A release is made by the 
 | `build` | read | Builds the image and the binary on each architecture, from nothing |
 | `image-test`, `image-scan` | read | The same tests as on every change, on what was just built |
 | `publish` | write, in the environment `release` | Checks what `build` made against the sums it reported, then runs [`deploy/release/publish.sh`](../deploy/release/publish.sh): archives, SBOMs, the image, the chart, the manifests, the sums and the signatures. Then records the build provenance and creates the GitHub release as a draft |
-| `verify` | read | Runs [`deploy/release/verify.sh`](../deploy/release/verify.sh) against what was published, as a user would |
+| `verify` | read | Runs [`deploy/release/verify.sh`](../deploy/release/verify.sh) as a user would, against the image and the chart in the registry and against the files that `publish` handed on inside the workflow. It does not read the files attached to the draft: step 6 below does |
 
-The job that can write compiles nothing and builds no image. A version tag is three numbers, and at most a release candidate: `v1.2.3` or `v1.2.3-rc.1`.
+The job that can write compiles nothing and builds no image.
+
+The workflow that runs for a tag is the workflow file of the tagged commit, and the `check` job is part of it. So `check` catches a mistake, such as a tag on a branch, and it does not bind someone who can push a tag. What decides which commit can become a release is the tag ruleset and the reviewer of the environment `release`, the first two steps above. Set up both before the first tag is pushed. A version tag is three numbers, and at most a release candidate: `v1.2.3` or `v1.2.3-rc.1`.
 
 ## Each release
 
@@ -34,10 +36,10 @@ The job that can write compiles nothing and builds no image. A version tag is th
    git push origin v1.2.3
    ```
 
-3. **Approve the job `publish`** when the workflow asks for it. Before that point nothing has been published; `check`, `build`, `image-test` and `image-scan` have run.
+3. **Approve the job `publish`** when the workflow asks for it, after looking at which commit the tag names: it must be the commit of `main` that you mean to release. Before that point nothing has been published; `check`, `build`, `image-test` and `image-scan` have run.
 4. **Wait for `verify`.** Then look at the draft of the release: ten files, and the digests in its text.
 5. **The first time only:** make the two packages public, `pgsnare` and `charts/pgsnare`. A new package is private.
-6. **Verify it yourself**, from another machine, as [verifying-a-release.md](verifying-a-release.md) says. Downloading the files of a draft needs your login.
+6. **Verify it yourself**, from another machine, as [verifying-a-release.md](verifying-a-release.md) says, with the files downloaded from the draft. Downloading the files of a draft needs your login. This is the only check of the files as the draft holds them: the workflow verified its own copy of them.
 7. **Publish the draft.**
 8. Afterwards: write the digest of the image into the examples and the quickstart, and update `SECURITY.md`.
 
@@ -46,8 +48,8 @@ Make the first release a release candidate, such as `v0.1.0-rc.1`. It proves the
 ## When a release fails
 
 - **Before `publish`:** nothing was published. Fix the cause by pull request. The tag stays, because tags are protected, so the fix is released under the next version.
-- **During or after `publish`:** some of the image, the chart and their signatures may be in the registry, and the transparency log may hold entries. Nothing of it is announced: the GitHub release is a draft or does not exist. Do not repair it by hand. Delete the draft if there is one, fix the cause, and release the next version.
-- **The same version is never published twice.** `publish.sh` refuses a version whose image or chart is already in the registry, so that a release, once made, is never replaced.
+- **During or after `publish`:** some of the image, the chart and their signatures may be in the registry, and the transparency log may hold entries. The image and the chart are pushed under the tags of the version before they are signed, so a tag of that version may name something that carries no signature. Nothing of it is announced: the GitHub release is a draft or does not exist. Do not repair it by hand. Delete the draft if there is one, fix the cause, and release the next version.
+- **The same version is never published twice.** `publish.sh` refuses a version whose image or chart is already in the registry, so that a release, once made, is never replaced. Only the registry's own answer that there is no such version counts: when the registry cannot be asked, `publish.sh` stops before it pushes anything, and the job can be run again.
 
 ## What is not automated
 

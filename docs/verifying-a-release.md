@@ -30,6 +30,8 @@ The image, the image of each architecture and the chart each carry a signature i
 
 **Use digests, not tags.** A tag such as `:1.2.3` can be moved to another image by whoever controls the registry. A digest cannot. The signature is over the digest, the chart names the image by digest, and `verify.sh` refuses a reference by tag.
 
+**A tag in the registry is not yet a release.** The image and the chart are pushed before they are signed, and a release that stopped in between leaves its tags behind. A release is what the published GitHub release names by digest and what `verify.sh` accepts. Treat a tag whose artefact has no signature as a release that failed, and do not use it.
+
 ## What you need
 
 - `cosign`, version 3. The release is made and rehearsed with the version in [`deploy/tools/tools.txt`](../deploy/tools/tools.txt).
