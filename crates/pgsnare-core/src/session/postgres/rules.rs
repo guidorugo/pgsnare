@@ -19,6 +19,34 @@
 //! one whose `Parse` was analysed when it arrived, and the answer is kept
 //! with the text the tracker holds, so they cost nothing more.
 //!
+//! # A statement that sets off a rule
+//!
+//! When the analysis is there, the rules the statement was held under
+//! judge it, once, before any of it is passed on: the catalogue rule, the
+//! rule about unbounded reads and the rule about functions. A text with
+//! several statements is judged as a whole, and each rule is raised at
+//! most once for it.
+//!
+//! A rule hit takes the path of a honeytoken hit, [`Ledger::rule_hit`]:
+//! an exempt session is counted and nothing else, the session is flagged,
+//! and the response is carried out by the same code.
+//!
+//! - `alert`: a `rule_hit` event, and the statement goes on.
+//! - `kill`: the event, and the session ends with the error of the policy
+//!   before any byte of the statement is passed on. What the client sent
+//!   earlier is cancelled as for a honeytoken.
+//! - `tarpit`: the event, the statement goes on, and the session is slowed
+//!   down from then on. When no place is free the session is killed.
+//! - `fake_data`: there is no result yet that rows could be added to, so
+//!   it is carried out as `alert`, and the event says `alert`.
+//!
+//! A statement is judged where its text arrives. An `Execute` of a
+//! prepared statement or a portal raises nothing again, and a statement
+//! prepared before a reload is not judged by the rules loaded since. The
+//! SQL statements `EXECUTE` and `FETCH` run what an earlier `PREPARE` or
+//! `DECLARE` stored: that one was judged when it arrived, and they are not
+//! tied back to it.
+//!
 //! # Holding a statement
 //!
 //! The message is searched for honeytokens first, exactly as without
@@ -47,6 +75,8 @@
 //! | The parser refused the statement, or it nests too deep | when the runtime answers |
 //! | The analysis is incomplete: a list in it was full | when the runtime answers |
 //! | The parser threads were busy, did not answer in time, or one panicked | when the runtime answers |
+//! | The statement carries code as a string: `DO`, `CREATE FUNCTION`, `CREATE PROCEDURE` | when the runtime answers |
+//! | A `FunctionCall` message, in a session the rule about functions applies to | at once |
 //!
 //! - `allow`: the statement goes on.
 //! - `alert`: the statement goes on, and a `parse_failure` event is raised.
@@ -59,6 +89,17 @@
 //!
 //! A session the policy exempts is counted and nothing else, as for a
 //! honeytoken: no event, and it is not ended.
+//!
+//! # What the parser does not read
+//!
+//! The body of a `DO` block or of a function is a string to the parser,
+//! and what it runs, dynamic SQL included, is not in the analysis. Such a
+//! statement is judged by what the parser does read of it, and is then a
+//! statement without an analysis as well.
+//!
+//! A `FunctionCall` message names its function by the number the database
+//! gave it, which no rule can compare with a name. Where the rule about
+//! functions applies, the message is a statement without an analysis.
 //!
 //! # What the database reads
 //!
@@ -87,12 +128,12 @@ use pgsnare_proto::{Frame, backend, frontend};
 use crate::actions;
 use crate::event::EventKind;
 use crate::policy::{Action, ActionSet};
-use crate::rules::{Analysis, OnParseFailure, ParseFailure, RuleSet, Subject};
+use crate::rules::{Analysis, OnParseFailure, ParseFailure, RuleSet, StatementFlags, Subject};
 use crate::session::{Direction, Effect, Output, StatementText};
 
-use super::scan::{Ledger, Place, exempts};
+use super::scan::{Ledger, Place, Raised, exempts};
 use super::track::{Kept, Statement};
-use super::{Context, Verdict};
+use super::{Context, InspectionError, Verdict};
 
 /// The statement whose analysis the session waits for.
 struct Waiting {
@@ -237,6 +278,9 @@ impl Hook {
             frontend::tag::PARSE => frontend::Parse::from_frame(frame)
                 .ok()
                 .map(|parse| parse.sql()),
+            frontend::tag::FUNCTION_CALL => {
+                return Self::function_call(place, ledger, client_can_be_told, out);
+            }
             _ => return Verdict::Forward,
         };
         let context = place.context;
@@ -293,37 +337,75 @@ impl Hook {
         Verdict::Hold
     }
 
-    /// The header of a `Query` or `Parse` of the client that arrives in
-    /// parts: it cannot be held, so it has no analysis. Returns whether
-    /// the session must end before the message is passed on.
+    /// The rules that cannot judge a `FunctionCall` of the session,
+    /// because the message names its function by a number: set when the
+    /// rule about functions applies to the session.
+    fn blind_to_calls<'a>(context: &'a Context<'a>) -> Option<&'a Arc<RuleSet>> {
+        rules_for(context).filter(|rules| rules.watches_functions(&subject(context)))
+    }
+
+    /// A whole `FunctionCall` of the client.
+    fn function_call(
+        place: &Place<'_>,
+        ledger: &Ledger,
+        client_can_be_told: bool,
+        out: &mut Output,
+    ) -> Verdict {
+        let context = place.context;
+        let Some(rules) = Self::blind_to_calls(context) else {
+            return Verdict::Forward;
+        };
+        let actions = raise(ParseFailure::FunctionCall, rules, place, ledger, out);
+        if actions.contains(Action::Kill) {
+            block(context, client_can_be_told, out)
+        } else {
+            Verdict::Forward
+        }
+    }
+
+    /// The header of a `Query`, `Parse` or `FunctionCall` of the client
+    /// that arrives in parts: it cannot be held, so it has no analysis.
+    /// Returns whether the session must end before the message is passed
+    /// on.
     pub(super) fn client_chunked(
         tag: u8,
         place: &Place<'_>,
         ledger: &Ledger,
         out: &mut Output,
     ) -> bool {
-        if !matches!(tag, frontend::tag::QUERY | frontend::tag::PARSE) {
-            return false;
-        }
-        let Some(rules) = rules_for(place.context) else {
+        let (reason, rules) = match tag {
+            frontend::tag::QUERY | frontend::tag::PARSE => {
+                (ParseFailure::Streamed, rules_for(place.context))
+            }
+            frontend::tag::FUNCTION_CALL => (
+                ParseFailure::FunctionCall,
+                Self::blind_to_calls(place.context),
+            ),
+            _ => return false,
+        };
+        let Some(rules) = rules else {
             return false;
         };
-        raise(ParseFailure::Streamed, rules, place, ledger, out).contains(Action::Kill)
+        raise(reason, rules, place, ledger, out).contains(Action::Kill)
     }
 
     /// The answer of the runtime to the request `id`. Returns what becomes
     /// of the held message, or `None` when no statement waits for this
     /// answer.
+    ///
+    /// With an analysis, this is where the rules judge the statement.
     pub(super) fn answer(
         &mut self,
         id: u64,
         outcome: Result<Arc<Analysis>, ParseFailure>,
-        ledger: &Ledger,
+        ledger: &mut Ledger,
         context: &Context<'_>,
         client_can_be_told: bool,
         out: &mut Output,
-    ) -> Option<Verdict> {
-        let waiting = self.waiting.take_if(|waiting| waiting.id == id)?;
+    ) -> Result<Option<Verdict>, InspectionError> {
+        let Some(waiting) = self.waiting.take_if(|waiting| waiting.id == id) else {
+            return Ok(None);
+        };
         // An analysis with a full list does not tell everything the
         // statement touches: it is no analysis.
         let outcome = outcome.and_then(|analysis| {
@@ -334,10 +416,6 @@ impl Hook {
             }
         });
         waiting.text.analysed(outcome.clone());
-        let reason = match outcome {
-            Ok(_) => return Some(Verdict::Forward),
-            Err(reason) => reason,
-        };
 
         let statement = Statement::Kept(Arc::clone(&waiting.text));
         let place = Place {
@@ -345,15 +423,45 @@ impl Hook {
             name: waiting.name,
             in_session: true,
             statement: &statement,
+            // No result of the statement exists yet.
             rows: false,
             context,
         };
-        let actions = raise(reason, &waiting.rules, &place, ledger, out);
-        Some(if actions.contains(Action::Kill) {
-            block(context, client_can_be_told, out)
-        } else {
-            Verdict::Forward
-        })
+        let analysis = match outcome {
+            Ok(analysis) => analysis,
+            Err(reason) => {
+                let actions = raise(reason, &waiting.rules, &place, ledger, out);
+                return Ok(Some(if actions.contains(Action::Kill) {
+                    block(context, client_can_be_told, out)
+                } else {
+                    Verdict::Forward
+                }));
+            }
+        };
+
+        // Every rule the statement sets off is raised before the session
+        // acts on any of them, as for the tokens of one message.
+        let mut kill = false;
+        for (rule_id, decided) in waiting.rules.evaluate(&analysis, &subject(context)) {
+            let actions = ledger.rule_hit(rule_id, decided, &place, out);
+            kill |= actions.contains(Action::Kill);
+        }
+        // Code the parser did not read: for that part there is no analysis.
+        if analysis.flags().contains(StatementFlags::OPAQUE_BODY) {
+            let actions = raise(
+                ParseFailure::OpaqueBody,
+                &waiting.rules,
+                &place,
+                ledger,
+                out,
+            );
+            if actions.contains(Action::Kill) && !kill {
+                return Ok(Some(block(context, client_can_be_told, out)));
+            }
+        }
+        Raised::by_rules(kill)
+            .respond(client_can_be_told, context, out)
+            .map(Some)
     }
 
     /// Whether a statement waits for its analysis.

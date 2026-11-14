@@ -16,9 +16,9 @@ use crate::session::Effect;
 use super::scan_tests::{EMAIL, EMAIL_ID, Harness, frame, join};
 
 /// The largest message these sessions hold whole.
-const LIMIT: usize = 64 * 1024;
+pub(super) const LIMIT: usize = 64 * 1024;
 
-fn base(on_error: OnError, limit: usize) -> PolicySnapshotBuilder {
+pub(super) fn base(on_error: OnError, limit: usize) -> PolicySnapshotBuilder {
     PolicySnapshot::builder()
         .generation(1)
         .inspection(Inspection::new(on_error, limit))
@@ -26,18 +26,18 @@ fn base(on_error: OnError, limit: usize) -> PolicySnapshotBuilder {
         .matcher(Matcher::build(&[TokenSpec::new(EMAIL_ID, [EMAIL])]).unwrap())
 }
 
-fn query(sql: &str) -> Vec<u8> {
+pub(super) fn query(sql: &str) -> Vec<u8> {
     frame(b'Q', &join(&[sql.as_bytes(), b"\0"]))
 }
 
-fn parse(name: &str, sql: &str) -> Vec<u8> {
+pub(super) fn parse(name: &str, sql: &str) -> Vec<u8> {
     frame(
         b'P',
         &join(&[name.as_bytes(), b"\0", sql.as_bytes(), b"\0", &[0, 0]]),
     )
 }
 
-fn token_hits(harness: &Harness) -> usize {
+pub(super) fn token_hits(harness: &Harness) -> usize {
     harness
         .effects
         .iter()
@@ -65,7 +65,7 @@ fn without_rules_a_statement_is_searched_and_passed_on_at_once() {
 }
 
 #[cfg(feature = "rules")]
-mod with_rules {
+pub(super) mod with_rules {
     use std::sync::Arc;
 
     use pgsnare_proto::{Frame, Framer, Step};
@@ -109,7 +109,7 @@ mod with_rules {
             .unwrap()
     }
 
-    fn parameter(name: &[u8], value: &[u8]) -> Vec<u8> {
+    pub(crate) fn parameter(name: &[u8], value: &[u8]) -> Vec<u8> {
         frame(b'S', &join(&[name, b"\0", value, b"\0"]))
     }
 
@@ -132,7 +132,7 @@ mod with_rules {
         harness
     }
 
-    fn bind(portal: &str, statement: &str) -> Vec<u8> {
+    pub(crate) fn bind(portal: &str, statement: &str) -> Vec<u8> {
         frame(
             b'B',
             &join(&[
@@ -149,17 +149,17 @@ mod with_rules {
         frame(b'D', &join(&[b"S", name.as_bytes(), b"\0"]))
     }
 
-    fn execute(portal: &str) -> Vec<u8> {
+    pub(crate) fn execute(portal: &str) -> Vec<u8> {
         frame(b'E', &join(&[portal.as_bytes(), b"\0", &[0, 0, 0, 0]]))
     }
 
-    fn sync() -> Vec<u8> {
+    pub(crate) fn sync() -> Vec<u8> {
         frame(b'S', b"")
     }
 
     /// The requests for an analysis since the last call: their ids and
     /// texts.
-    fn asked(harness: &mut Harness) -> Vec<(u64, Vec<u8>)> {
+    pub(crate) fn asked(harness: &mut Harness) -> Vec<(u64, Vec<u8>)> {
         let mut asked = Vec::new();
         harness.effects.retain(|effect| match effect {
             Effect::Analyse { id, text, .. } => {
@@ -171,7 +171,7 @@ mod with_rules {
         asked
     }
 
-    fn report(harness: &mut Harness, report: Report) {
+    pub(crate) fn report(harness: &mut Harness, report: Report) {
         let mut out = Output::new();
         harness
             .session
@@ -182,18 +182,22 @@ mod with_rules {
         harness.effects.append(&mut out.effects);
     }
 
-    fn answer(harness: &mut Harness, id: u64, outcome: Result<Arc<Analysis>, ParseFailure>) {
+    pub(crate) fn answer(
+        harness: &mut Harness,
+        id: u64,
+        outcome: Result<Arc<Analysis>, ParseFailure>,
+    ) {
         report(harness, Report::Analysed { id, outcome });
     }
 
     /// What the parser makes of `sql`.
-    fn analysis(sql: &str) -> Arc<Analysis> {
+    pub(crate) fn analysis(sql: &str) -> Arc<Analysis> {
         let limits = Limits::with_max_bytes(4 * 1024 * 1024);
         let analysed = on_parser_thread(|thread| analyse(sql.as_bytes(), &limits, thread));
         Arc::new(analysed.unwrap().unwrap())
     }
 
-    fn failures(harness: &Harness) -> Vec<(ParseFailure, ActionSet)> {
+    pub(crate) fn failures(harness: &Harness) -> Vec<(ParseFailure, ActionSet)> {
         harness
             .effects
             .iter()
@@ -204,7 +208,7 @@ mod with_rules {
             .collect()
     }
 
-    fn failure_events(harness: &Harness) -> Vec<&EventBody> {
+    pub(crate) fn failure_events(harness: &Harness) -> Vec<&EventBody> {
         harness
             .events()
             .into_iter()
@@ -212,7 +216,7 @@ mod with_rules {
             .collect()
     }
 
-    fn blocked() -> ActionSet {
+    pub(crate) fn blocked() -> ActionSet {
         ActionSet::of(&[Action::Alert, Action::Kill])
     }
 
@@ -491,7 +495,6 @@ mod with_rules {
             &frame(b'C', b"Ss1\0"),
             &frame(b'H', b""),
             &sync(),
-            &frame(b'F', &[0, 0, 0, 1, 0, 0, 0, 0, 0, 0]),
         ]);
         harness.client(&messages);
         assert!(asked(&mut harness).is_empty());

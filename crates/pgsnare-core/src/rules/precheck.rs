@@ -105,6 +105,12 @@ pub enum ParseFailure {
     Encoding,
     /// No answer came from the parser threads in the time allowed.
     TimedOut,
+    /// The statement carries code as a string, which the parser does not
+    /// read: `DO`, and `CREATE FUNCTION` or `CREATE PROCEDURE`.
+    OpaqueBody,
+    /// A `FunctionCall` message: it names the function by a number, which
+    /// no rule can tie to a name.
+    FunctionCall,
 }
 
 impl ParseFailure {
@@ -124,6 +130,8 @@ impl ParseFailure {
             Self::Streamed => "streamed",
             Self::Encoding => "encoding",
             Self::TimedOut => "timed_out",
+            Self::OpaqueBody => "opaque_body",
+            Self::FunctionCall => "function_call",
         }
     }
 }
@@ -517,6 +525,11 @@ mod tests {
             (ParseFailure::Incomplete, "incomplete"),
             (ParseFailure::Busy, "busy"),
             (ParseFailure::Panicked, "panicked"),
+            (ParseFailure::Streamed, "streamed"),
+            (ParseFailure::Encoding, "encoding"),
+            (ParseFailure::TimedOut, "timed_out"),
+            (ParseFailure::OpaqueBody, "opaque_body"),
+            (ParseFailure::FunctionCall, "function_call"),
         ] {
             assert_eq!(failure.name(), name);
             assert_eq!(failure.to_string(), name);

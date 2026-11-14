@@ -102,6 +102,18 @@
 //! statement is searched. Their number is not bounded here: the queue of
 //! the dispatcher is the bound.
 //!
+//! # The SQL rules
+//!
+//! With the `rules` feature, a statement of the client that has been
+//! searched is held until it has been judged by the rules of the policy,
+//! see the `rules` module beside this one. A statement that sets off a
+//! rule is a hit like that of a honeytoken, and takes the same path: it
+//! is counted with `Effect::RuleHit`, also in an exempt session, where
+//! that is all; it is reported with a `rule_hit` event that names the
+//! rule and no token; it flags the session; and its response is carried
+//! out by the code that carries out the response to a honeytoken. The
+//! rules have no part in whether a honeytoken is found.
+//!
 //! # Statements
 //!
 //! Each `Query`, each `Execute` and each `FunctionCall` of a client is
@@ -128,6 +140,8 @@ use crate::actions::{self, FakeRows, Tarpit, TarpitPlaces};
 use crate::bait::Entropy;
 use crate::detect::{Match, Matcher, ScanError, StreamScanner};
 use crate::event::{EventBody, EventKind, StatementDigest};
+#[cfg(feature = "rules")]
+use crate::policy::RuleId;
 use crate::policy::{Action, ActionSet, PolicySnapshot, TokenId};
 #[cfg(feature = "rules")]
 use crate::rules::{Analysis, ParseFailure};
@@ -432,10 +446,11 @@ impl Responder {
     }
 }
 
-/// What the hits of one search ask of the session.
-struct Raised {
+/// What the hits of one search, or the rules a statement set off, ask of
+/// the session.
+pub(super) struct Raised {
     /// Whether a hit is answered with `kill`.
-    kill: bool,
+    pub(super) kill: bool,
     /// Whether a hit asks for made-up rows.
     fake: bool,
     /// Whether anything was found, exempt or not.
@@ -445,9 +460,29 @@ struct Raised {
 }
 
 impl Raised {
+    /// Nothing was found.
+    const fn nothing() -> Self {
+        Self {
+            kill: false,
+            fake: false,
+            matched: false,
+            error: None,
+        }
+    }
+
+    /// What a session does about a statement that set off rules, of which
+    /// one is answered with `kill` or none is.
+    #[cfg(feature = "rules")]
+    pub(super) const fn by_rules(kill: bool) -> Self {
+        Self {
+            kill,
+            ..Self::nothing()
+        }
+    }
+
     /// Ends the session if a hit asked for it, and otherwise passes the
     /// message on, or fails if a match could not be reported.
-    fn respond(
+    pub(super) fn respond(
         self,
         client_can_be_told: bool,
         context: &Context<'_>,
@@ -557,12 +592,7 @@ impl Ledger {
         out: &mut Output,
     ) -> Raised {
         let mut seen = BTreeSet::new();
-        let mut raised = Raised {
-            kill: false,
-            fake: false,
-            matched: false,
-            error: None,
-        };
+        let mut raised = Raised::nothing();
         for found in matches {
             raised.matched = true;
             let Ok(found) = found else {
@@ -606,6 +636,29 @@ impl Ledger {
         let decided = policy
             .token(&token_id)
             .map_or(ActionSet::ALERT, |token| token.actions_for_hit(number));
+        let actions = self.carry_out(decided, place, out);
+
+        let mut body = self.body(EventKind::TokenHit, place);
+        body.token_id = Some(token_id.clone());
+        body.action_taken = actions;
+        self.flagged = true;
+
+        out.effects.push(Effect::TokenHit {
+            token_id,
+            exempt: false,
+            decided,
+            actions,
+        });
+        out.effects.push(Effect::Emit(Box::new(body)));
+        actions
+    }
+
+    /// The responses to one hit that are carried out, of those the policy
+    /// `decided`, and the start of those that begin here: the tarpit.
+    ///
+    /// This is the one place that turns a decision into responses, for a
+    /// honeytoken and for a rule alike.
+    fn carry_out(&mut self, decided: ActionSet, place: &Place<'_>, out: &mut Output) -> ActionSet {
         let built = match self.responder {
             Some(_) => Responder::built(),
             None => ActionSet::of(&ALWAYS_BUILT),
@@ -615,7 +668,7 @@ impl Ledger {
             && !self
                 .responder
                 .as_mut()
-                .is_some_and(|responder| responder.tarpit(context, out))
+                .is_some_and(|responder| responder.tarpit(place.context, out))
         {
             // Every place is taken: the session is killed, not queued.
             let mut killed = ActionSet::of(&[Action::Kill]);
@@ -628,14 +681,44 @@ impl Ledger {
             // No result here that rows can be added to: `alert` instead.
             actions = without(actions, Action::FakeData);
         }
+        actions
+    }
 
-        let mut body = self.body(EventKind::TokenHit, place);
-        body.token_id = Some(token_id.clone());
+    /// Raises the hit of a rule that the statement at `place` set off, and
+    /// returns the responses to carry out. `decided` is the response the
+    /// rule asks for.
+    ///
+    /// A rule hit is a hit like that of a honeytoken: an exempt session is
+    /// counted and nothing else, the responses are those of
+    /// [`Ledger::carry_out`], and the session is flagged from then on. The
+    /// event names the rule and no token.
+    #[cfg(feature = "rules")]
+    pub(super) fn rule_hit(
+        &mut self,
+        rule_id: RuleId,
+        decided: ActionSet,
+        place: &Place<'_>,
+        out: &mut Output,
+    ) -> ActionSet {
+        if exempts(place.context) {
+            out.effects.push(Effect::RuleHit {
+                rule_id,
+                exempt: true,
+                decided: ActionSet::EMPTY,
+                actions: ActionSet::EMPTY,
+            });
+            return ActionSet::EMPTY;
+        }
+
+        let actions = self.carry_out(decided, place, out);
+
+        let mut body = self.body(EventKind::RuleHit, place);
+        body.rule_id = Some(rule_id.clone());
         body.action_taken = actions;
         self.flagged = true;
 
-        out.effects.push(Effect::TokenHit {
-            token_id,
+        out.effects.push(Effect::RuleHit {
+            rule_id,
             exempt: false,
             decided,
             actions,
@@ -1018,8 +1101,13 @@ impl Inspector for Scanner {
     ) -> Result<Option<Verdict>, InspectionError> {
         // A whole message from the server is never inside another one.
         let client_can_be_told = self.from_server.chunked.is_none();
-        Ok(self
-            .rules
-            .answer(id, outcome, &self.ledger, context, client_can_be_told, out))
+        self.rules.answer(
+            id,
+            outcome,
+            &mut self.ledger,
+            context,
+            client_can_be_told,
+            out,
+        )
     }
 }

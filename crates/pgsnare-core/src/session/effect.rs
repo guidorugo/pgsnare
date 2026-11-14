@@ -9,6 +9,8 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use crate::event::EventBody;
+#[cfg(feature = "rules")]
+use crate::policy::RuleId;
 use crate::policy::{ActionSet, TokenId};
 #[cfg(feature = "rules")]
 use crate::rules::{Limits, ParseFailure};
@@ -125,6 +127,22 @@ pub enum Effect {
         reason: ParseFailure,
         /// What was done about it: nothing, `alert`, or `alert` and
         /// `kill` when the session was ended.
+        actions: ActionSet,
+    },
+    /// A statement set off an SQL rule. The runtime counts it.
+    ///
+    /// This is the count only. The event of the hit travels separately, as
+    /// [`Effect::Emit`], because a hit can be counted without one.
+    #[cfg(feature = "rules")]
+    RuleHit {
+        /// The rule, by the id the configuration gives it.
+        rule_id: RuleId,
+        /// Whether the session is exempt, so that the hit triggers
+        /// nothing.
+        exempt: bool,
+        /// The responses the policy asks for. Empty for an exempt hit.
+        decided: ActionSet,
+        /// The responses that were carried out. Empty for an exempt hit.
         actions: ActionSet,
     },
 }

@@ -230,6 +230,16 @@ impl RuleSet {
         .any(|scope| scope.applies(subject))
     }
 
+    /// Whether the rule about functions applies to statements from
+    /// `subject`. A call that does not name its function cannot be judged
+    /// by it.
+    #[must_use]
+    pub fn watches_functions(&self, subject: &Subject<'_>) -> bool {
+        self.functions
+            .as_ref()
+            .is_some_and(|rule| rule.scope.applies(subject))
+    }
+
     /// The rules a statement sets off before it runs, each with its
     /// response. At most one entry per rule, however many statements the
     /// text holds and however often one of them breaks the rule.
