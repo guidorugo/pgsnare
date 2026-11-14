@@ -24,5 +24,21 @@
 # name  version  arch   sha256                                                            member  url
 
 # Image vulnerability scanner: deploy/tests/scan/scan.sh
-grype   0.121.2  amd64  9c8965ced9df657e5e851c14021bae838802f711edd7a48f9bc3c923a8d28f12  grype   https://github.com/anchore/grype/releases/download/v0.121.2/grype_0.121.2_linux_amd64.tar.gz
-grype   0.121.2  arm64  d7d2e160255b0f087280feabf6f213cf4c45d475690f3f1fe5dc336eb1037bf0  grype   https://github.com/anchore/grype/releases/download/v0.121.2/grype_0.121.2_linux_arm64.tar.gz
+grype       0.121.2 amd64  9c8965ced9df657e5e851c14021bae838802f711edd7a48f9bc3c923a8d28f12  grype             https://github.com/anchore/grype/releases/download/v0.121.2/grype_0.121.2_linux_amd64.tar.gz
+grype       0.121.2 arm64  d7d2e160255b0f087280feabf6f213cf4c45d475690f3f1fe5dc336eb1037bf0  grype             https://github.com/anchore/grype/releases/download/v0.121.2/grype_0.121.2_linux_arm64.tar.gz
+
+# Chart renderer and installer: deploy/tests/render.sh and the cluster tests
+helm        4.3.1   amd64  0403a88ae20913d11b10a2467b50087721fea7581736da6b9d3992f5357fe54b  linux-amd64/helm  https://get.helm.sh/helm-v4.3.1-linux-amd64.tar.gz
+helm        4.3.1   arm64  8cf8f66ecbc252ac8f7f06cca68aba88508ddfde3a6a34feb1678ad1694b4f88  linux-arm64/helm  https://get.helm.sh/helm-v4.3.1-linux-arm64.tar.gz
+
+# Manifest validator: deploy/tests/render.sh
+kubeconform 0.8.0   amd64  9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883  kubeconform       https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz
+kubeconform 0.8.0   arm64  1f53fc8e81258197a35e8603054162a5af1de8c5af13746c71ab680d9534ed87  kubeconform       https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-arm64.tar.gz
+
+# Kubernetes in containers, for the cluster tests: deploy/tests/kubernetes/
+kind        0.33.0  amd64  aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  -                 https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+kind        0.33.0  arm64  20022bee6cfcd5086cb7234d218e3454e6090022f2a8f55d1fa7fcf42c3867a2  -                 https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-arm64
+
+# Kubernetes command line, for the cluster tests
+kubectl     1.37.2  amd64  c04487523e7aa7d1493f7808174c899db93d7a9cf57531420cd76b9bd415f8f4  -                 https://dl.k8s.io/release/v1.37.2/bin/linux/amd64/kubectl
+kubectl     1.37.2  arm64  fcc16f63186659d9722014b7e02d5fdd2d4e669cb8c0ab66365d7d3b8ba03509  -                 https://dl.k8s.io/release/v1.37.2/bin/linux/arm64/kubectl
