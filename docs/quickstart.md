@@ -28,7 +28,7 @@ Wait until `docker compose ps pgsnare` shows the container as `healthy`. The ima
 ## 2. Check the receiver
 
 ```sh
-docker compose exec receiver python3 /app/receiver.py check https://receiver:8443/events
+docker compose exec -T receiver python3 /app/receiver.py check https://receiver:8443/events
 ```
 
 The receiver must refuse a request without a signature, one signed with another key and one with an old timestamp, and accept a signed one. Every line of the output says `ok`. The receiver follows the four checks of the signature scheme (design document, section 12.3). Use it as a starting point for your own receiver.
@@ -36,7 +36,7 @@ The receiver must refuse a request without a signature, one signed with another 
 ## 3. A query that reads no token
 
 ```sh
-docker compose run --rm client -c "SELECT name FROM customers WHERE id = 1"
+docker compose run --rm -T client -c "SELECT name FROM customers WHERE id = 1"
 ```
 
 `client` is psql, connecting to pgsnare with TLS and verifying its certificate. The answer is `Alice Example`, and no alert is raised: pgsnare passes traffic through until a token appears in it.
@@ -44,7 +44,7 @@ docker compose run --rm client -c "SELECT name FROM customers WHERE id = 1"
 ## 4. A query that reads a token
 
 ```sh
-docker compose run --rm client -c "SELECT name, email, extract(epoch FROM clock_timestamp()) AS queried_at FROM customers"
+docker compose run --rm -T client -c "SELECT name, email, extract(epoch FROM clock_timestamp()) AS queried_at FROM customers"
 ```
 
 Carol's email address is a honeytoken. The query gets its answer, because the token's only action is `alert`, and pgsnare raises a `token_hit`. The last column is the database's clock when it ran the query, which the smoke test compares with the time the receiver got the event.

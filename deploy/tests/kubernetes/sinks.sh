@@ -67,8 +67,17 @@ k --namespace "$sink_namespace" apply --filename "$here/receiver.yaml" >&2
 k --namespace "$sink_namespace" wait --for=condition=Ready pod/receiver --timeout=300s >&2
 
 say "the receiver must refuse what is not signed and accept what is"
-k --namespace "$sink_namespace" exec receiver -- python3 /app/receiver.py check "$receiver_url" \
-    || die "the receiver does not check signatures as it must"
+# The Service gets its endpoint a moment after the pod is ready, and
+# refuses connections until then.
+checked=0
+for attempt in $(seq 1 30); do
+    if k --namespace "$sink_namespace" exec receiver -- python3 /app/receiver.py check "$receiver_url"; then
+        checked=1
+        break
+    fi
+    sleep 2
+done
+[[ "$checked" == 1 ]] || die "the receiver does not check signatures as it must"
 
 # --- 2. The Secrets of the release --------------------------------------------------------
 

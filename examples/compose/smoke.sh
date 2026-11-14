@@ -76,7 +76,7 @@ say "ok: pgsnare is healthy"
 
 checked=0
 for _ in $(seq 1 30); do
-    if docker compose exec receiver python3 /app/receiver.py check https://receiver:8443/events; then
+    if docker compose exec -T receiver python3 /app/receiver.py check https://receiver:8443/events; then
         checked=1
         break
     fi
@@ -91,7 +91,7 @@ received() {
 
 # --- 3. A query that reads no token ---------------------------------------------------
 
-answer="$(docker compose run --rm client -c "SELECT name FROM customers WHERE id = 1")"
+answer="$(docker compose run --rm -T client -c "SELECT name FROM customers WHERE id = 1")"
 echo "$answer"
 grep -qF 'Alice Example' <<<"$answer" || die "a client could not read through pgsnare"
 sleep 2
@@ -100,7 +100,7 @@ say "ok: a query that reads no token raised nothing"
 
 # --- 4. A query that reads a token ----------------------------------------------------
 
-answer="$(docker compose run --rm client -c "SELECT name, email, extract(epoch FROM clock_timestamp()) AS queried_at FROM customers")"
+answer="$(docker compose run --rm -T client -c "SELECT name, email, extract(epoch FROM clock_timestamp()) AS queried_at FROM customers")"
 echo "$answer"
 # The rows are "name | email | queried_at"; the token is Carol's email.
 token="$(awk -F'|' '/Carol Example/ { gsub(/ /, "", $2); print $2 }' <<<"$answer")"

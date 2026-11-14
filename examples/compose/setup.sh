@@ -138,12 +138,15 @@ printf 'pgsnare:5432:*:postgres:%s\n' "$(cat password)" > /out/client/pgpass
 
 # --- Owners --------------------------------------------------------------------------
 
+# Modes first: once a file belongs to another user, root without the
+# capability FOWNER can no longer change it. The volumes' own directories
+# stay root's, readable by all; what is in them belongs to the consumer.
 find /out/pgsnare /out/receiver /out/postgres /out/initdb /out/client -type f -exec chmod 0600 {} +
-chown -R 65532:65532 /out/pgsnare
-chown -R 65533:65533 /out/receiver
-chown -R 999:999 /out/postgres /out/initdb /out/client
-chmod 0755 /out/pgsnare /out/receiver /out/postgres /out/initdb /out/client
 chmod 0700 /out/pgsnare/tokens
+chmod 0755 /out/pgsnare /out/receiver /out/postgres /out/initdb /out/client
+find /out/pgsnare -mindepth 1 -exec chown 65532:65532 {} +
+find /out/receiver -mindepth 1 -exec chown 65533:65533 {} +
+find /out/postgres /out/initdb /out/client -mindepth 1 -exec chown 999:999 {} +
 
 rm -rf "$work"
 : > /out/pgsnare/.done

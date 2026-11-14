@@ -38,7 +38,7 @@ reach() {
 # scrape NAMESPACE POD HOST: what POD gets from /metrics of HOST.
 scrape() {
     k --namespace "$1" exec "$2" -- timeout 5 bash -c \
-        'exec 3<>"/dev/tcp/$0/$1" && printf "GET /metrics HTTP/1.0\r\nHost: pgsnare\r\n\r\n" >&3 && cat <&3' \
+        'exec 3<>"/dev/tcp/$0/$1" && printf "GET /metrics HTTP/1.0\r\nHost: pgsnare\r\nConnection: close\r\n\r\n" >&3 && cat <&3' \
         "$3" "$metrics_port" 2>/dev/null
 }
 
@@ -55,7 +55,8 @@ eventually() {
 
 scraped() {
     local answer
-    answer="$(scrape "$1" "$2" "$3")" || return 1
+    # The answer counts, not how the connection ended.
+    answer="$(scrape "$1" "$2" "$3" || true)"
     head -n 1 <<<"$answer" | grep -q ' 200 ' && grep -q '^pgsnare_' <<<"$answer"
 }
 

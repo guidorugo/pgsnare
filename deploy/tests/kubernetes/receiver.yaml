@@ -47,7 +47,7 @@ spec:
       readinessProbe:
         tcpSocket:
           port: 8443
-        periodSeconds: 1
+        periodSeconds: 2
       securityContext:
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true
