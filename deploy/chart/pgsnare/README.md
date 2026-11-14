@@ -4,6 +4,8 @@ Installs pgsnare as a central proxy: a Deployment and a Service in front of one 
 
 One release serves one database. For a second database, install the chart a second time.
 
+To run pgsnare inside an application's pod instead, as a sidecar, see [`deploy/sidecar/`](../../sidecar/README.md).
+
 No release of pgsnare exists yet, so no image and no packaged chart are published. The chart is installed from this directory, with an image you built yourself and pushed to a registry of your own.
 
 ## What the chart creates

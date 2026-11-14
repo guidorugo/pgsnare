@@ -24,8 +24,12 @@
 #                validated, it refuses what it must, and the binary of the
 #                image accepts the configuration it renders
 #   kubernetes   the chart in a cluster inside the runner, in a namespace
-#                that enforces the restricted Pod Security Standard:
-#                deploy/tests/kubernetes/
+#                that enforces the restricted Pod Security Standard: first
+#                alert to a webhook, a token added through the Secret, a
+#                rolling update, both sidecar definitions, and isolation by
+#                the NetworkPolicy: deploy/tests/kubernetes/
+#   example      the Compose example from `up` to a verified alert:
+#                examples/compose/smoke.sh
 
 name: deploy
 
@@ -185,7 +189,7 @@ jobs:
     name: kubernetes
     needs: image-build
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -210,3 +214,54 @@ jobs:
           export PATH="$RUNNER_TEMP/bin:$PATH"
           image="$(deploy/tests/registry/load.sh "$RUNNER_TEMP/image/pgsnare-image-amd64.tar")"
           deploy/tests/kubernetes/install.sh "$image"
+      - name: Prepare a webhook receiver and upgrade the release
+        run: |
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          deploy/tests/kubernetes/sinks.sh
+      - name: First alert of the central proxy
+        run: |
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          deploy/tests/kubernetes/alert.sh
+      - name: A token added through the Secret, without a restart
+        run: |
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          deploy/tests/kubernetes/token-change.sh
+      - name: A rolling update lets an open session finish
+        run: |
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          deploy/tests/kubernetes/rollout.sh
+      - name: The native sidecar, from install to first alert
+        run: |
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          deploy/tests/kubernetes/sidecar.sh native
+      - name: The sidecar without native support, from install to first alert
+        run: |
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          deploy/tests/kubernetes/sidecar.sh classic
+      - name: Only listed clients and scrapers get through the NetworkPolicy
+        run: |
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          deploy/tests/kubernetes/isolation.sh
+
+  example:
+    name: example
+    needs: image-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Take the image from the build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-amd64
+          path: ${{ runner.temp }}/image
+      - name: Check the archive against its sums
+        working-directory: ${{ runner.temp }}/image
+        run: sha256sum --check --strict SHA256SUMS-amd64
+      - name: The Compose example, from up to a verified alert
+        run: |
+          deploy/tests/registry/start.sh
+          image="$(deploy/tests/registry/load.sh "$RUNNER_TEMP/image/pgsnare-image-amd64.tar")"
+          PGSNARE_IMAGE="$image" examples/compose/smoke.sh

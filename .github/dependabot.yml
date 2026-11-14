@@ -100,3 +100,27 @@ updates:
       - dependency-name: "postgres"
         update-types: ["version-update:semver-major"]
       - dependency-name: "kindest/node"
+
+  # The images of the Compose example: PostgreSQL, and the Python image
+  # of its webhook receiver. The image of pgsnare is given by digest when
+  # the example is started.
+  - package-ecosystem: docker-compose
+    directory: /examples/compose
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    ignore:
+      - dependency-name: "postgres"
+        update-types: ["version-update:semver-major"]
+
+  # The stand-in application image of the sidecar definitions.
+  - package-ecosystem: docker
+    directory: /deploy/sidecar
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    ignore:
+      - dependency-name: "postgres"
+        update-types: ["version-update:semver-major"]

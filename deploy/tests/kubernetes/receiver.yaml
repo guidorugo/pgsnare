@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The webhook receiver of the cluster tests, in its own namespace: the
+# receiver of the Compose example (examples/compose/receiver/receiver.py,
+# from the ConfigMap `receiver-script`), with a certificate and a signing
+# key that sinks.sh makes for each run (Secret `receiver`). It prints every
+# event whose signature it verified; the tests read its log.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: receiver
+  labels:
+    app.kubernetes.io/name: receiver
+spec:
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  terminationGracePeriodSeconds: 1
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65533
+    runAsGroup: 65533
+    fsGroup: 65533
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: receiver
+      image: python:3.15.2-slim-trixie@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928
+      command: ["python3", "/app/receiver.py", "serve"]
+      env:
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: RECEIVER_LISTEN
+          value: 0.0.0.0:8443
+        - name: RECEIVER_CERT
+          value: /receiver/tls.crt
+        - name: RECEIVER_KEY
+          value: /receiver/tls.key
+        - name: RECEIVER_HMAC_KEY_FILE
+          value: /receiver/hmac-key
+        - name: RECEIVER_CA
+          value: /receiver/ca.crt
+      ports:
+        - name: https
+          containerPort: 8443
+      readinessProbe:
+        tcpSocket:
+          port: 8443
+        periodSeconds: 1
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          memory: 128Mi
+      volumeMounts:
+        - name: script
+          mountPath: /app
+          readOnly: true
+        - name: secrets
+          mountPath: /receiver
+          readOnly: true
+  volumes:
+    - name: script
+      configMap:
+        name: receiver-script
+        defaultMode: 292
+    - name: secrets
+      secret:
+        secretName: receiver
+        defaultMode: 288
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: receiver
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: receiver
+  ports:
+    - name: https
+      port: 8443
+      targetPort: 8443

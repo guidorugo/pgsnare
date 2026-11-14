@@ -1,0 +1,78 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The pods of the isolation test (isolation.sh), outside the namespace of
+# pgsnare:
+#
+#   outsider  in pgsnare-other, with the label of an allowed client: the
+#             namespace is part of the rule, so it must not get through
+#   scraper   in pgsnare-monitoring, with the label values-live.yaml lists
+#             as a scraper: it may read the metrics, and nothing else
+#
+# They hold no password: they only try to open connections.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pgsnare-other
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pgsnare-monitoring
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: outsider
+  namespace: pgsnare-other
+  labels:
+    app.kubernetes.io/name: client
+spec:
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 1
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 999
+    runAsGroup: 999
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: psql
+      image: postgres:18.6-trixie@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
+      command: ["sleep", "infinity"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: scraper
+  namespace: pgsnare-monitoring
+  labels:
+    app.kubernetes.io/name: scraper
+spec:
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 1
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 999
+    runAsGroup: 999
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: psql
+      image: postgres:18.6-trixie@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
+      command: ["sleep", "infinity"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
