@@ -95,6 +95,7 @@ certificate pglegacy
 #   68NN  TLS offered, plaintext accepted to  plaintext
 #   69NN  plaintext                       to  TLS, verified against the
 #                                             system's certificate store
+#   71NN  plaintext                       to  plaintext, with the SQL rules on
 #   7000  plaintext                       to  TLS, with a server that
 #                                             speaks nothing above TLS 1.1
 #
@@ -140,8 +141,17 @@ verified="{ mode: verify-full, ca: /state/certs/ca.crt }"
         listener "offered-plain-$version" "68$version" "$host:5432" "$offered" "$plain"
         listener "system-store-$version" "69$version" "$host:5432" "$plain" \
             "{ mode: verify-full }"
+        listener "rules-$version" "71$version" "$host:5432" "$plain" "$plain"
     done
     listener "legacy-tls" "7000" "pglegacy:5432" "$plain" "$verified"
+    # The SQL rules apply to the listeners of setup 71 and to no other, so
+    # that no other scenario waits for the parser.
+    scoped=""
+    for version in $versions; do
+        scoped="${scoped:+$scoped, }rules-$version"
+    done
+    echo "rules:"
+    echo "  functions: { names: [pg_sleep], actions: [alert, kill], listeners: [$scoped] }"
     cat <<'REST'
 tokens:
   - id: itest-alert
