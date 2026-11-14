@@ -3,7 +3,7 @@
 A PostgreSQL proxy that catches data theft with honeytokens.
 
 > [!IMPORTANT]
-> pgsnare is under construction. It finds honeytokens and answers them, but no version has been released, the integration tests have not yet run the responses against PostgreSQL, and nothing here is ready for use.
+> pgsnare is under construction. It finds honeytokens and answers them, but no version has been released, the integration tests have so far run only `alert` and `kill` against PostgreSQL, and nothing here is ready for use.
 > [Status and roadmap](#status-and-roadmap) shows what exists today. The design is described in [docs/high-level-design.md](docs/high-level-design.md).
 
 ## What it is
@@ -134,11 +134,11 @@ Container images and the Helm chart will be published to the GitHub Container Re
 
 ## Status and roadmap
 
-pgsnare cannot be used yet: it detects and responds, but no version has been released, and the integration tests have not yet run the responses against PostgreSQL. What exists today:
+pgsnare cannot be used yet: it detects and responds, but no version has been released, and the integration tests have so far run only `alert` and `kill` against PostgreSQL. What exists today:
 
 - **Relay.** `pgsnare run` puts a proxy between clients and a database: TLS on both legs, logins, simple and extended queries, COPY, replication, notifications, function calls and cancellation, for protocol 3.0 and 3.2. Tests compare what a client sees from PostgreSQL 15 to 18 directly and through pgsnare, in every supported TLS setup.
 - **Detection.** Every message, in both directions, is scanned for honeytoken values before it is forwarded, and so are the startup parameters and the user name at login. A value split across reads, across the chunks of a large message or across `CopyData` messages is found. A hit becomes a `token_hit` event that names the token, the session and the statement.
-- **Policy and responses.** Per token: `alert`, `kill`, `tarpit` and `fake_data`, combinations, escalation after repeated hits, exemptions by user and address range, and a `session_activity` event for each statement of a flagged session. Counted in `pgsnare_queries_total`, `pgsnare_hits_total` and `pgsnare_actions_total`. See [Configuring responses](#configuring-responses). The responses are tested with the proxy running in test programs, with a real client socket and a database made for the test. Tests against PostgreSQL are not written yet.
+- **Policy and responses.** Per token: `alert`, `kill`, `tarpit` and `fake_data`, combinations, escalation after repeated hits, exemptions by user and address range, and a `session_activity` event for each statement of a flagged session. Counted in `pgsnare_queries_total`, `pgsnare_hits_total` and `pgsnare_actions_total`. See [Configuring responses](#configuring-responses). The responses are tested with the proxy running in test programs, with a real client socket and a database made for the test. The integration tests also read a honeytoken through the proxy from PostgreSQL, once with `alert` and once with `kill`; `tarpit`, `fake_data` and reload are not yet run against PostgreSQL.
 - **Reload.** `SIGHUP` or a change to a configuration or token file replaces the policy without dropping a session. See [Reload](#reload).
 - **Events and observability.** Events reach four sinks through a dispatcher that never makes database traffic wait: a signed webhook over verified HTTPS, standard output, a file and syslog. `pgsnare run` serves `/healthz` and `/readyz` on an admin listener and Prometheus metrics on a listener of their own, both on loopback by default, and `pgsnare healthcheck` asks the admin listener. The log is JSON, one object for each line, on standard error, written by a thread of its own through a queue, so a log nobody reads costs lines and never makes a session wait. One redaction layer stands before every event, log line and metric label.
 - **Wire protocol.** Framing, message views and encoders for protocol 3.0 and 3.2, tested against traffic captured from PostgreSQL 15 to 18.
@@ -152,7 +152,7 @@ The steps to the first release:
 | Step | What it delivers | State |
 |---|---|---|
 | 1. Relay | A proxy that real clients cannot tell from the database | Done |
-| 2. Detect and alert | Honeytokens, events and sinks. The first usable version | Built: detection, events, sinks, health and metrics. Not yet run against PostgreSQL by the integration tests |
+| 2. Detect and alert | Honeytokens, events and sinks. The first usable version | Built: detection, events, sinks, health and metrics. `tarpit`, `fake_data` and reload not yet run against PostgreSQL |
 | 3. Respond | Kill, tarpit, fake data and exemptions | Built, with the same limit |
 | 4. SQL rules | Optional checks on the statements themselves | Not started |
 | 5. Prove and ship | Detection corpus, fuzzing, benchmarks, container image, Helm chart and documentation | Not started |
