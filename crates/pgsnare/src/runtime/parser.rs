@@ -321,6 +321,23 @@ struct Entry {
     used: bool,
 }
 
+/// Whether an outcome depends on the statement and the limits alone, so
+/// that it is the answer the next time too. A failure that can come from
+/// the state of the process at the moment, such as memory the parser
+/// could not get, must not stay with the statement: under `block` it
+/// would end every session that sends the statement, for as long as the
+/// entry lives.
+const fn lasting(outcome: &Outcome) -> bool {
+    matches!(
+        outcome,
+        Ok(_)
+            | Err(ParseFailure::InvalidUtf8
+                | ParseFailure::EmbeddedNul
+                | ParseFailure::TooDeep
+                | ParseFailure::Rejected)
+    )
+}
+
 /// What an entry costs beyond its analysis: the key twice, the entry, and
 /// an allowance for the tables that hold them.
 const ENTRY_OVERHEAD: usize = 2 * size_of::<Key>() + size_of::<Entry>() + 64;
@@ -369,6 +386,9 @@ impl Cache {
     }
 
     fn insert(&mut self, key: Key, limits: &Limits, outcome: Outcome) {
+        if !lasting(&outcome) {
+            return;
+        }
         let weight = outcome
             .as_ref()
             .map_or(0, |analysis| analysis.weight())
@@ -669,6 +689,45 @@ mod tests {
 
     fn failure() -> Outcome {
         Err(ParseFailure::Rejected)
+    }
+
+    #[test]
+    fn a_failure_that_may_not_come_again_is_not_kept() {
+        let limits = Limits::default();
+        let mut cache = Cache::new(64, usize::MAX);
+        for (n, reason) in [
+            ParseFailure::Unreadable,
+            ParseFailure::Panicked,
+            ParseFailure::Busy,
+            ParseFailure::TimedOut,
+            ParseFailure::TooLarge,
+            ParseFailure::Incomplete,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = key(u32::try_from(n).unwrap());
+            cache.insert(key, &limits, Err(reason));
+            assert!(cache.get(&key, &limits).is_none(), "{reason:?}");
+        }
+        assert_eq!(
+            (cache.entries.len(), cache.order.len(), cache.bytes),
+            (0, 0, 0)
+        );
+        // What the statement itself is the reason for stays.
+        for (n, reason) in [
+            ParseFailure::Rejected,
+            ParseFailure::TooDeep,
+            ParseFailure::InvalidUtf8,
+            ParseFailure::EmbeddedNul,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = key(u32::try_from(n).unwrap());
+            cache.insert(key, &limits, Err(reason));
+            assert_eq!(cache.get(&key, &limits), Some(Err(reason)), "{reason:?}");
+        }
     }
 
     #[test]
