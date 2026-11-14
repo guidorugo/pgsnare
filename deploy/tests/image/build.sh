@@ -42,8 +42,22 @@ trap 'rm -rf "$work"' EXIT
 # No attestation is attached, so the result is one image and not a list.
 build=("$docker" buildx build --file "$root/deploy/Dockerfile" --provenance=false --sbom=false)
 
+# The image says which version it is and which commit it was built from: the
+# version of the workspace, which a release tag must equal, and the commit
+# that is checked out, when there is a repository to ask.
+version="$(sed -nE '/^\[workspace\.package\]/,/^\[/{s/^version = "([0-9A-Za-z.-]+)"$/\1/p}' "$root/Cargo.toml")"
+if [[ -z "$version" || "$version" == *$'\n'* ]]; then
+    echo "build: Cargo.toml does not declare one version of the workspace" >&2
+    exit 1
+fi
+labels=(--label "org.opencontainers.image.version=$version")
+revision="$(git -C "$root" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null || true)"
+if [[ "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+    labels+=(--label "org.opencontainers.image.revision=$revision")
+fi
+
 echo "build: the image for $arch"
-"${build[@]}" --tag "$tag" --load "$root"
+"${build[@]}" "${labels[@]}" --tag "$tag" --load "$root"
 
 # The same build stage again, from the cache of the build above.
 echo "build: the binary for $arch"
