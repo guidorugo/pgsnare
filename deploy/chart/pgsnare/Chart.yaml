@@ -7,8 +7,8 @@ description: >-
 type: application
 # The version of the chart and of pgsnare are the version of the workspace.
 # A release writes them.
-version: 0.0.0
-appVersion: "0.0.0"
+version: 0.0.1
+appVersion: "0.0.1"
 kubeVersion: ">=1.30.0-0"
 home: https://github.com/guidorugo/pgsnare
 sources:

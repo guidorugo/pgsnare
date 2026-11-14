@@ -13,7 +13,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.0.1"
 edition = "2024"
 rust-version = "1.99"
 license = "Apache-2.0"
@@ -21,8 +21,8 @@ repository = "https://github.com/guidorugo/pgsnare"
 publish = false
 
 [workspace.dependencies]
-pgsnare-core = { path = "crates/pgsnare-core", version = "0.0.0", default-features = false }
-pgsnare-proto = { path = "crates/pgsnare-proto", version = "0.0.0" }
+pgsnare-core = { path = "crates/pgsnare-core", version = "0.0.1", default-features = false }
+pgsnare-proto = { path = "crates/pgsnare-proto", version = "0.0.1" }
 
 aho-corasick = "1.1.5"
 aws-lc-rs = { version = "1.19.0", default-features = false, features = ["aws-lc-sys"] }
