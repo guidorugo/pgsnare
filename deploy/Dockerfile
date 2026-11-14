@@ -105,10 +105,13 @@ LABEL org.opencontainers.image.title="pgsnare" \
 # base (fixed in zlib 1.4-r0, which the base does not carry yet). pgsnare is
 # static and does not use this library, but the scan sees the package. Upgrade
 # that one package while the image is built, from the signed package index of
-# the distribution, and keep no cache. Remove this step when the base digest
-# above is raised to one that carries a fixed zlib. This is the only package
-# touched, and nothing is installed or upgraded when the image runs.
-RUN apk add --no-cache --upgrade 'zlib>=1.4-r0'
+# the distribution, and keep no cache. The version is named exactly, so the
+# same commit gives the same package on any day; when the distribution
+# replaces that version the build stops, and it is time to raise the base
+# digest above to one that carries a fixed zlib and to remove this step.
+# This is the only package touched, and nothing is installed or upgraded
+# when the image runs.
+RUN apk add --no-cache --upgrade 'zlib=1.4-r0'
 
 # The user and the home directory that the image names. Added while the image
 # is built, and not at run time. No package is installed: the CA certificates

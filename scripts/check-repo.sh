@@ -151,6 +151,65 @@ done < <(find deploy examples -type f \
        -o -name 'Containerfile' -o -name 'Containerfile.*' \) \
     ! -name '*.dockerignore' -print0 2>/dev/null)
 
+# A package of the distribution that a Dockerfile adds with `apk` is named
+# with its exact version, on the line of the command: `apk add NAME=VERSION`.
+# A range, or no version, gives another image on another day. The package
+# index of the day decides nothing: a version that is gone stops the build.
+# (This rule reads `apk` only. What a build stage installs with another
+# package manager is not held to it.)
+package='[a-z0-9][a-z0-9+._-]*=[0-9][a-z0-9._]*-r[0-9]+'
+while IFS= read -r -d '' file; do
+    number=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        number=$((number + 1))
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        rest="$line"
+        while [[ "$rest" =~ (^|[^A-Za-z0-9_./-])apk[[:space:]]+(.*)$ ]]; do
+            rest="${BASH_REMATCH[2]}"
+            read -ra words <<<"$rest"
+            verb=""
+            named=0
+            for word in "${words[@]}"; do
+                last=0
+                if [[ "$word" == *';' ]]; then
+                    word="${word%;}"
+                    last=1
+                fi
+                word="${word#[\"\']}"
+                word="${word%[\"\']}"
+                if [[ -z "$verb" ]]; then
+                    # The options of apk itself come before its command.
+                    [[ "$word" == -* ]] || verb="$word"
+                elif [[ "$word" == '&&' || "$word" == '||' || "$word" == '|' ]]; then
+                    break
+                elif [[ "$verb" != add ]]; then
+                    :
+                elif [[ "$word" == '\' ]]; then
+                    named=1
+                    fail "$file:$number: apk $verb names its packages on another line; name them on this one"
+                elif [[ -n "$word" && "$word" != -* ]]; then
+                    named=1
+                    if ! [[ "$word" =~ ^${package}$ ]]; then
+                        fail "$file:$number: the package '$word' is not named with its exact version (NAME=VERSION)"
+                    fi
+                fi
+                [[ "$last" -eq 0 ]] || break
+            done
+            case "$verb" in
+                add)
+                    [[ "$named" -eq 1 ]] || fail "$file:$number: apk add names no package on its line"
+                    ;;
+                upgrade | fix)
+                    fail "$file:$number: apk $verb changes packages without naming their versions; use apk add NAME=VERSION"
+                    ;;
+            esac
+        done
+    done < "$file"
+done < <(find deploy examples -type f \
+    \( -name 'Dockerfile' -o -name 'Dockerfile.*' -o -name '*.Dockerfile' \
+       -o -name 'Containerfile' -o -name 'Containerfile.*' \) \
+    ! -name '*.dockerignore' -print0 2>/dev/null)
+
 # An `image:` in a Compose file, a manifest or the values of a chart has a
 # digest, or is a variable that must be set and has no default:
 # `${NAME:?message}`. Only a template of a chart may compose the name: what
@@ -179,6 +238,42 @@ while IFS= read -r hit; do
     fi
 done < <(grep -rnE --include='*.yaml' --include='*.yml' --include='*.json' --include='*.tpl' \
     '^[[:space:]]*(-[[:space:]]+)?"?image"?:' deploy examples 2>/dev/null || true)
+
+# The rule above reads a name that follows `image:` at the start of a line,
+# and no other form. So no other form is accepted: `image` as a key further
+# into a line (a mapping written on one line), with a blank before its
+# colon, or in single quotes; and an image that a script names with
+# `--image`. A key whose value is a mapping is a group of settings, as
+# above. A comment is not read. What a script does with a name it gets from
+# elsewhere is not seen here: this guards against a slip, and a review reads
+# the rest.
+while IFS= read -r hit; do
+    file="${hit%%:*}"
+    rest="${hit#*:}"
+    number="${rest%%:*}"
+    text="${rest#*:}"
+    [[ "$text" =~ ^[[:space:]]*# ]] && continue
+    # The form that the rule above has read: go on behind it.
+    if [[ "$text" =~ ^[[:space:]]*(-[[:space:]]+)?\"?image\"?:(.*)$ ]]; then
+        text="${BASH_REMATCH[2]}"
+    fi
+    while [[ "$text" =~ (^|[[:space:]{,[])[\"\']?image[\"\']?[[:space:]]*:[[:space:]]*(.*)$ ]]; do
+        text="${BASH_REMATCH[2]}"
+        if [[ -z "$text" || ( "$text" == \{* && "$text" != \{\{* ) ]]; then
+            continue
+        fi
+        fail "$file:$number: an image is named in a form that this check does not read; write 'image: NAME' on a line of its own"
+        break
+    done
+done < <(grep -rnE --include='*.yaml' --include='*.yml' --include='*.json' --include='*.tpl' \
+    '(^|[[:space:]{,[])["'"'"']?image["'"'"']?[[:space:]]*:' deploy examples 2>/dev/null || true)
+
+while IFS= read -r hit; do
+    file="${hit%%:*}"
+    rest="${hit#*:}"
+    number="${rest%%:*}"
+    fail "$file:$number: a script names an image with --image; name it in a manifest, where this check reads it"
+done < <(grep -rnE --include='*.sh' -e '(^|[^A-Za-z0-9_-])--image([=[:space:]"'"'"']|$)' deploy examples 2>/dev/null || true)
 
 # --- 5. Jobs ------------------------------------------------------------------
 # `main` accepts a pull request when the checks with these names pass. Each

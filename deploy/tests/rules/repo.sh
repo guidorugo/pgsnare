@@ -39,6 +39,9 @@ RUN --mount=type=bind,from=registry.example.com/tools:1.0.0$digest,target=/tools
 FROM scratch AS binary
 COPY --from=build /out/pgsnare /pgsnare
 from --platform=linux/amd64 registry.example.com/base:1.0.0$digest as image
+# apk upgrade: a comment is not read
+RUN apk add --no-cache --upgrade 'zlib=1.4-r0'
+RUN set -eu; apk --no-cache add "libfoo++=2.0_p1-r12" bar-baz=3-r0; apk del bar-baz; mkdir /apk
 COPY --from=build /out/pgsnare /usr/local/bin/pgsnare
 FROM binary
 DOCKERFILE
@@ -97,6 +100,15 @@ jobs:
     steps:
       - run: "true"
 WORKFLOW
+    # What the rule about other forms must not take for an image.
+    cat > "$dir/deploy/tests/notes.yaml" <<NOTES
+# the image: \${PGSNARE_IMAGE} must be named by digest
+x-postgres-image: &postgres-image
+  image: postgres:18.6-trixie$digest
+initImage: {}
+NOTES
+    printf '%s\n' '# SPDX-License-Identifier: Apache-2.0' '# kubectl run takes the name with an option; this script does not' \
+        'kubectl set image-pull-policy x --image-pull-policy=Never' > "$dir/deploy/tests/notes.sh"
     echo "$dir"
 }
 
@@ -161,6 +173,23 @@ dockerfile "a Rust image of another version" "rust-toolchain.toml pins Rust $too
 dockerfile "a Rust image without a version" "names no full version" \
     "FROM rust$digest"
 
+# --- Packages in a Dockerfile ----------------------------------------------------
+inexact="is not named with its exact version"
+
+dockerfile "a package with a lower bound" "$inexact" "FROM scratch" "RUN apk add --no-cache --upgrade 'zlib>=1.4-r0'"
+dockerfile "a package without a version" "$inexact" "FROM scratch" "RUN apk add --no-cache zlib"
+dockerfile "a package with the start of a version" "$inexact" "FROM scratch" "RUN apk add 'zlib~1.4'"
+dockerfile "a package with a version and no release" "$inexact" "FROM scratch" "RUN apk add zlib=1.4"
+dockerfile "a second package without a version" "$inexact" "FROM scratch" "RUN apk add zlib=1.4-r0 busybox"
+dockerfile "a package after another command" "$inexact" "FROM scratch" "RUN set -eu; mkdir /x && apk add --no-cache zlib; true"
+dockerfile "packages on the next line" "names its packages on another line" \
+    "FROM scratch" 'RUN apk add --no-cache \' "        zlib=1.4-r0"
+dockerfile "apk add without a package" "names no package on its line" "FROM scratch" "RUN apk add --no-cache"
+dockerfile "an upgrade of every package" "changes packages without naming their versions" \
+    "FROM scratch" "RUN apk upgrade --no-cache"
+dockerfile "an upgrade of one package" "changes packages without naming their versions" \
+    "FROM scratch" "RUN apk --no-cache upgrade zlib"
+
 dir="$(tree)"
 mkdir -p "$dir/examples/compose"
 echo "FROM debian:13" > "$dir/examples/compose/receiver.Dockerfile"
@@ -190,6 +219,45 @@ image "a template outside the templates of a chart" deploy/tests/pod.yaml \
     '    image: "{{ .Values.image }}"'
 image "a template in the values of a chart" deploy/chart/pgsnare/values.yaml \
     'image: "{{ .Values.other }}"'
+
+# --- Images in a form that is not read ---------------------------------------------
+unread="is named in a form that this check does not read"
+
+# form WHAT MESSAGE FILE LINE: FILE, in a new tree, holds LINE.
+form() {
+    local dir
+    dir="$(tree)"
+    mkdir -p "$dir/$(dirname "$3")"
+    if [[ "$3" == *.sh ]]; then
+        printf '%s\n' '# SPDX-License-Identifier: Apache-2.0' "$4" > "$dir/$3"
+    else
+        printf '%s\n' "$4" > "$dir/$3"
+    fi
+    refused "$1" "$2" "$dir"
+}
+
+form "an image in a mapping on one line" "$unread" deploy/tests/pod.yaml \
+    '  containers: [{name: a, image: postgres:18.6-trixie}]'
+form "an image that begins a mapping on one line" "$unread" deploy/tests/pod.yaml \
+    '    - {image: postgres:18.6-trixie, name: a}'
+form "an image in a mapping on one line, pinned" "$unread" deploy/tests/pod.yaml \
+    "  containers: [{name: a, image: postgres:18.6-trixie$digest}]"
+form "a blank before the colon" "$unread" deploy/tests/compose.yaml '    image : postgres:18.6-trixie'
+form "a second image behind the first" "$unread" deploy/tests/pod.yaml \
+    "    - image: postgres:18.6-trixie$digest, {image: postgres:18.6-trixie}"
+form "a key in single quotes" "$unread" examples/compose/compose.yaml "    'image': postgres:18.6-trixie"
+form "an image in JSON on one line" "$unread" deploy/tests/pod.json \
+    '{"spec":{"containers":[{"name":"a","image":"postgres:18.6-trixie"}]}}'
+form "an image in a list in JSON" "$unread" deploy/tests/pod.json '["image" : "postgres:18.6-trixie"]'
+
+# The option is put together here, so that this file does not hold it.
+option="--""image"
+by_option="a script names an image with $option"
+form "an image that a script names with an option" "$by_option" deploy/tests/run.sh \
+    "kubectl run probe $option=postgres:18.6-trixie"
+form "the same, with a blank" "$by_option" examples/compose/run.sh \
+    "kubectl run probe $option postgres:18.6-trixie"
+form "the same, at the start of a line" "$by_option" deploy/tests/run.sh "    $option \"\$name\""
 
 # --- Jobs ------------------------------------------------------------------------
 required="is the name of a required check"
