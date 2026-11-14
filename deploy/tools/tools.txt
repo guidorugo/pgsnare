@@ -42,3 +42,15 @@ kind        0.33.0  arm64  20022bee6cfcd5086cb7234d218e3454e6090022f2a8f55d1fa7f
 # Kubernetes command line, for the cluster tests
 kubectl     1.37.2  amd64  c04487523e7aa7d1493f7808174c899db93d7a9cf57531420cd76b9bd415f8f4  -                 https://dl.k8s.io/release/v1.37.2/bin/linux/amd64/kubectl
 kubectl     1.37.2  arm64  fcc16f63186659d9722014b7e02d5fdd2d4e669cb8c0ab66365d7d3b8ba03509  -                 https://dl.k8s.io/release/v1.37.2/bin/linux/arm64/kubectl
+
+# Registry client without a daemon, for the release: deploy/release/
+crane       0.22.1  amd64  0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0  crane             https://github.com/google/go-containerregistry/releases/download/v0.22.1/go-containerregistry_Linux_x86_64.tar.gz
+crane       0.22.1  arm64  898c0cff975f898a33e8c4580bdafb0e7c02c7faa33374e946762f97c4ab7110  crane             https://github.com/google/go-containerregistry/releases/download/v0.22.1/go-containerregistry_Linux_arm64.tar.gz
+
+# Signing and verifying, for the release: deploy/release/
+cosign      3.1.4   amd64  424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa  -                 https://github.com/sigstore/cosign/releases/download/v3.1.4/cosign-linux-amd64
+cosign      3.1.4   arm64  ade83b7aac62e131cacfe96d958948b2150cc9efec46a570a2649b8e27dedad2  -                 https://github.com/sigstore/cosign/releases/download/v3.1.4/cosign-linux-arm64
+
+# SBOM generator, for the release: deploy/release/
+syft        1.57.0  amd64  9c077a7d43029b3b13e98a8db720661e700c4d58db6352153a06395ae4a2a704  syft              https://github.com/anchore/syft/releases/download/v1.57.0/syft_1.57.0_linux_amd64.tar.gz
+syft        1.57.0  arm64  410cbfa0ae0f63246bc0057843760b1de2833cd23919e025e368fd7681308cdb  syft              https://github.com/anchore/syft/releases/download/v1.57.0/syft_1.57.0_linux_arm64.tar.gz
