@@ -138,9 +138,12 @@ done
 say "the builds of both architectures match the sums that were reported"
 
 # --- Nothing of this version is in the registry yet ---------------------------
+#
+# Only the registry's own "there is no such thing" counts as free. A
+# question that got no answer stops here, before the first push.
 
 for reference in "$image:$version" "$image:$version-amd64" "$image:$version-arm64" "$chart:$version"; do
-    if crane digest "$reference" >/dev/null 2>&1; then
+    if registry_holds "$reference"; then
         die "$reference exists already; a release is never replaced"
     fi
 done

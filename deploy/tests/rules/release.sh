@@ -22,6 +22,10 @@
 #
 # The second part runs deploy/release/check-tag.sh in repositories made
 # for the test.
+#
+# The third part asks deploy/release/lib.sh whether a registry holds a
+# version, with a stand-in for the registry client that answers as the
+# test says: only "there is no such thing" may count as free.
 
 set -euo pipefail
 
@@ -296,6 +300,74 @@ at shallow on-main v1.2.3
 git "${quiet[@]}" -C "$work/shallow" update-ref -d refs/remotes/origin/main
 rejects "the main branch of the remote is not known" "a checkout that does not know main" \
     "$work/shallow/deploy/release/check-tag.sh" refs/tags/v1.2.3
+
+# --- Whether the registry holds a version ---------------------------------------
+#
+# A stand-in for crane: it prints the text of CRANE_SAYS to standard error
+# and ends with the status of CRANE_STATUS.
+
+mkdir "$work/bin"
+cat > "$work/bin/crane" <<'CRANE'
+#!/usr/bin/env bash
+[[ "$1" == digest ]] || exit 64
+if [[ "$CRANE_STATUS" -eq 0 ]]; then
+    echo "sha256:$(printf '%064d' 0)"
+else
+    printf '%s\n' "$CRANE_SAYS" >&2
+fi
+exit "$CRANE_STATUS"
+CRANE
+chmod +x "$work/bin/crane"
+
+# asked STATUS TEXT: what registry_holds makes of that answer: `held`,
+# `free`, or `stopped` when it ends the script and says why.
+asked() {
+    local status=0
+    CRANE_STATUS="$1" CRANE_SAYS="$2" PATH="$work/bin:$PATH" bash -c '
+        set -euo pipefail
+        source "$1"
+        if registry_holds registry.example.com/pgsnare:1.2.3; then echo held; else echo free; fi
+    ' - "$root/deploy/release/lib.sh" > "$work/asked" 2> "$work/asked.err" || status=$?
+    if [[ "$status" -eq 0 ]]; then
+        cat "$work/asked"
+    elif [[ ! -s "$work/asked" ]] && grep -q 'did not say whether .* exists; nothing was published' "$work/asked.err"; then
+        echo stopped
+    else
+        echo "failed otherwise"
+    fi
+}
+
+# registry EXPECTED DESCRIPTION STATUS TEXT
+registry() {
+    local got
+    got="$(asked "$3" "$4")"
+    if [[ "$got" == "$1" ]]; then
+        good "the registry: $2: $1"
+    else
+        bad "the registry: $2: $got, not $1"
+    fi
+}
+
+at_registry='GET https://registry.example.com/v2/pgsnare/manifests/1.2.3:'
+registry held "a digest" 0 ""
+registry free "no such manifest" 1 "Error: $at_registry MANIFEST_UNKNOWN: manifest unknown"
+registry free "no such repository" 1 "Error: $at_registry NAME_UNKNOWN: repository name not known to registry"
+registry free "not found, without a reason" 1 "Error: $at_registry unexpected status code 404 Not Found"
+registry stopped "no connection" 1 'Error: Get "https://registry.example.com/v2/": dial tcp 192.0.2.1:443: i/o timeout'
+registry stopped "too many requests" 1 "Error: $at_registry TOOMANYREQUESTS: retry later"
+registry stopped "a failing server" 1 "Error: $at_registry unexpected status code 503 Service Unavailable"
+registry stopped "a server that is not allowed to say" 1 "Error: $at_registry DENIED: requested access to the resource is denied"
+registry stopped "no login" 1 "Error: $at_registry UNAUTHORIZED: authentication required"
+registry stopped "a failure without a word" 1 ""
+registry stopped "a client that was killed" 137 ""
+registry stopped "a reason that only looks like one" 1 "Error: $at_registry XMANIFEST_UNKNOWN_Y: unexpected status code 4040"
+if grep -Eq 'crane digest [^|]*(>|&>) ?/dev/null 2>&1|crane digest .*\|\| true' "$root/deploy/release/publish.sh"; then
+    bad "publish.sh asks the registry in a way that takes any failure for an answer"
+elif [[ "$(grep -c 'if registry_holds "\$reference"; then' "$root/deploy/release/publish.sh")" -eq 1 ]]; then
+    good "publish.sh asks whether a version exists through registry_holds"
+else
+    bad "publish.sh does not ask whether a version exists through registry_holds"
+fi
 
 echo "release rules: $cases cases, $failed failed"
 [[ "$failed" -eq 0 ]]

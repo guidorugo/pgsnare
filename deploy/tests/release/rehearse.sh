@@ -283,5 +283,27 @@ passes "the chart of the release, by itself, is accepted" \
 refuses "exists already" "publishing the same version again" \
     "$publish" "$version" "$registry" "key=$key" "$input" "$work/again"
 
+# The same, when the registry cannot be asked whether the version exists:
+# a client that fails every such question as a busy server would, and is
+# the real client for everything else. Nothing may be pushed then.
+before="$(crane digest "$chart:$version")"
+mkdir "$work/busy"
+real_crane="$(command -v crane)"
+cat > "$work/busy/crane" <<BUSY
+#!/usr/bin/env bash
+if [[ "\${1:-}" == digest ]]; then
+    echo "Error: unexpected status code 503 Service Unavailable" >&2
+    exit 1
+fi
+exec "$real_crane" "\$@"
+BUSY
+chmod +x "$work/busy/crane"
+refuses "did not say whether" "publishing the same version again when the registry gives no answer" \
+    env PATH="$work/busy:$PATH" "$publish" "$version" "$registry" "key=$key" "$input" "$work/unanswered"
+passes "the chart of the release is the one that was published first" \
+    test "$(crane digest "$chart:$version")" = "$before"
+passes "and it is the chart that the release names" \
+    test "$chart@$before" = "$chart_reference"
+
 echo "rehearse: $checks checks, $failed failed"
 [[ "$failed" -eq 0 ]]

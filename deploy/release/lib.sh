@@ -65,6 +65,24 @@ check_reference() {
         || die "'$reference' does not name an artefact by digest: registry/path@sha256: and 64 hexadecimal digits"
 }
 
+# Whether the registry holds REFERENCE. Three answers, and they are kept
+# apart: 0, the registry names a digest for it; 1, the registry says that
+# there is no such manifest or no such repository; and anything else, an
+# answer that is no answer to the question (no connection, a refusal, a
+# busy or a failing server), ends the script. A registry that could not be
+# asked has not said that a version is free.
+registry_holds() {
+    local reference="$1" answer
+    if answer="$(crane digest "$reference" 2>&1 >/dev/null)"; then
+        return 0
+    fi
+    if grep -Eq '(^|[^A-Z_])(MANIFEST_UNKNOWN|NAME_UNKNOWN)([^A-Z_]|$)|unexpected status code 404( |$)' <<<"$answer"; then
+        return 1
+    fi
+    answer="$(tail -n 1 <<<"$answer" | tr -c '[:print:]' ' ' | cut -c 1-300)"
+    die "the registry did not say whether $reference exists; nothing was published (${answer:-no message})"
+}
+
 # The signing mode: `keyless`, or `key=FILE`. Sets `mode` and `key`.
 read_mode() {
     key=""
