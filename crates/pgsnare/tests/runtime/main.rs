@@ -9,6 +9,7 @@
 
 mod kill;
 mod relay;
+mod reload;
 mod scan;
 mod support;
 mod tls;
