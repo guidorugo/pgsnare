@@ -298,6 +298,19 @@ fn how_a_relation_is_used_is_told_apart() {
         ("SELECT * FROM users LIMIT ALL", unbounded),
         ("SELECT * FROM users LIMIT NULL", unbounded),
         ("SELECT * FROM users OFFSET 5", unbounded),
+        // A filter that is a constant leaves no row out.
+        ("SELECT * FROM users WHERE true", unbounded),
+        ("SELECT * FROM users WHERE 't'", unbounded),
+        (
+            "SELECT * FROM (SELECT * FROM users WHERE true) s",
+            unbounded,
+        ),
+        ("SELECT * FROM users WHERE true LIMIT 5", read_only),
+        ("SELECT * FROM users WHERE id = 1 OR true", read_only),
+        (
+            "DELETE FROM users WHERE true RETURNING *",
+            written.union(unbounded),
+        ),
         ("SELECT * FROM users ORDER BY id", unbounded),
         ("SELECT * FROM (SELECT * FROM users) s", unbounded),
         ("SELECT * FROM (SELECT * FROM users) s LIMIT 5", read_only),

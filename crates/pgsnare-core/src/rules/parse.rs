@@ -125,6 +125,8 @@ struct Frame {
     /// The relations this statement is aimed at.
     targets: Vec<usize>,
     has_where: bool,
+    /// The `WHERE` is a constant and nothing else, such as `WHERE true`.
+    where_is_constant: bool,
     has_limit: bool,
     limit_is_null: bool,
     has_returning: bool,
@@ -233,14 +235,17 @@ impl Walker {
         match frame.name {
             "String" => self.leave_string(frame),
             "AConst" => {
-                // `LIMIT ALL` and `LIMIT NULL` are a null constant.
                 let mut around = self.frames.iter_mut().rev();
-                if frame.is_null
-                    && around.next().is_some_and(|node| node.name == "Node")
-                    && let Some(select) = around.next()
-                    && select.is("SelectStmt", "limit_count")
+                if around.next().is_some_and(|node| node.name == "Node")
+                    && let Some(statement) = around.next()
                 {
-                    select.limit_is_null = true;
+                    if statement.field == "where_clause" {
+                        // `WHERE true` leaves no row out.
+                        statement.where_is_constant = true;
+                    } else if frame.is_null && statement.is("SelectStmt", "limit_count") {
+                        // `LIMIT ALL` and `LIMIT NULL` are a null constant.
+                        statement.limit_is_null = true;
+                    }
                 }
             }
             "RangeVar" => self.leave_relation(&frame),
@@ -275,7 +280,8 @@ impl Walker {
             "UpdateStmt" | "DeleteStmt" | "MergeStmt" => {
                 // Without RETURNING no row reaches the client. With it and
                 // without WHERE, every row does.
-                let returned = match (frame.has_returning, frame.has_where) {
+                let filtered = frame.has_where && !frame.where_is_constant;
+                let returned = match (frame.has_returning, filtered) {
                     (false, _) => RelationUse::NAMED,
                     (true, true) => RelationUse::READ,
                     (true, false) => RelationUse::UNBOUNDED_READ,
@@ -331,7 +337,8 @@ impl Walker {
     /// A query ends. What it reads is settled here, unless another query
     /// reads from this one: then that one's `WHERE` and `LIMIT` count too.
     fn leave_select(&mut self, frame: Frame) {
-        let narrowed = frame.has_where || (frame.has_limit && !frame.limit_is_null);
+        let narrowed = (frame.has_where && !frame.where_is_constant)
+            || (frame.has_limit && !frame.limit_is_null);
         let outer = self.around(&BETWEEN_QUERIES).filter(|outer| {
             outer.name == "SelectStmt" && matches!(outer.field, "from_clause" | "larg" | "rarg")
         });
