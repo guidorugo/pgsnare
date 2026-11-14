@@ -771,6 +771,20 @@ impl Driver {
                     self.context.status.parse_failed();
                     self.context.status.actions_taken(actions);
                 }
+                #[cfg(feature = "rules")]
+                Effect::RuleHit {
+                    rule_id,
+                    exempt,
+                    actions,
+                    decided: _,
+                } => {
+                    // A hit in an exempt session triggers nothing, and
+                    // there is no counter of its own for it.
+                    if !exempt {
+                        self.context.status.rule_hit(&rule_id);
+                        self.context.status.actions_taken(actions);
+                    }
+                }
                 // An effect this runtime does not know cannot be carried
                 // out, and a session must not go on as if it had been.
                 _ => {

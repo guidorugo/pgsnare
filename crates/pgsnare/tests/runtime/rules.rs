@@ -3,7 +3,8 @@
 //! The SQL rules through the runtime: a statement waits for the parser
 //! threads before it reaches the database, and a statement they give no
 //! analysis for meets `on_parse_failure`, whether they refused it, were
-//! busy, or did not answer in time.
+//! busy, or did not answer in time. A statement that sets off a rule is
+//! counted, reported and answered.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -16,7 +17,8 @@ use pgsnare_core::detect::{Matcher, TokenSpec};
 use pgsnare_core::event::EventKind;
 use pgsnare_core::extension::ProtocolModule;
 use pgsnare_core::policy::{
-    ActionSet, FixedPolicy, Inspection, OnError, PolicySnapshot, TokenId, TokenPolicy,
+    Action, ActionSet, Exemption, FixedPolicy, Inspection, OnError, PolicySnapshot,
+    PolicySnapshotBuilder, TokenId, TokenPolicy,
 };
 use pgsnare_core::rules::{Limits, OnParseFailure, RuleScope, RuleSet};
 use pgsnare_core::session::postgres::Postgres;
@@ -36,13 +38,14 @@ const VALUE: &str = "svc.backup.8f3k2q@mail.example";
 const NEVER: Duration = Duration::from_secs(600);
 
 fn policy(on_failure: OnParseFailure) -> PolicySnapshot {
+    answering(on_failure, ActionSet::ALERT).build().unwrap()
+}
+
+/// A policy whose rule about `pg_sleep` is answered with `actions`.
+fn answering(on_failure: OnParseFailure, actions: ActionSet) -> PolicySnapshotBuilder {
     let rules = RuleSet::builder()
         .on_parse_failure(on_failure)
-        .functions(
-            &["pg_sleep".to_owned()],
-            ActionSet::ALERT,
-            RuleScope::default(),
-        )
+        .functions(&["pg_sleep".to_owned()], actions, RuleScope::default())
         .unwrap()
         .build();
     PolicySnapshot::builder()
@@ -50,8 +53,6 @@ fn policy(on_failure: OnParseFailure) -> PolicySnapshot {
         .token(TokenPolicy::new(TokenId::new(TOKEN_ID).unwrap()))
         .matcher(Matcher::build(&[TokenSpec::new(TOKEN_ID, [VALUE])]).unwrap())
         .rules(rules)
-        .build()
-        .unwrap()
 }
 
 /// What the database was sent once a client was let in.
@@ -152,6 +153,21 @@ impl Proxied {
         client.write_all(&startup_message()).await.unwrap();
         soon(read_until_ready(&mut client)).await.unwrap();
         client
+    }
+
+    /// The rule hits that were reported: the rule and what was done.
+    fn rule_events(&self) -> Vec<(String, ActionSet)> {
+        self.events
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.body.kind == EventKind::RuleHit)
+            .map(|event| {
+                let rule = event.body.rule_id.as_ref().unwrap().as_str().to_owned();
+                (rule, event.body.action_taken)
+            })
+            .collect()
     }
 
     fn parse_failure_events(&self) -> usize {
@@ -429,4 +445,67 @@ async fn a_prepared_statement_is_analysed_once_however_often_it_runs() {
     let stats = pool.stats();
     assert_eq!((stats.analysed, stats.cache_hits), (1, 0));
     assert_eq!(proxy.status.counters().parse_failures, 0);
+}
+
+#[tokio::test]
+async fn a_statement_that_sets_off_a_rule_is_counted_reported_and_answered() {
+    let pool = pool(1, 16);
+    let functions = || vec![("functions".to_owned(), 1)];
+
+    // Alert: the statement goes on.
+    let seen = Arc::new(Seen::default());
+    let database = database(&seen).await;
+    let policy = answering(OnParseFailure::Block, ActionSet::ALERT);
+    let proxy = Proxied::start(&database, policy.build().unwrap(), Some(&pool), PATIENCE).await;
+    let mut client = proxy.log_in().await;
+    let sql = "SELECT 1; SELECT \"pg_sleep\" /* a name */ (0)";
+    client.write_all(&query(sql)).await.unwrap();
+    soon(read_until_ready(&mut client)).await.unwrap();
+    assert_eq!(seen.messages(), [query(sql)]);
+    let counters = proxy.status.counters();
+    assert_eq!(counters.rule_hits, 1);
+    assert_eq!(counters.actions, [1, 0, 0, 0]);
+    assert_eq!(counters.parse_failures, 0);
+    assert_eq!(proxy.status.hits().rules, functions());
+    until(|| proxy.rule_events() == [("functions".to_owned(), ActionSet::ALERT)]).await;
+
+    // Kill: the client gets the error, and the database not one message.
+    let kill = ActionSet::of(&[Action::Alert, Action::Kill]);
+    let seen = Arc::new(Seen::default());
+    let database = self::database(&seen).await;
+    let policy = answering(OnParseFailure::Allow, kill);
+    let proxy = Proxied::start(&database, policy.build().unwrap(), Some(&pool), PATIENCE).await;
+    let mut client = proxy.log_in().await;
+    client
+        .write_all(&query("SELECT PG_CATALOG.PG_SLEEP(0)"))
+        .await
+        .unwrap();
+    assert!(is_fatal(&read_to_end(&mut client).await));
+    until(|| seen.ended.load(Ordering::SeqCst) == 1).await;
+    assert!(seen.messages().is_empty());
+    let counters = proxy.status.counters();
+    assert_eq!(counters.rule_hits, 1);
+    assert_eq!(counters.actions, [1, 1, 0, 0]);
+    assert_eq!(counters.parse_failures, 0);
+    assert_eq!(proxy.status.hits().rules, functions());
+    until(|| proxy.rule_events() == [("functions".to_owned(), kill)]).await;
+
+    // An exempt session: the statement goes on, and nothing is counted as
+    // a hit or reported.
+    let seen = Arc::new(Seen::default());
+    let database = self::database(&seen).await;
+    let policy = answering(OnParseFailure::Allow, kill)
+        .exemption(Exemption::new(Some("app".to_owned()), None));
+    let proxy = Proxied::start(&database, policy.build().unwrap(), Some(&pool), PATIENCE).await;
+    let mut client = proxy.log_in().await;
+    client
+        .write_all(&query("SELECT pg_sleep(0)"))
+        .await
+        .unwrap();
+    soon(read_until_ready(&mut client)).await.unwrap();
+    assert_eq!(seen.messages(), [query("SELECT pg_sleep(0)")]);
+    let counters = proxy.status.counters();
+    assert_eq!(counters.rule_hits, 0);
+    assert_eq!(counters.actions, [0, 0, 0, 0]);
+    assert!(proxy.rule_events().is_empty());
 }
