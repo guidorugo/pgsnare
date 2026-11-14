@@ -23,8 +23,15 @@
 //!   not need to empty it. It is bounded by entries and by bytes; a client
 //!   that sends ever new statements evicts old entries and nothing more.
 //!
-//! Nothing uses the pool yet: the session logic asks for an analysis in a
-//! later step.
+//! # Who asks
+//!
+//! A session whose policy has rules asks for the analysis of each
+//! statement before the statement is passed on, and holds the statement
+//! until the answer is there. `Awaited` is that wait, as the task of the
+//! session keeps it: the answer of the pool, or
+//! [`ParseFailure::TimedOut`] once the time allowed has passed, whichever
+//! comes first. A session therefore never waits for the parser for longer
+//! than that time, however long the queue is.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -32,13 +39,22 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use pgsnare_core::event::StatementDigest;
 use pgsnare_core::rules::{
     Analysis, Limits, ParseFailure, ParserThread, analyse, spawn_parser_thread,
 };
 
+use pgsnare_core::session::StatementText;
+use tokio::sync::oneshot;
+use tokio::time::{Instant, sleep_until};
+
 use crate::redact::Sha256;
+
+/// How long a session waits for the analysis of a statement, unless the
+/// runtime is told otherwise.
+pub const DEFAULT_ANALYSIS_DEADLINE: Duration = Duration::from_secs(5);
 
 /// The answer to one statement: its analysis, shared with the cache, or
 /// the reason there is none.
@@ -214,6 +230,58 @@ impl ParserPool {
             panicked: self.shared.panicked.load(Ordering::Relaxed),
             cache_entries: cache.entries.len(),
             cache_bytes: cache.bytes,
+        }
+    }
+}
+
+/// The analysis one session waits for.
+pub(crate) struct Awaited {
+    /// The `id` the session logic gave its request.
+    pub(crate) id: u64,
+    /// When the request was made.
+    pub(crate) since: Instant,
+    answer: oneshot::Receiver<Outcome>,
+    deadline: Instant,
+}
+
+impl Awaited {
+    /// Asks `pool` for the analysis of `text`, to be answered within
+    /// `patience`. This never waits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseFailure::Busy`] when the pool did not take the
+    /// statement, or when there is no pool.
+    pub(crate) fn ask(
+        pool: Option<&ParserPool>,
+        id: u64,
+        text: StatementText,
+        limits: Limits,
+        patience: Duration,
+    ) -> Result<Self, ParseFailure> {
+        let pool = pool.ok_or(ParseFailure::Busy)?;
+        let (reply, answer) = oneshot::channel();
+        pool.submit(text, limits, move |outcome| {
+            // Nobody waits any more when the session has given up or gone.
+            let _ = reply.send(outcome);
+        })?;
+        let since = Instant::now();
+        Ok(Self {
+            id,
+            since,
+            answer,
+            // A moment the clock cannot name is now.
+            deadline: since.checked_add(patience).unwrap_or(since),
+        })
+    }
+
+    /// Waits for the answer, for as long as was allowed. Dropping the wait
+    /// loses nothing: it can be taken up again.
+    pub(crate) async fn outcome(&mut self) -> Outcome {
+        tokio::select! {
+            // The pool only drops a request unanswered when it is gone.
+            answer = &mut self.answer => answer.unwrap_or(Err(ParseFailure::Busy)),
+            () = sleep_until(self.deadline) => Err(ParseFailure::TimedOut),
         }
     }
 }
