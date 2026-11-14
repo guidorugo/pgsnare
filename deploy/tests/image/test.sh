@@ -14,7 +14,8 @@
 #   1. The image names a numeric user that is not 0, its entry point is
 #      pgsnare, and its health check is `pgsnare healthcheck` in exec form.
 #   2. The image holds no shell and no package manager, and no file that
-#      can be executed other than pgsnare.
+#      the kernel would run other than pgsnare: no other binary, and no
+#      script whose interpreter is in the image.
 #   3. The binary asks for no interpreter and no shared library.
 #   4. With a read-only root filesystem, without capabilities and with
 #      `no-new-privileges`, the container finds a PostgreSQL container by
@@ -118,41 +119,83 @@ starts_pgsnare() {
     fi
 }
 
-# listing IMAGE FILE: writes one line for each file of the image to FILE:
-# type and mode, size, name. The container it creates for that is never
-# started; its id is left in `listed`.
+# listing IMAGE NAME: exports the files of the image to $work/NAME.tar and
+# writes one line for each to $work/NAME.list: type and mode, size, name.
+# The container it creates for that is never started; its id is left in
+# `listed`.
 listed=""
 listing() {
     listed="$("$docker" create "$1")"
     created+=("$listed")
-    "$docker" export "$listed" \
-        | tar --list --verbose --numeric-owner \
+    "$docker" export --output "$work/$2.tar" "$listed"
+    tar --list --verbose --numeric-owner --file "$work/$2.tar" \
         | sed -E 's/^([^ ]+) +[^ ]+ +([^ ]+) +[^ ]+ +[^ ]+ (.*)$/\1 \2 \3/; s/ (->|link to) .*$//' \
-        > "$2"
+        > "$work/$2.list"
 }
 
 shells='sh|bash|dash|ash|zsh|ksh|mksh|csh|tcsh|fish|busybox|toybox'
 package_managers='apt|apt-get|apt-cache|aptitude|dpkg|dpkg-deb|apk|rpm|yum|dnf|microdnf|tdnf|zypper|pacman|opkg|pip|pip3|npm|gem|conda|nix|snap'
 
-# has_no_tools LISTING
+# runs NAME FILE: whether the kernel would run the file FILE of the export
+# NAME: it is a binary, or a script whose interpreter is in the image. It
+# prints which of the two.
+runs() {
+    local magic interpreter
+    magic="$( (tar --extract --to-stdout --occurrence=1 --file "$work/$1.tar" -- "$2" 2>/dev/null || true) \
+        | head -c 4 | od -An -tx1 | tr -d ' \n')"
+    case "$magic" in
+        7f454c46)
+            echo "$2 (a binary)"
+            return 0
+            ;;
+        2321*)
+            # `#!/bin/sh`, `#! /usr/bin/env sh`: the first word is what runs.
+            interpreter="$( (tar --extract --to-stdout --occurrence=1 --file "$work/$1.tar" -- "$2" 2>/dev/null || true) \
+                | head -c 256 | tr -d '\0' | sed -nE '1s/^#![[:space:]]*([^[:space:]]+).*$/\1/p')"
+            interpreter="${interpreter##*/}"
+            # By its name alone, whatever directory it is in: a link may
+            # lead to it under another path.
+            if [[ -z "$interpreter" ]] || awk -v name="$interpreter" '
+                    $1 !~ /^d/ { file = $0; sub(/^[^ ]+ [^ ]+ /, "", file); sub(/^.*\//, "", file)
+                                 if (file == name) found = 1 }
+                    END { exit !found }' "$work/$1.list"; then
+                echo "$2 (a script, and its interpreter is in the image)"
+                return 0
+            fi
+            ;;
+    esac
+    return 1
+}
+
+# has_no_tools NAME: the export NAME holds no shell and no package manager,
+# and nothing that can be run but pgsnare.
 has_no_tools() {
-    local found status=0
+    local found file count=0 status=0
     # Any file, link or device with the name of a shell or package manager.
-    found="$(grep -Ev '^d' "$1" | sed -E 's/^[^ ]+ [^ ]+ //' \
-        | grep -E "(^|/)($shells|$package_managers)\$" | head -n 5 || true)"
+    found="$(grep -Ev '^d' "$work/$1.list" | sed -E 's/^[^ ]+ [^ ]+ //' \
+        | grep -E "(^|/)($shells|$package_managers)\$" | sed -n '1,5p' || true)"
     if [[ -n "$found" ]]; then
         echo "the image holds a shell or a package manager:"
         echo "$found" | sed 's/^/    /'
         status=1
     fi
-    # Any file with content and an execute bit, and any hard link to one.
-    # Docker adds empty files to every container, such as /.dockerenv; they
-    # hold nothing to execute.
-    found="$( { grep -E '^-[^ ]*[xsSt]' "$1" | grep -Ev '^[^ ]+ 0 ' || true; grep -E '^h[^ ]*[xsSt]' "$1" || true; } \
-        | sed -E 's/^[^ ]+ [^ ]+ //' | grep -vxF 'usr/local/bin/pgsnare' | head -n 5 || true)"
+    # Any file that may be executed and that the kernel would run. A base
+    # image can mark a text file as executable; that runs nothing, and a
+    # script runs nothing without its interpreter. Docker adds empty files
+    # to every container, such as /.dockerenv, which hold nothing at all.
+    found=""
+    while IFS= read -r file; do
+        [[ "$file" == usr/local/bin/pgsnare ]] && continue
+        if file="$(runs "$1" "$file")"; then
+            found="$found    $file"$'\n'
+            count=$((count + 1))
+            [[ "$count" -lt 5 ]] || break
+        fi
+    done < <({ grep -E '^-[^ ]*[xsSt]' "$work/$1.list" | grep -Ev '^[^ ]+ 0 ' || true
+               grep -E '^h[^ ]*[xsSt]' "$work/$1.list" || true; } | sed -E 's/^[^ ]+ [^ ]+ //')
     if [[ -n "$found" ]]; then
-        echo "the image holds files that can be executed, other than pgsnare:"
-        echo "$found" | sed 's/^/    /'
+        echo "the image holds files that can be run, other than pgsnare:"
+        printf '%s' "$found"
         status=1
     fi
     return "$status"
@@ -210,15 +253,21 @@ must_reject "a numeric user that is not 0" user_is_numeric "$reference"
 must_pass "entry point and health check are pgsnare" starts_pgsnare "$image"
 must_reject "entry point and health check are pgsnare" starts_pgsnare "$reference"
 
-echo "image-test: the image must hold no shell, no package manager and nothing to execute but pgsnare"
-listing "$image" "$work/image.list"
+echo "image-test: the image must hold no shell, no package manager and nothing to run but pgsnare"
+listing "$image" image
 container="$listed"
-listing "$reference" "$work/reference.list"
+listing "$reference" reference
 reference_container="$listed"
 grep -qE '^-[^ ]+ [1-9][0-9]* usr/local/bin/pgsnare$' "$work/image.list" \
     || fail "the image does not hold /usr/local/bin/pgsnare"
-must_pass "no shell, no package manager, no other executable" has_no_tools "$work/image.list"
-must_reject "no shell, no package manager, no other executable" has_no_tools "$work/reference.list"
+must_pass "no shell, no package manager, nothing else to run" has_no_tools image
+must_reject "no shell, no package manager, nothing else to run" has_no_tools reference
+# The reference must be rejected for each reason by itself.
+if runs reference usr/bin/bash >/dev/null && runs reference usr/local/bin/docker-entrypoint.sh >/dev/null; then
+    echo "image-test: ok: a binary and a script of the PostgreSQL image count as files that can be run"
+else
+    fail "a binary or a script of the PostgreSQL image does not count as a file that can be run"
+fi
 # And the plain way to find out: ask for a shell.
 if "$docker" run --rm --network none --entrypoint /bin/sh "$image" -c true >/dev/null 2>&1; then
     fail "the image ran /bin/sh"
