@@ -53,6 +53,9 @@ pub struct Context<'a> {
     /// The database user the client asked for, once the startup message
     /// has been read.
     pub db_user: Option<&'a str>,
+    /// Whether the database has accepted the login. Until then
+    /// [`Context::db_user`] is only what the client claims to be.
+    pub authenticated: bool,
     /// The database the client asked for.
     pub database: Option<&'a str>,
     /// The application name the client reported, if any.

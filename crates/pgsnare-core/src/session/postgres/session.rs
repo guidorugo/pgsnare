@@ -190,11 +190,13 @@ fn context<'a>(
     cancel_request: Option<&'a [u8]>,
     policy: &'a PolicySnapshot,
     in_copy: bool,
+    authenticated: bool,
 ) -> Context<'a> {
     Context {
         policy,
         origin,
         db_user: identity.db_user.as_deref(),
+        authenticated,
         database: identity.database.as_deref(),
         application_name: identity.application_name.as_deref(),
         in_copy,
@@ -504,7 +506,7 @@ impl PostgresSession {
         }
 
         self.identity = Identity::of(message);
-        let context = context(&self.origin, &self.identity, None, policy, false);
+        let context = context(&self.origin, &self.identity, None, policy, false, false);
         let verdict = self
             .inspector
             .startup(message, &context, out)
@@ -850,6 +852,7 @@ impl PostgresSession {
             self.cancel_request.as_deref(),
             policy,
             self.half(from).in_copy,
+            self.phase == Phase::Established,
         );
         match self.inspector.frame(frame, &context, out)? {
             Verdict::Forward => destination(out, from).extend_from_slice(frame.as_bytes()),
@@ -874,6 +877,7 @@ impl PostgresSession {
             self.cancel_request.as_deref(),
             policy,
             self.half(from).in_copy,
+            self.phase == Phase::Established,
         );
         let verdict = self.inspector.stream_start(from, header, &context, out)?;
         let half = self.half_mut(from);
@@ -901,6 +905,7 @@ impl PostgresSession {
             self.cancel_request.as_deref(),
             policy,
             self.half(from).in_copy,
+            self.phase == Phase::Established,
         );
         match self.inspector.stream_chunk(from, chunk, &context, out)? {
             Verdict::Forward => {
