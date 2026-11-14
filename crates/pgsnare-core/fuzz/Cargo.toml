@@ -20,6 +20,10 @@ cargo-fuzz = true
 # Keeps this package out of any workspace above it.
 [workspace]
 
+# The same stand-in for bindgen as in the workspace: see the root Cargo.toml.
+[patch.crates-io]
+bindgen = { path = "../../bindgen-prebuilt" }
+
 [dependencies]
 libfuzzer-sys = "0.4.13"
 pgsnare-core = { path = ".." }
@@ -36,6 +40,13 @@ debug-assertions = true
 [[bin]]
 name = "session"
 path = "fuzz_targets/session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rules"
+path = "fuzz_targets/rules.rs"
 test = false
 doc = false
 bench = false

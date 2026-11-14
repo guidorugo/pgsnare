@@ -32,6 +32,17 @@
 //!   send what is still queued. A peer that does not read cannot hold it
 //!   open.
 //!
+//! # A statement that waits for its analysis
+//!
+//! When the session logic asks for the analysis of a statement, the
+//! statement is handed to the parser threads without waiting, and the
+//! session goes on: the database is read and written as before. Only the
+//! client is not read until the answer is there, so what a client can
+//! queue behind a held statement is what one read had brought already.
+//! The answer is the analysis, or the reason there is none: the threads
+//! were busy, or the time allowed has passed. The session logic gets one
+//! of them, always.
+//!
 //! # What the proxy adds
 //!
 //! Once the database has accepted the login, the session measures how long
@@ -39,8 +50,9 @@
 //! connection to the moment everything that came of it has been written to
 //! the other. That time goes into the histogram of added latency of the
 //! [`Status`]. It includes what the session logic takes and the wait for a
-//! peer that is slow to read. It leaves out what is held back on purpose:
-//! bytes for a client that the session logic told the runtime to delay.
+//! peer that is slow to read, and the wait for the analysis of a
+//! statement. It leaves out what is held back on purpose: bytes for a
+//! client that the session logic told the runtime to delay.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -63,6 +75,8 @@ use crate::tls::{self, ClientLeg};
 
 use super::backend::{Connected, Connector};
 use super::events::{Events, new_session_id};
+#[cfg(feature = "rules")]
+use super::parser::{Awaited, Outcome, ParserPool};
 use super::status::Status;
 use super::stream::{BackendStream, ClientStream, Rewind};
 
@@ -111,6 +125,54 @@ pub(crate) struct ListenerContext {
     pub(crate) login_timeout: Duration,
     pub(crate) status: Arc<Status>,
     pub(crate) events: Arc<Events>,
+    /// The threads that analyse statements.
+    #[cfg(feature = "rules")]
+    pub(crate) parser: Option<Arc<ParserPool>>,
+    /// How long a session waits for an analysis.
+    #[cfg(feature = "rules")]
+    pub(crate) analysis_deadline: Duration,
+}
+
+/// The analysis a session waits for, if any.
+#[cfg(feature = "rules")]
+type Analysing = Option<Awaited>;
+/// A build without the SQL rules never waits for one.
+#[cfg(not(feature = "rules"))]
+type Analysing = ();
+
+/// The answer to a request for an analysis: the `id` of the request, the
+/// outcome, and when the request was made.
+#[cfg(feature = "rules")]
+type Answer = (u64, Outcome, Instant);
+#[cfg(not(feature = "rules"))]
+type Answer = std::convert::Infallible;
+
+#[cfg(feature = "rules")]
+const fn is_analysing(analysing: &Analysing) -> bool {
+    analysing.is_some()
+}
+
+#[cfg(not(feature = "rules"))]
+const fn is_analysing(_: &Analysing) -> bool {
+    false
+}
+
+/// Waits for the answer the session is waiting for, and takes it. Never
+/// returns when the session waits for none.
+#[cfg(feature = "rules")]
+async fn next_answer(analysing: &mut Analysing) -> Answer {
+    let Some(awaited) = analysing.as_mut() else {
+        return std::future::pending().await;
+    };
+    let outcome = awaited.outcome().await;
+    let answer = (awaited.id, outcome, awaited.since);
+    *analysing = None;
+    answer
+}
+
+#[cfg(not(feature = "rules"))]
+async fn next_answer(_: &mut Analysing) -> Answer {
+    std::future::pending().await
 }
 
 /// A buffer to read into, small while quiet and large while busy. What it
@@ -261,6 +323,9 @@ struct Driver {
     /// Set when the session is to end at once.
     over: bool,
     told_to_stop: bool,
+    /// The analysis the session logic waits for. The client is not read
+    /// meanwhile.
+    analysing: Analysing,
 }
 
 /// Runs one session from the accepted connection to its end.
@@ -271,7 +336,8 @@ pub(crate) async fn run(
     stage: watch::Receiver<Stage>,
 ) {
     let origin = SessionOrigin::new(new_session_id(), peer.ip(), peer.port(), false)
-        .with_client_tls_policy(context.client_tls.policy());
+        .with_client_tls_policy(context.client_tls.policy())
+        .with_listener(context.name.as_str());
     let session = context.proxy.start_session(origin);
     let login_deadline = Instant::now() + context.login_timeout;
     let (client_buffer, backend_buffer) = (
@@ -305,6 +371,7 @@ pub(crate) async fn run(
         linger_until: None,
         over: false,
         told_to_stop: false,
+        analysing: Analysing::default(),
     };
     driver.drive().await;
 }
@@ -351,8 +418,11 @@ impl Driver {
             let client_reader = client_reader.filter(|_| !self.client_closing);
             let backend_reader = backend_reader.filter(|_| !self.backend_closing);
             // Reading produces bytes for the other side, so a direction is
-            // read only while the other side keeps up.
-            let read_client = client_reader.is_some() && to_backend < HIGH_WATER;
+            // read only while the other side keeps up. And a client whose
+            // statement waits for its analysis is not read: nothing it
+            // sends is looked at until then.
+            let analysing = is_analysing(&self.analysing);
+            let read_client = client_reader.is_some() && to_backend < HIGH_WATER && !analysing;
             // Nor is the server while the client is held back, nor in a
             // tarpitted session before the last read has reached the
             // client, so such a session holds no more than one read and a
@@ -416,6 +486,10 @@ impl Driver {
                     self.hold_client_until = None;
                     self.report(Report::TarpitOver);
                     self.carry_out().await;
+                }
+                answer = next_answer(&mut self.analysing), if analysing => {
+                    active = true;
+                    self.analysed(answer).await;
                 }
                 () = &mut idle, if !shrunk => {
                     if active {
@@ -574,6 +648,53 @@ impl Driver {
         self.settle(result);
     }
 
+    /// Hands the session logic the answer it waits for, and carries out
+    /// what it then asks for.
+    #[cfg(feature = "rules")]
+    async fn analysed(&mut self, (id, outcome, since): Answer) {
+        self.report(Report::Analysed { id, outcome });
+        // The wait is time the proxy added to what goes on to the database
+        // now.
+        if self.logged_in
+            && self.to_backend_since.is_none()
+            && self.out.to_server.len() > self.backend_sent
+        {
+            self.to_backend_since = Some(since);
+        }
+        self.carry_out().await;
+    }
+
+    /// A build without the SQL rules never gets an answer.
+    #[cfg(not(feature = "rules"))]
+    fn analysed(&mut self, answer: Answer) -> std::future::Ready<()> {
+        match answer {}
+    }
+
+    /// Asks the parser threads for an analysis. The answer comes later,
+    /// unless they did not take the statement: then it is given at once.
+    #[cfg(feature = "rules")]
+    fn analyse(
+        &mut self,
+        id: u64,
+        text: pgsnare_core::session::StatementText,
+        limits: pgsnare_core::rules::Limits,
+    ) {
+        let asked = Awaited::ask(
+            self.context.parser.as_deref(),
+            id,
+            text,
+            limits,
+            self.context.analysis_deadline,
+        );
+        match asked {
+            Ok(awaited) => self.analysing = Some(awaited),
+            Err(reason) => self.report(Report::Analysed {
+                id,
+                outcome: Err(reason),
+            }),
+        }
+    }
+
     /// What follows every call into the session logic.
     async fn after(&mut self, result: Result<(), SessionError>) {
         self.settle(result);
@@ -643,6 +764,27 @@ impl Driver {
                     alpn_required,
                 } => self.accept_tls(handshake, alpn_required).await,
                 Effect::ConnectBackend => self.connect_backend().await,
+                #[cfg(feature = "rules")]
+                Effect::Analyse { id, text, limits } => self.analyse(id, text, limits),
+                #[cfg(feature = "rules")]
+                Effect::ParseFailed { reason: _, actions } => {
+                    self.context.status.parse_failed();
+                    self.context.status.actions_taken(actions);
+                }
+                #[cfg(feature = "rules")]
+                Effect::RuleHit {
+                    rule_id,
+                    exempt,
+                    actions,
+                    decided: _,
+                } => {
+                    // A hit in an exempt session triggers nothing, and
+                    // there is no counter of its own for it.
+                    if !exempt {
+                        self.context.status.rule_hit(&rule_id);
+                        self.context.status.actions_taken(actions);
+                    }
+                }
                 // An effect this runtime does not know cannot be carried
                 // out, and a session must not go on as if it had been.
                 _ => {

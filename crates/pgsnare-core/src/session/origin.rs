@@ -3,6 +3,7 @@
 //! Where a session and its messages come from.
 
 use core::net::IpAddr;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -82,6 +83,10 @@ pub struct SessionOrigin {
     pub client_tls: bool,
     /// Whether the listener offers or requires TLS on the client leg.
     pub client_tls_policy: TlsPolicy,
+    /// The name the configuration gives the listener that accepted the
+    /// connection. `None` when the runtime did not say: a rule that is
+    /// limited to named listeners then does not apply to the session.
+    pub listener: Option<Arc<str>>,
 }
 
 impl SessionOrigin {
@@ -101,7 +106,15 @@ impl SessionOrigin {
             client_port,
             client_tls,
             client_tls_policy: TlsPolicy::Disabled,
+            listener: None,
         }
+    }
+
+    /// Sets the name of the listener that accepted the connection.
+    #[must_use]
+    pub fn with_listener(mut self, name: impl Into<Arc<str>>) -> Self {
+        self.listener = Some(name.into());
+        self
     }
 
     /// Sets whether the listener offers or requires TLS on the client leg.

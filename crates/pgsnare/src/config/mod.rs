@@ -220,7 +220,12 @@ impl Config {
         }
 
         if let Some(rules) = &self.rules {
-            rules.validate(&root.field("rules"), &mut problems);
+            let names: Vec<&str> = self
+                .listeners
+                .iter()
+                .map(|listener| listener.name.as_str())
+                .collect();
+            rules.validate(&names, &root.field("rules"), &mut problems);
         }
         self.actions.validate(&root.field("actions"), &mut problems);
         self.events.validate(&root.field("events"), &mut problems);
@@ -247,15 +252,27 @@ impl Config {
         let matcher = self.matcher().map_err(|_| PolicyError::Matcher {
             reason: "the tokens could not be compiled",
         })?;
-        PolicySnapshot::builder()
+        let builder = PolicySnapshot::builder()
             .matcher(matcher)
             .generation(generation)
             .inspection(self.inspection.policy())
             .tokens(self.tokens.iter().map(Token::policy))
             .exemptions(self.exemptions.iter().map(Exemption::policy))
             .actions(self.actions.policy())
-            .query_redaction(self.events.query_redaction)
-            .build()
+            .query_redaction(self.events.query_redaction);
+        // The rules are compiled here, with the rest of the snapshot, so a
+        // reload swaps them in the same step as everything else.
+        #[cfg(feature = "rules")]
+        let builder = match &self.rules {
+            Some(rules) => {
+                builder.rules(rules.rule_set().map_err(|error| PolicyError::Setting {
+                    section: "rules",
+                    reason: error.reason,
+                })?)
+            }
+            None => builder,
+        };
+        builder.build()
     }
 
     /// Compiles the honeytokens into the matcher that finds them in

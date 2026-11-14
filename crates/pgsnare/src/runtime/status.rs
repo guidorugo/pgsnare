@@ -22,8 +22,9 @@
 //! Queries, hits, responses, statements that could not be parsed and
 //! reloads that failed are counted by [`Status::query_seen`],
 //! [`Status::token_hit`], [`Status::rule_hit`], [`Status::actions_taken`],
-//! [`Status::parse_failed`] and [`Status::reload_failed`]. Nothing calls
-//! them yet: they are the place for the code that detects and responds.
+//! [`Status::parse_failed`] and [`Status::reload_failed`]. The session
+//! logic decides, and the task that drives a session calls them for the
+//! effects it is handed.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

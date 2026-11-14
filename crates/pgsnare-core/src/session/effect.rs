@@ -2,10 +2,18 @@
 
 //! What the session logic hands back to the runtime.
 
+#[cfg(feature = "rules")]
+use core::fmt;
 use core::time::Duration;
+#[cfg(feature = "rules")]
+use std::sync::Arc;
 
 use crate::event::EventBody;
+#[cfg(feature = "rules")]
+use crate::policy::RuleId;
 use crate::policy::{ActionSet, TokenId};
+#[cfg(feature = "rules")]
+use crate::rules::{Limits, ParseFailure};
 
 use super::Leg;
 
@@ -89,6 +97,100 @@ pub enum Effect {
         /// The responses that were carried out. Empty for an exempt hit.
         actions: ActionSet,
     },
+    /// Analyse this statement on a parser thread and answer with
+    /// [`Report::Analysed`] under the same `id`.
+    ///
+    /// The session holds the message that carries the statement, and every
+    /// message of the client after it, until the answer is there. The
+    /// runtime therefore answers always, and within a time it sets: with
+    /// the analysis, or with the reason there is none. While it waits it
+    /// need not read from the client.
+    ///
+    /// [`Report::Analysed`]: super::Report::Analysed
+    #[cfg(feature = "rules")]
+    Analyse {
+        /// Tells the answer to this request from the answer to another.
+        id: u64,
+        /// The statement, exactly as the database will read it.
+        text: StatementText,
+        /// The limits the analysis runs under.
+        limits: Limits,
+    },
+    /// A statement that the rules apply to has no analysis. The runtime
+    /// counts it and the responses to it.
+    ///
+    /// This is the count only. The event, when the policy asks for one,
+    /// travels separately as [`Effect::Emit`].
+    #[cfg(feature = "rules")]
+    ParseFailed {
+        /// Why there is no analysis.
+        reason: ParseFailure,
+        /// What was done about it: nothing, `alert`, or `alert` and
+        /// `kill` when the session was ended.
+        actions: ActionSet,
+    },
+    /// A statement set off an SQL rule. The runtime counts it.
+    ///
+    /// This is the count only. The event of the hit travels separately, as
+    /// [`Effect::Emit`], because a hit can be counted without one.
+    #[cfg(feature = "rules")]
+    RuleHit {
+        /// The rule, by the id the configuration gives it.
+        rule_id: RuleId,
+        /// Whether the session is exempt, so that the hit triggers
+        /// nothing.
+        exempt: bool,
+        /// The responses the policy asks for. Empty for an exempt hit.
+        decided: ActionSet,
+        /// The responses that were carried out. Empty for an exempt hit.
+        actions: ActionSet,
+    },
+}
+
+/// The text of a statement, shared with the session that holds it.
+///
+/// Cloning it copies no text. Its `Debug` form shows the length and
+/// nothing of the text.
+#[cfg(feature = "rules")]
+#[derive(Clone)]
+pub struct StatementText(Arc<dyn AsRef<[u8]> + Send + Sync>);
+
+#[cfg(feature = "rules")]
+impl StatementText {
+    /// The text `shared` holds, without copying it.
+    #[must_use]
+    pub fn new(shared: Arc<dyn AsRef<[u8]> + Send + Sync>) -> Self {
+        Self(shared)
+    }
+
+    /// The bytes of the statement.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        (*self.0).as_ref()
+    }
+}
+
+#[cfg(feature = "rules")]
+impl AsRef<[u8]> for StatementText {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+#[cfg(feature = "rules")]
+impl PartialEq for StatementText {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+#[cfg(feature = "rules")]
+impl fmt::Debug for StatementText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StatementText")
+            .field("bytes", &self.as_bytes().len())
+            .finish()
+    }
 }
 
 /// Everything one step of the session logic produced.

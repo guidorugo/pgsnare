@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
-# The members are pgsnare-proto, pgsnare-core and pgsnare. They are matched by
+# The members are pgsnare-proto, pgsnare-core, pgsnare, and bindgen-prebuilt,
+# which only the build of the SQL parser uses. They are matched by
 # a pattern because cargo ignores `exclude` for anything below a member that
 # is listed by its full path, and the fuzz crates below must stay excluded.
 members = ["crates/*"]
@@ -30,6 +31,7 @@ bytes = "1.12.1"
 clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 getrandom = { version = "0.4.3", default-features = false }
 hyper = { version = "1.12.0", default-features = false, features = ["http1", "client", "server"] }
+pg_query = "18.1.0"
 proptest = "1.12.0"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "process", "system"] }
@@ -43,6 +45,14 @@ tokio-rustls = { version = "0.26.6", default-features = false }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt"] }
 zeroize = "1.9.1"
+
+# The SQL parser asks for bindgen to write the declarations of its C
+# interface when it is built. bindgen would bring libclang and a crate that
+# loads code at run time into the build. The declarations are in
+# crates/bindgen-prebuilt instead, which stands in for it: see its
+# documentation. A fuzz crate that builds the parser has the same entry.
+[patch.crates-io]
+bindgen = { path = "crates/bindgen-prebuilt" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

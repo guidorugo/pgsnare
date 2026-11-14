@@ -27,6 +27,11 @@ use super::inspect::{Context, InspectionError, Inspector, Verdict};
 use super::messages::{self, Identity, Negotiation};
 use super::names::message_name;
 
+#[cfg(feature = "rules")]
+mod hold;
+#[cfg(all(test, feature = "rules"))]
+pub(super) use hold::MAX_BEHIND;
+
 /// The most bytes a client may hand over at once before the login begins:
 /// the largest startup packet, and what may follow it while the connection
 /// to the database is being opened, which is at most one message of the
@@ -69,6 +74,9 @@ struct Half {
     /// Whether that message is passed on at all. It is not when its header
     /// was held back.
     stream_forwarded: bool,
+    /// Whether a message is under way whose header was held back. The
+    /// receiver cannot be given the rest of it.
+    stream_withheld: bool,
 }
 
 impl Half {
@@ -80,6 +88,7 @@ impl Half {
             need: 0,
             in_copy: false,
             stream_tag: None,
+            stream_withheld: false,
             stream_forwarded: false,
         }
     }
@@ -237,6 +246,10 @@ pub struct PostgresSession {
     backend_tls: bool,
     /// The request that cancels the query of this session.
     cancel_request: Option<Vec<u8>>,
+    /// The message of the client that is held until the inspector has
+    /// decided about it, and what the client sent after it.
+    #[cfg(feature = "rules")]
+    parked: Option<hold::Parked>,
 }
 
 impl PostgresSession {
@@ -263,6 +276,8 @@ impl PostgresSession {
             login: None,
             backend_tls: false,
             cancel_request: None,
+            #[cfg(feature = "rules")]
+            parked: None,
         }
     }
 
@@ -279,14 +294,33 @@ impl PostgresSession {
 
     /// How many bytes the session holds that it has received and not yet
     /// passed on or dropped: the beginnings of messages that are not
-    /// complete.
+    /// complete, and a statement that waits for its analysis with what the
+    /// client sent after it.
     #[must_use]
     pub fn buffered_bytes(&self) -> usize {
-        self.from_client
+        let bytes = self
+            .from_client
             .held
             .len()
             .saturating_add(self.from_server.held.len())
-            .saturating_add(self.startup_for_server.len())
+            .saturating_add(self.startup_for_server.len());
+        #[cfg(feature = "rules")]
+        let bytes = bytes.saturating_add(self.parked.as_ref().map_or(0, hold::Parked::bytes));
+        bytes
+    }
+
+    /// Whether a message of the client is held until the inspector has
+    /// decided about it. Nothing the client sends is looked at until then.
+    #[must_use]
+    pub const fn holds_client(&self) -> bool {
+        #[cfg(feature = "rules")]
+        {
+            self.parked.is_some()
+        }
+        #[cfg(not(feature = "rules"))]
+        {
+            false
+        }
     }
 
     /// Whether the server has accepted the login and the session has not
@@ -344,6 +378,10 @@ impl PostgresSession {
         self.startup_for_server = Vec::new();
         self.negotiation = None;
         self.login = None;
+        #[cfg(feature = "rules")]
+        {
+            self.parked = None;
+        }
     }
 
     // ----------------------------------------------------------------------
@@ -564,6 +602,29 @@ impl PostgresSession {
         policy: &PolicySnapshot,
         out: &mut Output,
     ) -> Result<(), SessionError> {
+        // Behind a held message nothing of the client is looked at.
+        #[cfg(feature = "rules")]
+        if from == Direction::FromClient && self.parked.is_some() {
+            return self.queue_behind(input);
+        }
+        let unhandled = self.pump_some(from, input, policy, out)?;
+        #[cfg(feature = "rules")]
+        self.keep_unhandled(input, unhandled)?;
+        #[cfg(not(feature = "rules"))]
+        let _ = unhandled;
+        Ok(())
+    }
+
+    /// Does the work of [`Self::pump`] and returns how many bytes at the
+    /// end of `input` were not handled. That is none, unless a message of
+    /// the client is held now: then it is everything behind that message.
+    fn pump_some(
+        &mut self,
+        from: Direction,
+        input: &[u8],
+        policy: &PolicySnapshot,
+        out: &mut Output,
+    ) -> Result<usize, SessionError> {
         let mut held = mem::take(&mut self.half_mut(from).held);
         let mut rest = input;
         let queued = out.to_client.len();
@@ -581,14 +642,17 @@ impl PostgresSession {
                     let to_client = out.to_client.len().saturating_sub(queued);
                     self.inspector.after_read(from, to_client, out);
                 }
-                Ok(())
+                Ok(rest.len())
             }
-            Err(fault) => self.fail(from, &fault, &held, rest, policy, out),
+            Err(fault) => self
+                .fail(from, &fault, &held, rest, policy, out)
+                .map(|()| 0),
         }
     }
 
     /// On success, everything in `held` and `rest` has been handled, or
-    /// `held` holds the beginning of a message and `rest` is empty. On a
+    /// `held` holds the beginning of a message and `rest` is empty, or a
+    /// message of the client is held and `rest` is what follows it. On a
     /// fault, `held` followed by `rest` is everything that has not been
     /// handled, beginning with the message at fault.
     fn pump_units(
@@ -664,6 +728,10 @@ impl PostgresSession {
                 return Ok(None);
             }
             if bytes.is_empty() {
+                return Ok(None);
+            }
+            // What follows a held message waits where it is.
+            if from == Direction::FromClient && self.holds_client() {
                 return Ok(None);
             }
             let limits = self.limits(policy);
@@ -864,6 +932,8 @@ impl PostgresSession {
             Verdict::Forward => destination(out, from).extend_from_slice(frame.as_bytes()),
             Verdict::Withhold => {}
             Verdict::End => self.close(),
+            #[cfg(feature = "rules")]
+            Verdict::Hold => self.park(from, frame)?,
         }
         Ok(())
     }
@@ -889,10 +959,15 @@ impl PostgresSession {
         let half = self.half_mut(from);
         half.stream_tag = Some(header.tag());
         half.stream_forwarded = verdict == Verdict::Forward;
+        half.stream_withheld = verdict == Verdict::Withhold;
         match verdict {
             Verdict::Forward => destination(out, from).extend_from_slice(&header.to_bytes()),
             Verdict::Withhold => {}
             Verdict::End => self.close(),
+            #[cfg(feature = "rules")]
+            Verdict::Hold => {
+                return Err(Fault::new("a message that arrives in parts cannot be held"));
+            }
         }
         Ok(())
     }
@@ -921,6 +996,13 @@ impl PostgresSession {
             }
             Verdict::Withhold => {}
             Verdict::End => self.close(),
+            #[cfg(feature = "rules")]
+            Verdict::Hold => {
+                return Err(Fault::new("a part of a message cannot be held"));
+            }
+        }
+        if chunk.is_last() {
+            self.half_mut(from).stream_withheld = false;
         }
         Ok(())
     }
@@ -939,7 +1021,13 @@ impl PostgresSession {
         out: &mut Output,
     ) -> Result<(), SessionError> {
         // Only a session the server has accepted may go on uninspected.
-        let fail_open = matches!(policy.inspection().on_error, OnError::FailOpen);
+        // And only one that holds nothing back: a statement that waits for
+        // its analysis must not go on without it, and the rest of a message
+        // whose beginning was held back is no message.
+        let fail_open = matches!(policy.inspection().on_error, OnError::FailOpen)
+            && !self.holds_client()
+            && !self.from_client.stream_withheld
+            && !self.from_server.stream_withheld;
         if self.phase != Phase::Established || !fail_open {
             self.close();
             return Err(fault.error);
@@ -1088,6 +1176,13 @@ impl ProtocolSession for PostgresSession {
                 out.effects.push(Effect::Close(Leg::Client));
                 Ok(())
             }
+            #[cfg(feature = "rules")]
+            (Report::Analysed { id, outcome }, Phase::Established) => {
+                self.analysed(id, outcome, policy, out)
+            }
+            // An answer nobody waits for any more.
+            #[cfg(feature = "rules")]
+            (Report::Analysed { .. }, _) => Ok(()),
             _ => {
                 self.close();
                 Err(SessionError::new(

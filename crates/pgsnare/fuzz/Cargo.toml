@@ -17,6 +17,10 @@ publish = false
 [package.metadata]
 cargo-fuzz = true
 
+# The same stand-in for bindgen as in the workspace: see the root Cargo.toml.
+[patch.crates-io]
+bindgen = { path = "../../bindgen-prebuilt" }
+
 [dependencies]
 libfuzzer-sys = "0.4.13"
 pgsnare = { path = ".." }

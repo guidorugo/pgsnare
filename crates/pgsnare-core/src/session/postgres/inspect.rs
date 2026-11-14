@@ -35,11 +35,15 @@
 //! place in the protocol.
 
 use core::fmt;
+#[cfg(feature = "rules")]
+use std::sync::Arc;
 
 use pgsnare_proto::startup::StartupMessage;
 use pgsnare_proto::{Chunk, Frame, FrameHeader};
 
 use crate::policy::PolicySnapshot;
+#[cfg(feature = "rules")]
+use crate::rules::{Analysis, ParseFailure};
 use crate::session::{Direction, Output, SessionOrigin};
 
 /// What a session knows about the message it shows to an [`Inspector`].
@@ -91,6 +95,17 @@ pub enum Verdict {
     /// receive and the effects that close the connections. The session
     /// produces nothing more.
     End,
+    /// Keep it, and every message of the client after it, until the
+    /// inspector has decided: only a whole message of the client can be
+    /// held. Messages of the server go on as before.
+    ///
+    /// The inspector asks the runtime for what it needs to decide, with
+    /// [`Effect::Analyse`], and the session asks the inspector again when
+    /// the answer is there: see [`Inspector::analysed`].
+    ///
+    /// [`Effect::Analyse`]: crate::session::Effect::Analyse
+    #[cfg(feature = "rules")]
+    Hold,
 }
 
 /// An inspector could not do its work.
@@ -212,6 +227,31 @@ pub trait Inspector: Send {
     /// it and however.
     fn copy_ended(&mut self, direction: Direction) {
         let _ = direction;
+    }
+
+    /// Called with the answer to an [`Effect::Analyse`] of this inspector,
+    /// while the session holds the message the inspector answered with
+    /// [`Verdict::Hold`].
+    ///
+    /// Returns what becomes of the held message, or `None` when the
+    /// inspector does not wait for this answer: the message then stays
+    /// held. [`Verdict::Hold`] is not an answer here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the inspector could not decide.
+    ///
+    /// [`Effect::Analyse`]: crate::session::Effect::Analyse
+    #[cfg(feature = "rules")]
+    fn analysed(
+        &mut self,
+        id: u64,
+        outcome: Result<Arc<Analysis>, ParseFailure>,
+        context: &Context<'_>,
+        out: &mut Output,
+    ) -> Result<Option<Verdict>, InspectionError> {
+        let _ = (id, outcome, context, out);
+        Ok(None)
     }
 }
 

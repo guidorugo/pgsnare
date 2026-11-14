@@ -81,12 +81,19 @@ exemptions:
 
 # Optional SQL rules. Leave the section out to use none. A rule that is left
 # out is off. This needs a build with the rules feature.
+#
+# Every rule takes three optional lists that say where it applies:
+# `listeners` and `users` (database users) name where it is on, and
+# `exclude_users` names who it is off for. A list that is left out means all.
 rules:
   on_parse_failure: alert                   # allow, alert (default) or block
-  max_parse_bytes: 1MiB                     # default 1MiB
+  # A longer statement is not parsed and follows on_parse_failure. Parsing
+  # can take about 1,500 times the size of a statement in memory, on every
+  # parser thread at once, so raise this with care.
+  max_parse_bytes: 64KiB                    # default 64KiB
   catalog_enumeration: { actions: [alert], exclude_users: [migrator] }
-  unbounded_read: { tables: [public.users], actions: [alert] }
-  row_threshold: { tables: [public.users], max_rows: 1000, actions: [alert, tarpit] }
+  unbounded_read: { tables: [public.users], actions: [alert], listeners: [main] }
+  row_threshold: { tables: [public.users], max_rows: 1000, actions: [alert, tarpit], users: [app] }
   functions: { names: [pg_read_file, pg_read_binary_file, lo_export, pg_sleep], actions: [alert] }
 
 actions:
