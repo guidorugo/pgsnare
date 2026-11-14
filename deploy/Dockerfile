@@ -108,7 +108,7 @@ LABEL org.opencontainers.image.title="pgsnare" \
 # the distribution, and keep no cache. Remove this step when the base digest
 # above is raised to one that carries a fixed zlib. This is the only package
 # touched, and nothing is installed or upgraded when the image runs.
-RUN apk upgrade --no-cache 'zlib>=1.4-r0'
+RUN apk add --no-cache --upgrade 'zlib>=1.4-r0'
 
 # The user and the home directory that the image names. Added while the image
 # is built, and not at run time. No package is installed: the CA certificates
