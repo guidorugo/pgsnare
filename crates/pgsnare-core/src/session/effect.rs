@@ -5,6 +5,7 @@
 use core::time::Duration;
 
 use crate::event::EventBody;
+use crate::policy::{ActionSet, TokenId};
 
 use super::Leg;
 
@@ -27,6 +28,14 @@ pub enum Effect {
     },
     /// Wait this long before sending the queued bytes to the client.
     Delay(Duration),
+    /// The session is tarpitted from now on, for `max_duration` at most.
+    /// Past it the runtime reports [`Report::TarpitOver`].
+    ///
+    /// [`Report::TarpitOver`]: super::Report::TarpitOver
+    Tarpit {
+        /// The longest time the session may stay tarpitted.
+        max_duration: Duration,
+    },
     /// Hand this event to the dispatcher, without waiting for it.
     Emit(Box<EventBody>),
     /// Start TLS on the client connection, as its server side, once the
@@ -60,6 +69,26 @@ pub enum Effect {
     /// have not logged in, such as the time allowed for it, no longer
     /// apply to this session.
     LoginFinished,
+    /// The client sent a message that runs a statement. The runtime counts
+    /// it.
+    QuerySeen,
+    /// A honeytoken was found in a message. The runtime counts the hit and
+    /// the responses to it.
+    ///
+    /// This is the count only. The event of a hit travels separately, as
+    /// [`Effect::Emit`], because a hit can be counted without one.
+    TokenHit {
+        /// The token, by the id the configuration gives it.
+        token_id: TokenId,
+        /// Whether the session is exempt, so that the hit triggers
+        /// nothing.
+        exempt: bool,
+        /// The responses the policy asks for at this hit, with the
+        /// escalation of the token applied. Empty for an exempt hit.
+        decided: ActionSet,
+        /// The responses that were carried out. Empty for an exempt hit.
+        actions: ActionSet,
+    },
 }
 
 /// Everything one step of the session logic produced.

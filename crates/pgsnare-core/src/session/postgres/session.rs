@@ -14,6 +14,7 @@ use pgsnare_proto::{
     Chunk, Frame, FrameError, FrameHeader, Framer, Limits, StartupError, Step, encode, frontend,
 };
 
+use crate::actions;
 use crate::event::{EventBody, EventKind};
 use crate::extension::{
     LoginDecision, LoginExchange, LoginStrategy, ProtocolSession, SessionError,
@@ -190,11 +191,13 @@ fn context<'a>(
     cancel_request: Option<&'a [u8]>,
     policy: &'a PolicySnapshot,
     in_copy: bool,
+    authenticated: bool,
 ) -> Context<'a> {
     Context {
         policy,
         origin,
         db_user: identity.db_user.as_deref(),
+        authenticated,
         database: identity.database.as_deref(),
         application_name: identity.application_name.as_deref(),
         in_copy,
@@ -504,7 +507,7 @@ impl PostgresSession {
         }
 
         self.identity = Identity::of(message);
-        let context = context(&self.origin, &self.identity, None, policy, false);
+        let context = context(&self.origin, &self.identity, None, policy, false, false);
         let verdict = self
             .inspector
             .startup(message, &context, out)
@@ -563,6 +566,7 @@ impl PostgresSession {
     ) -> Result<(), SessionError> {
         let mut held = mem::take(&mut self.half_mut(from).held);
         let mut rest = input;
+        let queued = out.to_client.len();
         match self.pump_units(from, &mut held, &mut rest, policy, out) {
             Ok(()) => {
                 let half = self.half_mut(from);
@@ -572,6 +576,10 @@ impl PostgresSession {
                     half.need = 0;
                 } else {
                     half.held = held;
+                }
+                if self.phase == Phase::Established {
+                    let to_client = out.to_client.len().saturating_sub(queued);
+                    self.inspector.after_read(from, to_client, out);
                 }
                 Ok(())
             }
@@ -850,6 +858,7 @@ impl PostgresSession {
             self.cancel_request.as_deref(),
             policy,
             self.half(from).in_copy,
+            self.phase == Phase::Established,
         );
         match self.inspector.frame(frame, &context, out)? {
             Verdict::Forward => destination(out, from).extend_from_slice(frame.as_bytes()),
@@ -874,6 +883,7 @@ impl PostgresSession {
             self.cancel_request.as_deref(),
             policy,
             self.half(from).in_copy,
+            self.phase == Phase::Established,
         );
         let verdict = self.inspector.stream_start(from, header, &context, out)?;
         let half = self.half_mut(from);
@@ -901,6 +911,7 @@ impl PostgresSession {
             self.cancel_request.as_deref(),
             policy,
             self.half(from).in_copy,
+            self.phase == Phase::Established,
         );
         match self.inspector.stream_chunk(from, chunk, &context, out)? {
             Verdict::Forward => {
@@ -1042,6 +1053,21 @@ impl ProtocolSession for PostgresSession {
         match (report, self.phase) {
             (Report::ShuttingDown, _) => self.farewell(out),
             (_, Phase::Closed) => Ok(()),
+            (Report::TarpitOver, Phase::Established) => {
+                // A client in the middle of a message cannot read an
+                // error in its place.
+                let server = &self.from_server;
+                let client_can_be_told = server.stream_tag.is_none() || !server.stream_forwarded;
+                let cancel_request = self.cancel_request().map(<[u8]>::to_vec);
+                self.close();
+                actions::kill(
+                    &policy.actions().kill,
+                    client_can_be_told,
+                    cancel_request.as_deref(),
+                    out,
+                );
+                Ok(())
+            }
             (Report::ClientTlsEstablished, Phase::AcceptingTls) => {
                 self.origin.client_tls = true;
                 self.phase = Phase::Startup;

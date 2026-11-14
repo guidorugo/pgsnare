@@ -79,6 +79,7 @@ use crate::redact::Redaction;
 use crate::tls::{BackendLeg, ClientLeg};
 
 mod backend;
+mod entropy;
 mod events;
 mod listener;
 pub mod permissions;
@@ -87,6 +88,7 @@ mod status;
 mod stream;
 
 pub use backend::Upstream;
+pub use entropy::OsEntropy;
 pub use status::{Counters, DropReason, Histogram, HitCounters, SinkCounters, SinkStatus, Status};
 
 use backend::Connector;

@@ -33,4 +33,9 @@ pub enum Report {
     /// runtime closes both connections once the bytes queued in answer to
     /// this report have been sent.
     ShuttingDown,
+    /// The session has been tarpitted for as long as
+    /// [`Effect::Tarpit`] allowed. It is killed.
+    ///
+    /// [`Effect::Tarpit`]: super::Effect::Tarpit
+    TarpitOver,
 }

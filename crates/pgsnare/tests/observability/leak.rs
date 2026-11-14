@@ -641,7 +641,7 @@ async fn nothing_that_went_in_as_a_secret_comes_out_anywhere() {
              token_files:\n  - tokens/*.yaml\n\
              tokens:\n  - id: leak-user\n    values: [{user}]\n  - id: leak-quoted\n    values: [{quoted}]\n\
              \x20 - id: leak-folded\n    values: [{folded}]\n    case_insensitive: true\n\
-             events:\n  query_redaction: full\n  labels: {{ environment: leak-test }}\n  \
+             events:\n  query_redaction: fingerprint\n  labels: {{ environment: leak-test }}\n  \
              labels_from_env: [POD_NAME]\n  sinks:\n    \
              - {{ type: webhook, url_file: {url_file}, hmac_secret_file: {signing_key} }}\n    \
              - {{ type: webhook, url: \"https://localhost:{second}/second\", hmac_secret_env: PGSNARE_LEAK_TEST_KEY }}\n    \
@@ -690,6 +690,9 @@ async fn nothing_that_went_in_as_a_secret_comes_out_anywhere() {
     .await;
     // Statements with a honeytoken, with one in hexadecimal and with a
     // password, and a parameter of a prepared statement.
+    // The session is flagged by now, so its statements are reported. The
+    // events show their fingerprint: under `full` an event shows a
+    // statement as it was sent, with a password that is written in it.
     let statement = format!(
         "SELECT '{}', '\\x{}'; ALTER ROLE app PASSWORD '{}'",
         secrets.token_quoted.text(),
@@ -751,10 +754,21 @@ async fn nothing_that_went_in_as_a_secret_comes_out_anywhere() {
     // ------------------------------------------------------------------
     // Everything that comes out
     // ------------------------------------------------------------------
-    // Two events, to six sinks.
-    until(|| pgsnare.stdout.lines().len() == 2).await;
-    until(|| first_receiver.count() == 3 && second_receiver.count() == 2).await;
-    until(|| std::fs::read_to_string(&events_file).is_ok_and(|text| text.lines().count() == 2))
+    // The two events of the messages that could not be followed, and the
+    // hits the honeytokens in this traffic raised, to six sinks. How many
+    // events the hits make depends on how they are folded, so the counts
+    // are the least there can be.
+    until(|| pgsnare.stdout.lines().len() >= 2).await;
+    until(|| {
+        pgsnare
+            .stdout
+            .lines()
+            .iter()
+            .any(|line| line.contains("\"kind\":\"token_hit\""))
+    })
+    .await;
+    until(|| first_receiver.count() >= 3 && second_receiver.count() >= 2).await;
+    until(|| std::fs::read_to_string(&events_file).is_ok_and(|text| text.lines().count() >= 2))
         .await;
     until(|| {
         syslog_datagrams
@@ -763,7 +777,7 @@ async fn nothing_that_went_in_as_a_secret_comes_out_anywhere() {
             .iter()
             .filter(|byte| **byte == b'\n')
             .count()
-            == 2
+            >= 2
     })
     .await;
     until(|| contains(&syslog_stream.lock().unwrap(), b"\"tls\":true")).await;

@@ -33,6 +33,16 @@
 //!   hand. A text with a line break or a quotation mark in it, such as a
 //!   path from the configuration, is still one field of one line.
 //!
+//! # A log never holds anything up
+//!
+//! A line is handed to one writer thread through a queue of
+//! [`MAX_QUEUED_LINES`] lines and [`MAX_QUEUED_BYTES`] bytes, and the code
+//! that logged it goes on at once. When standard error does not take what
+//! is written, as when it is a pipe nobody reads, the queue fills up and
+//! further lines are dropped and counted ([`dropped_lines`]). Once the
+//! writer can write again it says how many were lost, in a line of its
+//! own.
+//!
 //! A text is cut at [`MAX_TEXT_BYTES`] and a line has at most
 //! [`MAX_FIELDS`] fields, so that the length of a line has a bound whatever
 //! is logged.
@@ -40,6 +50,8 @@
 use std::fmt;
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 #[cfg(test)]
 use std::sync::{Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -76,14 +88,109 @@ pub const MAX_FIELDS: usize = 32;
 pub fn install(redaction: Redaction) -> bool {
     tracing_subscriber::registry()
         .with(LevelFilter::INFO)
-        .with(JsonLog::new(Destination::StandardError, redaction))
+        .with(JsonLog::new(Destination::standard_error(), redaction))
         .try_init()
         .is_ok()
+}
+
+/// The most lines waiting for the writer.
+pub const MAX_QUEUED_LINES: usize = 1024;
+
+/// The most bytes of the lines waiting for the writer.
+pub const MAX_QUEUED_BYTES: usize = 1024 * 1024;
+
+/// Lines dropped because the writer was behind, since the process started.
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// How many lines were dropped because standard error did not take them
+/// fast enough.
+#[must_use]
+pub fn dropped_lines() -> u64 {
+    DROPPED.load(Ordering::Relaxed)
+}
+
+/// The bytes waiting for the writer of standard error, once it runs.
+static QUEUED: std::sync::OnceLock<Arc<AtomicUsize>> = std::sync::OnceLock::new();
+
+/// Waits until the writer has written every line logged so far, but no
+/// longer than `limit`.
+pub fn flush(limit: std::time::Duration) {
+    let Some(queued) = QUEUED.get() else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    while queued.load(Ordering::Relaxed) > 0 && started.elapsed() < limit {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// The sending end of the queue of lines. Pushing never waits.
+#[derive(Clone)]
+struct Queue {
+    lines: SyncSender<Vec<u8>>,
+    /// The bytes of the lines in the queue.
+    bytes: Arc<AtomicUsize>,
+    max_bytes: usize,
+    dropped: &'static AtomicU64,
+}
+
+impl Queue {
+    fn new(
+        max_lines: usize,
+        max_bytes: usize,
+        dropped: &'static AtomicU64,
+    ) -> (Self, Receiver<Vec<u8>>) {
+        let (lines, receiver) = sync_channel(max_lines);
+        let queue = Self {
+            lines,
+            bytes: Arc::new(AtomicUsize::new(0)),
+            max_bytes,
+            dropped,
+        };
+        (queue, receiver)
+    }
+
+    fn push(&self, line: &[u8]) {
+        let before = self.bytes.fetch_add(line.len(), Ordering::Relaxed);
+        let fits = before.saturating_add(line.len()) <= self.max_bytes;
+        if !fits || self.lines.try_send(line.to_vec()).is_err() {
+            self.bytes.fetch_sub(line.len(), Ordering::Relaxed);
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Writes the lines of the queue as they come, until every sender is gone,
+/// and says when lines were dropped.
+fn write_lines(
+    lines: &Receiver<Vec<u8>>,
+    bytes: &AtomicUsize,
+    dropped: &AtomicU64,
+    out: &mut impl Write,
+) {
+    let mut reported = 0;
+    while let Ok(line) = lines.recv() {
+        // A log that cannot be written to has nobody left to tell.
+        let _ = out.write_all(&line);
+        bytes.fetch_sub(line.len(), Ordering::Relaxed);
+        let total = dropped.load(Ordering::Relaxed);
+        if total > reported {
+            tracing::warn!(
+                dropped = total - reported,
+                "log lines were dropped: standard error did not take them fast enough"
+            );
+            reported = total;
+        }
+    }
 }
 
 /// Where lines are written.
 #[derive(Clone)]
 enum Destination {
+    /// The queue of the thread that writes to standard error.
+    Queue(Queue),
+    /// Standard error itself, written to by the thread that logs, when
+    /// the writer thread could not be started.
     StandardError,
     /// Kept in memory, for a test to read.
     #[cfg(test)]
@@ -91,8 +198,24 @@ enum Destination {
 }
 
 impl Destination {
+    /// Standard error, through a writer thread.
+    fn standard_error() -> Self {
+        let (queue, lines) = Queue::new(MAX_QUEUED_LINES, MAX_QUEUED_BYTES, &DROPPED);
+        let bytes = Arc::clone(&queue.bytes);
+        let started = std::thread::Builder::new()
+            .name("pgsnare-log".to_owned())
+            .spawn(move || write_lines(&lines, &bytes, &DROPPED, &mut std::io::stderr()));
+        if started.is_ok() {
+            let _ = QUEUED.set(Arc::clone(&queue.bytes));
+            Self::Queue(queue)
+        } else {
+            Self::StandardError
+        }
+    }
+
     fn write(&self, line: &[u8]) {
         match self {
+            Self::Queue(queue) => queue.push(line),
             // One call for a whole line, with the stream locked, so that
             // lines of different threads do not mix. A log that cannot be
             // written to has nobody left to tell.
@@ -302,6 +425,40 @@ mod tests {
     use super::*;
 
     const VALUE: &str = "svc.backup.8f3k2q@mail.example";
+
+    #[test]
+    fn a_log_nobody_reads_drops_lines_and_never_waits() {
+        static LOST: AtomicU64 = AtomicU64::new(0);
+        let (queue, lines) = Queue::new(2, MAX_QUEUED_BYTES, &LOST);
+        let (done, finished) = std::sync::mpsc::channel();
+        // Nobody takes the lines from `lines` while the thread logs.
+        std::thread::spawn(move || {
+            for _ in 0..10 {
+                queue.push(b"{\"message\":\"a line\"}\n");
+            }
+            let _ = done.send(());
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("logging does not wait for the reader");
+        assert_eq!(LOST.load(Ordering::Relaxed), 8);
+        drop(lines);
+    }
+
+    #[test]
+    fn the_queue_of_the_log_holds_a_bounded_number_of_bytes() {
+        static LOST: AtomicU64 = AtomicU64::new(0);
+        let (queue, lines) = Queue::new(100, 10, &LOST);
+        queue.push(b"0123456");
+        queue.push(b"0123456");
+        assert_eq!(LOST.load(Ordering::Relaxed), 1);
+        let bytes = Arc::clone(&queue.bytes);
+        drop(queue);
+        let mut out = Vec::new();
+        write_lines(&lines, &bytes, &LOST, &mut out);
+        assert_eq!(out, b"0123456");
+        assert_eq!(bytes.load(Ordering::Relaxed), 0);
+    }
 
     /// Runs `log` with this format as the log of the thread, and returns
     /// the lines it wrote.

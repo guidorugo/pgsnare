@@ -352,6 +352,18 @@ actions:
     assert!(!snapshot.is_exempt(Some("backup"), "192.0.2.6".parse().unwrap()));
     assert!(!snapshot.is_exempt(None, "192.0.2.5".parse().unwrap()));
 
+    // Its matcher finds the values of the tokens, and names each token as
+    // the policy does.
+    let found: Vec<String> = snapshot
+        .matcher()
+        .scan(b"1\tzebra-value-0001\tsvc.backup.8f3k2q@mail.example\n")
+        .map(|found| found.unwrap().token_id().as_str().to_owned())
+        .collect();
+    assert_eq!(found.len(), 2);
+    for id in &found {
+        assert!(snapshot.token(&TokenId::new(id).unwrap()).is_some());
+    }
+
     // The snapshot holds no token value.
     let shown = format!("{snapshot:?}");
     assert!(!shown.contains("svc.backup"), "{shown}");

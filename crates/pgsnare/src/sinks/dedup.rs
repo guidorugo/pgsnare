@@ -125,11 +125,15 @@ impl Dedup {
             return false;
         }
 
-        if self.windows.len() < MAX_WINDOWS {
+        // A window whose end is past the last moment the clock can tell
+        // is not opened: the event passes unfolded.
+        if self.windows.len() < MAX_WINDOWS
+            && let Some(closes) = now.checked_add(self.window)
+        {
             self.windows.insert(
                 key.clone(),
                 Window {
-                    closes: now + self.window,
+                    closes,
                     actions: raised.body.action_taken,
                     folded: 0,
                     last: None,
@@ -399,6 +403,18 @@ mod tests {
         assert_eq!(seen(&out), [(1, 1), (2, 1), (3, 1)]);
         assert_eq!(dedup.open_windows(), 0);
         assert_eq!(dedup.next_close(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_window_past_the_end_of_the_clock_lets_every_event_pass() {
+        let start = Instant::now();
+        let mut dedup = Dedup::new(Duration::MAX);
+        let mut out = Vec::new();
+        for row in 1..=2 {
+            assert!(!dedup.take(hit(1, "users-admin-backup", row), start, &mut out));
+        }
+        assert_eq!(seen(&out), [(1, 1), (2, 1)]);
+        assert_eq!(dedup.open_windows(), 0);
     }
 
     #[tokio::test(start_paused = true)]

@@ -430,11 +430,12 @@ async fn a_sink_with_a_rate_limit_is_given_no_more_than_that() {
     );
     let began = Instant::now();
 
-    // Four events for a sink that takes two per second: a second's worth
+    // Hits, which may take every place of the queue. Four for a sink
+    // that takes two per second: a second's worth
     // goes out at once, the third waits in the worker for its turn, and
     // the fourth waits in the queue.
     for row in 1..=4 {
-        dispatcher.submit(bypass(row), at(row));
+        dispatcher.submit(hit(u128::from(row), "users-admin-backup", row), at(row));
     }
     settle().await;
     assert_eq!(rows(&sink.taken()), [1, 2]);
@@ -443,7 +444,7 @@ async fn a_sink_with_a_rate_limit_is_given_no_more_than_that() {
     // Six more: the queue has room for three of them, and the other three
     // are dropped. Nothing is delivered early to make room.
     for row in 5..=10 {
-        dispatcher.submit(bypass(row), at(row));
+        dispatcher.submit(hit(u128::from(row), "users-admin-backup", row), at(row));
     }
     settle().await;
     assert_eq!(rows(&sink.taken()), [1, 2]);
@@ -743,4 +744,36 @@ async fn a_dispatcher_nobody_holds_any_more_ends_by_itself() {
     assert_eq!(rows(&sink.taken()), [1]);
     assert_eq!(status.sinks()[0].delivered, 1);
     assert_eq!(Arc::strong_count(&sink), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hit_finds_room_in_a_queue_that_lesser_events_have_filled() {
+    let stuck = Scripted::new("stuck", &[], Do::Hang);
+    let (dispatcher, status) = start(
+        settings(),
+        vec![(
+            stuck.clone(),
+            SinkOptions::new()
+                .with_queue_size(8)
+                .with_attempt_timeout(Duration::from_secs(3600)),
+        )],
+    );
+
+    // The worker holds one event for ever. The others take six of the
+    // eight places of the queue, and are dropped after that.
+    for row in 1..=20 {
+        dispatcher.submit(bypass(row), at(row));
+    }
+    settle().await;
+    let before = status.sinks()[0].clone();
+    assert_eq!(before.queue_depth + before.dropped_total(), 19);
+    assert!(before.dropped_total() >= 13);
+
+    // A hit still gets in, and so does the next one.
+    dispatcher.submit(hit(1, "users-admin-backup", 21), at(21));
+    dispatcher.submit(hit(2, "users-admin-backup", 22), at(22));
+    settle().await;
+    let after = &status.sinks()[0];
+    assert_eq!(after.queue_depth, before.queue_depth + 2);
+    assert_eq!(after.dropped, before.dropped);
 }

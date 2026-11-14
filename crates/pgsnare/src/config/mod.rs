@@ -240,8 +240,15 @@ impl Config {
     /// A checked configuration always gives a valid policy. The error is
     /// passed on all the same, so that a mistake in this crate cannot turn
     /// into a panic.
+    ///
+    /// The snapshot holds the matcher compiled from the tokens, so this
+    /// does the work of [`Config::matcher`] and belongs off the data path.
     pub fn policy(&self, generation: u64) -> Result<PolicySnapshot, PolicyError> {
+        let matcher = self.matcher().map_err(|_| PolicyError::Matcher {
+            reason: "the tokens could not be compiled",
+        })?;
         PolicySnapshot::builder()
+            .matcher(matcher)
             .generation(generation)
             .inspection(self.inspection.policy())
             .tokens(self.tokens.iter().map(Token::policy))

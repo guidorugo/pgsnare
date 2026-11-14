@@ -27,6 +27,9 @@
 //!    the labels of this instance.
 //! 4. It puts the event into the queue of every sink. A queue that is
 //!    full drops the event for its sink, and the other sinks still get it.
+//!    A quarter of each queue is kept for hits (`token_hit`, `rule_hit`):
+//!    other events are dropped once only that share is left, so a flood
+//!    of lesser events cannot crowd out a hit.
 //!
 //! # What a worker does with an event
 //!
@@ -65,7 +68,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use pgsnare_core::event::{Event, EventBody, EventId, Labels, Timestamp};
+use pgsnare_core::event::{Event, EventBody, EventId, EventKind, Labels, Timestamp};
 use pgsnare_core::extension::EventSink;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -93,9 +96,15 @@ pub(crate) struct DispatcherSettings {
     pub(crate) event_id: fn() -> EventId,
 }
 
+/// The share of the queue of a sink that only hits may take: a quarter.
+/// A queue of fewer than four places keeps none.
+const KEPT_FOR_HITS: usize = 4;
+
 /// One sink as the dispatcher sees it.
 struct Outlet {
     queue: mpsc::Sender<Arc<Event>>,
+    /// The places of the queue that only a hit may take.
+    kept_for_hits: usize,
     status: Arc<SinkStatus>,
     full: LogGate,
 }
@@ -159,6 +168,7 @@ impl Dispatcher {
             let busy = Arc::new(AtomicBool::new(false));
             outlets.push(Outlet {
                 queue,
+                kept_for_hits: options.queue_size.max(1) / KEPT_FOR_HITS,
                 status: Arc::clone(&sink_status),
                 full: LogGate::new(),
             });
@@ -380,10 +390,13 @@ impl Core {
     fn deliver_due(&mut self) {
         for raised in self.due.drain(..) {
             let Raised { body, at } = raised;
+            let is_hit = matches!(body.kind, EventKind::TokenHit | EventKind::RuleHit);
             let event = Arc::new((*body).seal((self.event_id)(), at, self.labels.clone()));
             for outlet in &mut self.outlets {
                 outlet.status.queued();
-                if outlet.queue.try_send(Arc::clone(&event)).is_ok() {
+                // A flood of lesser events cannot crowd out a hit.
+                let room = is_hit || outlet.queue.capacity() > outlet.kept_for_hits;
+                if room && outlet.queue.try_send(Arc::clone(&event)).is_ok() {
                     continue;
                 }
                 outlet.status.dequeued();

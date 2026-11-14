@@ -63,26 +63,41 @@
 //!
 //! The session shows everything it is about to pass on to an
 //! [`Inspector`], which decides whether it goes through. That is the one
-//! place where detection attaches. The inspector that ships today,
-//! [`PassThrough`], lets everything through.
+//! place where detection attaches. [`Scanner`] is the inspector that looks
+//! for honeytokens, and [`Postgres::scanning`] installs it. [`PassThrough`]
+//! lets everything through.
 //!
 //! [`LoginStrategy`]: crate::extension::LoginStrategy
 //! [`ProtocolModule`]: crate::extension::ProtocolModule
 
 use std::sync::Arc;
 
+use crate::event::StatementDigest;
 use crate::extension::{LoginStrategy, ProtocolModule, ProtocolSession, TlsRequest};
 use crate::session::SessionOrigin;
 
+#[cfg(test)]
+mod fake_tests;
 mod inspect;
+#[cfg(test)]
+mod kill_tests;
 mod messages;
 mod names;
+mod scan;
+#[cfg(test)]
+mod scan_tests;
 mod session;
+#[cfg(test)]
+mod tarpit_tests;
+mod track;
+#[cfg(test)]
+mod track_tests;
 
 #[cfg(test)]
 mod tests;
 
 pub use inspect::{Context, InspectionError, Inspector, InspectorFactory, PassThrough, Verdict};
+pub use scan::{Responses, Scanner};
 pub use session::PostgresSession;
 
 /// The name PostgreSQL uses for itself in the ALPN extension of a TLS
@@ -108,6 +123,25 @@ impl Postgres {
     #[must_use]
     pub fn new() -> Self {
         Self::with_inspectors(|_: &SessionOrigin| -> Box<dyn Inspector> { Box::new(PassThrough) })
+    }
+
+    /// A module whose sessions look for the honeytokens of the policy in
+    /// everything they relay: each gets a [`Scanner`]. `digest` is the hash
+    /// function behind the fingerprint of a statement in an event.
+    #[must_use]
+    pub fn scanning(digest: Arc<dyn StatementDigest>) -> Self {
+        Self::with_inspectors(move |_: &SessionOrigin| -> Box<dyn Inspector> {
+            Box::new(Scanner::new(Arc::clone(&digest)))
+        })
+    }
+
+    /// A scanning module whose sessions also carry out `tarpit` with
+    /// `responses`.
+    #[must_use]
+    pub fn responding(digest: Arc<dyn StatementDigest>, responses: Responses) -> Self {
+        Self::with_inspectors(move |_: &SessionOrigin| -> Box<dyn Inspector> {
+            Box::new(Scanner::with_responses(Arc::clone(&digest), &responses))
+        })
     }
 
     /// A module whose sessions show what they relay to the inspectors

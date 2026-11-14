@@ -53,6 +53,9 @@ pub struct Context<'a> {
     /// The database user the client asked for, once the startup message
     /// has been read.
     pub db_user: Option<&'a str>,
+    /// Whether the database has accepted the login. Until then
+    /// [`Context::db_user`] is only what the client claims to be.
+    pub authenticated: bool,
     /// The database the client asked for.
     pub database: Option<&'a str>,
     /// The application name the client reported, if any.
@@ -197,6 +200,12 @@ pub trait Inspector: Send {
     /// carries the data.
     fn copy_started(&mut self, direction: Direction) {
         let _ = direction;
+    }
+
+    /// Called when all the bytes of one read from `direction` have been
+    /// handled, with the number of bytes that read queued for the client.
+    fn after_read(&mut self, direction: Direction, to_client: usize, out: &mut Output) {
+        let _ = (direction, to_client, out);
     }
 
     /// Called when the COPY in `direction` has ended, whichever side ended

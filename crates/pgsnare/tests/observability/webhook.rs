@@ -347,16 +347,22 @@ async fn a_receiver_that_never_answers_costs_events_and_delays_no_session() {
     let took = started.elapsed();
     assert!(took < Duration::from_secs(3), "{took:?}");
 
-    // The sink holds one event and eight wait for it. The rest were
-    // dropped, and counted.
+    // The sink holds one event and six wait for it: the last two places
+    // are kept for hits. The rest were dropped, and counted.
     until(|| receiver.count() == 1).await;
     let counters = proxy.status.counters();
     assert_eq!(counters.events_emitted, 200);
     assert_eq!(counters.events_dropped, 0);
     let sink = proxy.status.sinks().remove(0);
     assert_eq!(sink.delivered, 0);
-    assert_eq!(sink.queue_depth, 8);
-    assert_eq!(sink.dropped, [191, 0, 0, 0]);
+    assert_eq!(sink.queue_depth, 6);
+    assert_eq!(sink.dropped, [193, 0, 0, 0]);
+
+    // Hits still get in.
+    say(&mut client, "hit users-admin-backup").await;
+    say(&mut proxy.connect().await, "hit users-admin-backup").await;
+    until(|| proxy.status.sinks()[0].queue_depth == 8).await;
+    assert_eq!(proxy.status.sinks()[0].dropped, [193, 0, 0, 0]);
 
     // The attempt is given up after its three seconds, and the next event
     // gets its turn.

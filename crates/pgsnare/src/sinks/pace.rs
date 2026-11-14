@@ -51,7 +51,8 @@ impl Pace {
     pub(super) fn wait(&mut self, now: Instant) -> Duration {
         let due = self.due.max(now);
         let earliest = due.checked_sub(self.allowance).unwrap_or(now);
-        self.due = due + self.interval;
+        // At the last moment the clock can tell, the next one is due then.
+        self.due = due.checked_add(self.interval).unwrap_or(due);
         earliest.saturating_duration_since(now)
     }
 }
@@ -99,7 +100,8 @@ impl LogGate {
             self.held_back = self.held_back.saturating_add(1);
             return None;
         }
-        self.next = Some(now + LOG_INTERVAL);
+        // Past the last moment the clock can tell, every line may pass.
+        self.next = now.checked_add(LOG_INTERVAL);
         Some(std::mem::take(&mut self.held_back))
     }
 }
@@ -146,6 +148,31 @@ impl SharedLogGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The last moment the clock can tell, give or take a nanosecond.
+    fn end_of_the_clock() -> Instant {
+        let mut last = Instant::now();
+        let mut step = Duration::MAX;
+        while !step.is_zero() {
+            match last.checked_add(step) {
+                Some(later) => last = later,
+                None => step /= 2,
+            }
+        }
+        last
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_end_of_the_clock_is_no_reason_to_panic() {
+        let end = end_of_the_clock();
+        let mut pace = Pace::new(4, Instant::now());
+        for _ in 0..8 {
+            let _ = pace.wait(end);
+        }
+        let mut gate = LogGate::new();
+        assert!(gate.pass(end).is_some());
+        assert!(gate.pass(end).is_some());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn a_sink_may_deliver_a_seconds_worth_at_once_and_then_keeps_the_rate() {

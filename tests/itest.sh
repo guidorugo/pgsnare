@@ -450,6 +450,62 @@ if ! "$docker" exec "$proxy" grep -Eq '^Max core file size +0 +0 +bytes' /proc/1
     failed=1
 fi
 
+# --- A honeytoken read through pgsnare ---------------------------------------
+
+echo "itest: a honeytoken read through pgsnare must raise an event, and kill must end the session"
+# psql_as WHERE ARGUMENTS...: runs psql in the client container against
+# the database itself or through pgsnare.
+psql_as() {
+    conninfo="$1"
+    shift
+    compose --profile client run --rm --no-deps -T --entrypoint psql client \
+        --no-psqlrc --no-password --quiet --tuples-only --no-align \
+        --dbname "$conninfo dbname=postgres" "$@"
+}
+psql_as "$(direct "$first")" --command \
+    "CREATE TABLE itest_bait (v text); INSERT INTO itest_bait VALUES ('itest-bait-alert-5d83c1'); CREATE TABLE itest_bait_kill (v text); INSERT INTO itest_bait_kill VALUES ('itest-bait-kill-7e20a9')" \
+    >/dev/null
+
+# alert: the client gets the row, and an event names the token.
+if ! psql_as "$(proxied "$first")" --command "SELECT v FROM itest_bait" 2>&1 \
+    | grep -qxF "itest-bait-alert-5d83c1"; then
+    echo "itest: FAILED: a session that hit an alert token did not get its row" >&2
+    failed=1
+fi
+tries=0
+until logged "$(field kind token_hit)" "$(field token_id itest-alert)"; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 50 ]; then
+        echo "itest: FAILED: no token_hit event for the token that was read" >&2
+        failed=1
+        break
+    fi
+    sleep 0.2
+done
+
+# kill: the client gets the error of an administrator shutdown and never
+# the row, and an event names the token.
+status=0
+output="$(psql_as "$(proxied "$first")" --command "SELECT v FROM itest_bait_kill" 2>&1)" || status=$?
+if [ "$status" -eq 0 ] \
+    || ! echo "$output" | grep -qF "terminating connection due to administrator command" \
+    || echo "$output" | grep -qF "itest-bait-kill-7e20a9"; then
+    echo "itest: FAILED: a session that hit a kill token was not ended with the error, or got the row (exit status $status):" >&2
+    echo "$output" | sed 's/^/    /' >&2
+    failed=1
+fi
+tries=0
+until logged "$(field kind token_hit)" "$(field token_id itest-kill)"; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 50 ]; then
+        echo "itest: FAILED: no token_hit event for the token of kill" >&2
+        failed=1
+        break
+    fi
+    sleep 0.2
+done
+psql_as "$(direct "$first")" --command "DROP TABLE itest_bait, itest_bait_kill" >/dev/null 2>&1 || true
+
 # The last check, because it ends pgsnare: it stops on SIGTERM.
 #
 # What a look at pgsnare shows now depends on when the look is taken. So

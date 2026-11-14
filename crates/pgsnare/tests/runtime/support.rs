@@ -19,7 +19,7 @@ use pgsnare::runtime::{ListenerSettings, Runtime, Settings, Status, Upstream};
 use pgsnare::tls::{BackendLeg, ClientLeg};
 use pgsnare_core::event::Event;
 use pgsnare_core::extension::{EventSink, ProtocolModule, Relay, SinkFuture};
-use pgsnare_core::policy::{FixedPolicy, Inspection, OnError, PolicySnapshot};
+use pgsnare_core::policy::{FixedPolicy, Inspection, OnError, PolicySnapshot, PolicySource};
 use pgsnare_core::session::postgres::Postgres;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -336,12 +336,23 @@ impl Running {
     }
 
     pub async fn start_with(listener: ListenerSettings, options: ProxyOptions) -> Self {
+        let source = Arc::new(FixedPolicy::new(options.policy));
+        Self::start_from(listener, options.module, source, options.grace_period).await
+    }
+
+    /// Starts a proxy that reads its policy from `source`.
+    pub async fn start_from(
+        listener: ListenerSettings,
+        module: Arc<dyn ProtocolModule>,
+        source: Arc<dyn PolicySource>,
+        grace_period: Duration,
+    ) -> Self {
         let events = Arc::new(Memory::default());
-        let proxy = proxy_of(options.module, &events);
+        let proxy = proxy_of(module, &events);
         let runtime = Runtime::new(
             proxy,
-            Arc::new(FixedPolicy::new(options.policy)),
-            Settings::new(vec![listener]).with_grace_period(options.grace_period),
+            source,
+            Settings::new(vec![listener]).with_grace_period(grace_period),
         );
         let bound = runtime.bind().unwrap();
         let address = bound.local_addrs()[0];

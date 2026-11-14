@@ -4,7 +4,9 @@
 //!
 //! The command reads the configuration, checks the access rights of the
 //! files that hold secrets, opens the listeners and relays traffic until
-//! it is told to stop with `SIGTERM` or `SIGINT`. It then lets open
+//! it is told to stop with `SIGTERM` or `SIGINT`. `SIGHUP`, or a change
+//! to a file of the configuration, reloads the policy: see
+//! [`crate::reload`]. On `SIGTERM` or `SIGINT` it lets open
 //! sessions finish for the grace period of the configuration and exits
 //! with status 0.
 //!
@@ -20,19 +22,24 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use pgsnare_core::actions::TarpitPlaces;
+use pgsnare_core::bait::Entropy;
 use pgsnare_core::event::Labels;
 use pgsnare_core::extension::Relay;
-use pgsnare_core::policy::FixedPolicy;
-use pgsnare_core::session::postgres::Postgres;
+use pgsnare_core::session::postgres::{Postgres, Responses};
 use tokio::signal::unix::{SignalKind, signal};
 
 use crate::admin;
 use crate::builder::{Proxy, ProxyBuilder};
 use crate::config::{self, Config, UpstreamTlsMode};
-use crate::redact::{Redaction, Redactor, RedactorBuilder};
-use crate::runtime::{ListenerSettings, Runtime, Settings, Stopped, Upstream, permissions};
+use crate::redact::{Redaction, Redactor, RedactorBuilder, Sha256};
+use crate::reload::{self, Reloader, SharedPolicy, Started};
+use crate::runtime::{
+    ListenerSettings, OsEntropy, Runtime, Settings, Stopped, Upstream, permissions,
+};
 use crate::sinks;
 use crate::tls::{BackendLeg, ClientLeg};
 
@@ -63,13 +70,16 @@ pub fn run(args: &Args) -> u8 {
     // tests, keeps the first log.
     let redaction = Redaction::default();
     crate::log::install(redaction.clone());
-    match start(args, &redaction) {
+    let status = match start(args, &redaction) {
         Ok(()) => SUCCESS,
         Err(reason) => {
             tracing::error!(reason = %reason, "pgsnare cannot go on");
             FAILURE
         }
-    }
+    };
+    // The last lines are written before the process ends.
+    crate::log::flush(Duration::from_secs(2));
+    status
 }
 
 /// A panic is logged with the place it happened and nothing else: its
@@ -89,6 +99,7 @@ fn start(args: &Args, redaction: &Redaction) -> Result<(), String> {
     let loaded = config::load(&args.config).map_err(|error| error.to_string())?;
     check_permissions(&loaded, args.allow_insecure_file_permissions)?;
 
+    let files = reload::watched(&loaded);
     let config = loaded.config;
     // From here on no line of the log can show a honeytoken value.
     redaction.replace(
@@ -97,7 +108,12 @@ fn start(args: &Args, redaction: &Redaction) -> Result<(), String> {
             .map_err(|error| error.to_string())?,
     );
     let policy = config.policy(1).map_err(|error| error.to_string())?;
-    let module = Postgres::new();
+    let entropy = OsEntropy::new().map_err(|error| error.to_string())?;
+    let responses = Responses::new(
+        move || -> Box<dyn Entropy + Send> { Box::new(entropy) },
+        Arc::new(TarpitPlaces::new()),
+    );
+    let module = Postgres::responding(Arc::new(Sha256), responses);
     let listeners = listeners(&config, &module)?;
 
     // The sinks add what they must keep to themselves to what the redactor
@@ -112,13 +128,6 @@ fn start(args: &Args, redaction: &Redaction) -> Result<(), String> {
         builder = builder.event_sink_with(built.sink, built.options);
     }
     let proxy = builder.build().map_err(|error| error.to_string())?;
-
-    tracing::warn!(
-        tokens = config.tokens.len(),
-        sinks = config.events.sinks.len(),
-        "this build relays traffic and detects nothing: honeytoken detection and responses \
-         are not built yet, so the only events are those of sessions that inspection gave up on"
-    );
 
     let settings = Settings::new(listeners)
         .with_grace_period(config.shutdown.grace_period)
@@ -143,12 +152,20 @@ fn start(args: &Args, redaction: &Redaction) -> Result<(), String> {
         worker_threads = workers,
         "starting, with one worker thread for each processor this process may use"
     );
+    let started = Started {
+        path: args.config.clone(),
+        allow_insecure_file_permissions: args.allow_insecure_file_permissions,
+        config,
+        files,
+        generation: policy.generation(),
+    };
     install_panic_hook();
     runtime.block_on(serve(
         proxy,
-        Arc::new(FixedPolicy::new(policy)),
+        Arc::new(SharedPolicy::new(policy)),
         settings,
         observed,
+        started,
     ))
 }
 
@@ -163,9 +180,10 @@ struct Observed {
 
 async fn serve(
     proxy: Proxy,
-    policy: Arc<FixedPolicy>,
+    policy: Arc<SharedPolicy>,
     settings: Settings,
     observed: Observed,
+    started: Started,
 ) -> Result<(), String> {
     // The handlers are in place before the first client is accepted. As
     // process 1 of a container, pgsnare would otherwise not be stopped by
@@ -186,7 +204,17 @@ async fn serve(
             "listening"
         );
     }
-    let runtime = Runtime::new(proxy, policy, settings);
+    let runtime = Runtime::new(proxy, Arc::clone(&policy) as _, settings);
+    let reloader = Arc::new(Reloader::new(
+        started,
+        policy,
+        observed.redaction.clone(),
+        runtime.status(),
+    ));
+    let stop_watching = Arc::new(AtomicBool::new(false));
+    Arc::clone(&reloader)
+        .watch(Arc::clone(&stop_watching))
+        .map_err(|error| format!("cannot watch the configuration: {}", error.kind()))?;
 
     // The health endpoints and the metrics answer from before the first
     // client is accepted until after the last session has ended, so that
@@ -241,15 +269,15 @@ async fn serve(
                         break;
                     }
                     _ = hangup.recv() => {
-                        tracing::warn!(
-                            "received SIGHUP: reloading is not built yet, and the \
-                             configuration stays as it was read at the start"
-                        );
+                        tracing::info!("received SIGHUP: reloading the policy");
+                        let reloader = Arc::clone(&reloader);
+                        let _ = tokio::task::spawn_blocking(move || reloader.reload()).await;
                     }
                 }
             }
         })
         .await;
+    stop_watching.store(true, Ordering::Relaxed);
     let _ = stop_watchers.send(());
     let _ = watching.await;
     outcome(stopped)
