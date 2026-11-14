@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# The pgsnare image: one static binary on a base without a shell and without
-# a package manager.
+# The pgsnare image: one static binary on a small Alpine base, run by a
+# numeric user that is not root.
 #
 # Build it from the root of the repository:
 #
@@ -89,20 +89,31 @@ COPY --from=build /out/pgsnare /pgsnare
 
 # --- The image ----------------------------------------------------------------
 #
-# The base holds CA certificates, time zone data and the files that name
-# users. It has no shell, no package manager and no C library.
-FROM gcr.io/distroless/static-debian13:nonroot@sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931 AS image
+# The base holds CA certificates and the files that name users. It also holds
+# a shell (busybox) and the package manager (apk): that is the owner's choice
+# of this base. Nothing installs a package at run time: the process is not
+# root, holds no capability and has a read-only root filesystem when started
+# as the chart and the examples start it.
+FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS image
 
 LABEL org.opencontainers.image.title="pgsnare" \
       org.opencontainers.image.description="A PostgreSQL proxy that detects data theft with honeytokens" \
       org.opencontainers.image.source="https://github.com/guidorugo/pgsnare" \
       org.opencontainers.image.licenses="Apache-2.0"
 
+# The user and the home directory that the image names. Added while the image
+# is built, and not at run time. No package is installed: the CA certificates
+# come with the base.
+RUN set -eu; \
+    addgroup -g 65532 -S nonroot; \
+    adduser -u 65532 -G nonroot -S -H -h /home/nonroot -s /sbin/nologin nonroot; \
+    install -d -o 65532 -g 65532 -m 0700 /home/nonroot
+
 # Owned by root and not writable, so the process cannot replace it.
 COPY --from=build --chown=0:0 --chmod=0555 /out/pgsnare /usr/local/bin/pgsnare
 
 # A number and not a name: Kubernetes can check that a number is not 0, and
-# cannot check a name. This is the user `nonroot` of the base.
+# cannot check a name. This is the user `nonroot` made above.
 USER 65532:65532
 
 # The client port of the example configuration. The admin and metrics
@@ -113,7 +124,7 @@ EXPOSE 5432
 # `shutdown.grace_period` and ends with status 0.
 STOPSIGNAL SIGTERM
 
-# Exec form, because there is no shell. The check asks the admin listener
+# Exec form, so no shell runs for the check. It asks the admin listener
 # on the loopback interface whether the proxy works, reads no file, and
 # takes 2 seconds at most.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --start-interval=1s --retries=3 \

@@ -41,7 +41,7 @@ command -v grype >/dev/null || die "grype is not installed: deploy/tools/install
 # The severity from which a finding fails the scan.
 threshold=high
 # The distribution of the base image of deploy/Dockerfile.
-distribution=debian
+distribution=alpine
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT

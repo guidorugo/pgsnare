@@ -164,7 +164,7 @@ for arch in amd64 arm64; do
             [[ "$(tar --list --gzip --file "$1" | wc -l)" -eq 3 ]]' \
         - "$out/$name.tar.gz" "$name" "$input/pgsnare-$arch" "$root/LICENSE"
     passes "the SBOM of the $arch image is an SPDX document that lists the base" \
-        bash -c 'grep -q "\"spdxVersion\":\"SPDX-" "$1" && grep -q "\"name\":\"base-files\"" "$1"' \
+        bash -c 'grep -q "\"spdxVersion\":\"SPDX-" "$1" && grep -q "\"name\":\"alpine-baselayout\"" "$1"' \
         - "$out/pgsnare-$version-image-$arch.spdx.json"
 done
 passes "the SBOM of the binaries is an SPDX document that lists a crate of the lock file" \

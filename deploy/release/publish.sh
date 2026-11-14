@@ -184,9 +184,9 @@ for arch in "${arches[@]}"; do
     syft scan "docker-archive:$input/pgsnare-image-$arch.tar" --quiet --output "spdx-json=$sbom" \
         --source-name pgsnare --source-version "$version"
     # An SBOM that lists nothing looks like one. The base of the image
-    # always holds the package that names the distribution.
+    # always holds the package that names the distribution (alpine-baselayout).
     names_of "$sbom" > "$work/packages"
-    grep -qx 'base-files' "$work/packages" \
+    grep -qx 'alpine-baselayout' "$work/packages" \
         || die "the SBOM of the $arch image does not list the packages of its base"
 done
 say "wrote the archives and the SBOMs"

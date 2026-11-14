@@ -13,9 +13,14 @@
 #
 #   1. The image names a numeric user that is not 0, its entry point is
 #      pgsnare, and its health check is `pgsnare healthcheck` in exec form.
-#   2. The image holds no shell and no package manager, and no file that
-#      the kernel would run other than pgsnare: no other binary, and no
-#      script whose interpreter is in the image.
+#   2. The files of the image: pgsnare is owned by root and cannot be
+#      written, no file has the setuid or setgid bit, nothing but the home
+#      directory of the user belongs to anyone but root, nothing outside a
+#      sticky directory can be written by everybody, no package manager
+#      cache is left, and the CA certificates are there. (The base has a
+#      shell and a package manager: the owner chose it. The process cannot
+#      use them to install anything: it is not root, holds no capability and
+#      has a read-only root filesystem.)
 #   3. The binary asks for no interpreter and no shared library.
 #   4. With a read-only root filesystem, without capabilities and with
 #      `no-new-privileges`, the container finds a PostgreSQL container by
@@ -23,8 +28,10 @@
 #      a client log in, reports a seeded token as `token_hit`, and ends with
 #      status 0 on SIGTERM.
 #
-# Checks 1 to 3 are also run against the PostgreSQL image, which must fail
-# every one of them: a check that cannot fail proves nothing.
+# Checks 1 and 3, and the setuid check of 2, are also run against the
+# PostgreSQL image, which must fail them. The other checks of 2 are run
+# against a list of files made up in the test, which each of them must
+# refuse: a check that cannot fail proves nothing.
 #
 # The test starts containers of the Compose project in compose.yaml and
 # removes them, with their volume and network, when it ends.
@@ -120,7 +127,8 @@ starts_pgsnare() {
 }
 
 # listing IMAGE NAME: exports the files of the image to $work/NAME.tar and
-# writes one line for each to $work/NAME.list: type and mode, size, name.
+# writes one line for each to $work/NAME.list: type and mode, owner and
+# group, size, name.
 # The container it creates for that is never started; its id is left in
 # `listed`.
 listed=""
@@ -129,76 +137,81 @@ listing() {
     created+=("$listed")
     "$docker" export --output "$work/$2.tar" "$listed"
     tar --list --verbose --numeric-owner --file "$work/$2.tar" \
-        | sed -E 's/^([^ ]+) +[^ ]+ +([^ ]+) +[^ ]+ +[^ ]+ (.*)$/\1 \2 \3/; s/ (->|link to) .*$//' \
+        | sed -E 's/^([^ ]+) +([^ ]+) +([^ ]+) +[^ ]+ +[^ ]+ (.*)$/\1 \2 \3 \4/; s/ (->|link to) .*$//' \
         > "$work/$2.list"
 }
 
-shells='sh|bash|dash|ash|zsh|ksh|mksh|csh|tcsh|fish|busybox|toybox'
-package_managers='apt|apt-get|apt-cache|aptitude|dpkg|dpkg-deb|apk|rpm|yum|dnf|microdnf|tdnf|zypper|pacman|opkg|pip|pip3|npm|gem|conda|nix|snap'
-
-# runs NAME FILE: whether the kernel would run the file FILE of the export
-# NAME: it is a binary, or a script whose interpreter is in the image. It
-# prints which of the two.
-runs() {
-    local magic interpreter
-    magic="$( (tar --extract --to-stdout --occurrence=1 --file "$work/$1.tar" -- "$2" 2>/dev/null || true) \
-        | head -c 4 | od -An -tx1 | tr -d ' \n')"
-    case "$magic" in
-        7f454c46)
-            echo "$2 (a binary)"
-            return 0
-            ;;
-        2321*)
-            # `#!/bin/sh`, `#! /usr/bin/env sh`: the first word is what runs.
-            interpreter="$( (tar --extract --to-stdout --occurrence=1 --file "$work/$1.tar" -- "$2" 2>/dev/null || true) \
-                | head -c 256 | tr -d '\0' | sed -nE '1s/^#![[:space:]]*([^[:space:]]+).*$/\1/p')"
-            interpreter="${interpreter##*/}"
-            # By its name alone, whatever directory it is in: a link may
-            # lead to it under another path.
-            if [[ -z "$interpreter" ]] || awk -v name="$interpreter" '
-                    $1 !~ /^d/ { file = $0; sub(/^[^ ]+ [^ ]+ /, "", file); sub(/^.*\//, "", file)
-                                 if (file == name) found = 1 }
-                    END { exit !found }' "$work/$1.list"; then
-                echo "$2 (a script, and its interpreter is in the image)"
-                return 0
-            fi
-            ;;
-    esac
-    return 1
+# The lines of a list are "MODE OWNER SIZE NAME". MODE is the ten characters
+# of `ls -l`: the type, then three for the owner, the group and everybody
+# else; the fourth, the seventh and the tenth hold x, s or S, x, s or S, and
+# x, t or T.
+list_names() {
+    sed -E 's/^[^ ]+ [^ ]+ [^ ]+ //'
 }
 
-# has_no_tools NAME: the export NAME holds no shell and no package manager,
-# and nothing that can be run but pgsnare.
-has_no_tools() {
-    local found file count=0 status=0
-    # Any file, link or device with the name of a shell or package manager.
-    found="$(grep -Ev '^d' "$work/$1.list" | sed -E 's/^[^ ]+ [^ ]+ //' \
-        | grep -E "(^|/)($shells|$package_managers)\$" | sed -n '1,5p' || true)"
+# no_setuid NAME: no file has the setuid or the setgid bit.
+no_setuid() {
+    local found
+    found="$(awk 'substr($1, 4, 1) ~ /[sS]/ || substr($1, 7, 1) ~ /[sS]/' "$work/$1.list" | list_names | sed -n '1,5p')"
     if [[ -n "$found" ]]; then
-        echo "the image holds a shell or a package manager:"
+        echo "the image holds files with the setuid or setgid bit:"
         echo "$found" | sed 's/^/    /'
-        status=1
+        return 1
     fi
-    # Any file that may be executed and that the kernel would run. A base
-    # image can mark a text file as executable; that runs nothing, and a
-    # script runs nothing without its interpreter. Docker adds empty files
-    # to every container, such as /.dockerenv, which hold nothing at all.
-    found=""
-    while IFS= read -r file; do
-        [[ "$file" == usr/local/bin/pgsnare ]] && continue
-        if file="$(runs "$1" "$file")"; then
-            found="$found    $file"$'\n'
-            count=$((count + 1))
-            [[ "$count" -lt 5 ]] || break
-        fi
-    done < <({ grep -E '^-[^ ]*[xsSt]' "$work/$1.list" | grep -Ev '^[^ ]+ 0 ' || true
-               grep -E '^h[^ ]*[xsSt]' "$work/$1.list" || true; } | sed -E 's/^[^ ]+ [^ ]+ //')
+}
+
+# only_root_owns NAME: nothing belongs to anybody but root, except the home
+# directory of the user.
+only_root_owns() {
+    local found
+    found="$(awk '{ split($2, owner, "/"); if (owner[1] != "0") print }' "$work/$1.list" | list_names \
+        | { grep -Ev '^home/nonroot/?$' || true; } | sed -n '1,5p')"
     if [[ -n "$found" ]]; then
-        echo "the image holds files that can be run, other than pgsnare:"
-        printf '%s' "$found"
-        status=1
+        echo "the image holds files that belong to somebody but root:"
+        echo "$found" | sed 's/^/    /'
+        return 1
     fi
-    return "$status"
+}
+
+# not_writable_by_all NAME: no file or directory can be written by everybody,
+# except a directory with the sticky bit, such as /tmp.
+not_writable_by_all() {
+    local found
+    found="$(awk '$1 ~ /^[-d]/ && substr($1, 9, 1) == "w" && substr($1, 10, 1) !~ /[tT]/' "$work/$1.list" | list_names | sed -n '1,5p')"
+    if [[ -n "$found" ]]; then
+        echo "the image holds files that everybody can write:"
+        echo "$found" | sed 's/^/    /'
+        return 1
+    fi
+}
+
+# no_package_cache NAME: no package index or downloaded package is left.
+no_package_cache() {
+    local found
+    found="$(awk '$1 !~ /^d/' "$work/$1.list" | list_names \
+        | { grep -E '^(var/cache/apk|var/cache/apt|var/lib/apt/lists)/' || true; } | sed -n '1,5p')"
+    if [[ -n "$found" ]]; then
+        echo "the image keeps a package manager cache:"
+        echo "$found" | sed 's/^/    /'
+        return 1
+    fi
+}
+
+# pgsnare_is_sealed NAME: pgsnare belongs to root and nobody can write it.
+pgsnare_is_sealed() {
+    if ! grep -qE '^-r-xr-xr-x 0/0 [1-9][0-9]* usr/local/bin/pgsnare$' "$work/$1.list"; then
+        echo "/usr/local/bin/pgsnare is not a file of root, with mode 0555:"
+        grep -E ' usr/local/bin/pgsnare$' "$work/$1.list" | sed 's/^/    /' || true
+        return 1
+    fi
+}
+
+# has_certificates NAME: the file that holds the CA certificates exists.
+has_certificates() {
+    if ! grep -qE ' etc/ssl/certs/ca-certificates\.crt$' "$work/$1.list"; then
+        echo "the image has no /etc/ssl/certs/ca-certificates.crt"
+        return 1
+    fi
 }
 
 # is_static FILE
@@ -253,28 +266,45 @@ must_reject "a numeric user that is not 0" user_is_numeric "$reference"
 must_pass "entry point and health check are pgsnare" starts_pgsnare "$image"
 must_reject "entry point and health check are pgsnare" starts_pgsnare "$reference"
 
-echo "image-test: the image must hold no shell, no package manager and nothing to run but pgsnare"
+echo "image-test: the files of the image"
 listing "$image" image
 container="$listed"
 listing "$reference" reference
 reference_container="$listed"
-grep -qE '^-[^ ]+ [1-9][0-9]* usr/local/bin/pgsnare$' "$work/image.list" \
+grep -qE '^-[^ ]+ [^ ]+ [1-9][0-9]* usr/local/bin/pgsnare$' "$work/image.list" \
     || fail "the image does not hold /usr/local/bin/pgsnare"
-must_pass "no shell, no package manager, nothing else to run" has_no_tools image
-must_reject "no shell, no package manager, nothing else to run" has_no_tools reference
-# The reference must be rejected for each reason by itself.
-if runs reference usr/bin/bash >/dev/null && runs reference usr/local/bin/docker-entrypoint.sh >/dev/null; then
-    echo "image-test: ok: a binary and a script of the PostgreSQL image count as files that can be run"
-else
-    fail "a binary or a script of the PostgreSQL image does not count as a file that can be run"
-fi
-# And the plain way to find out: ask for a shell.
-if "$docker" run --rm --network none --entrypoint /bin/sh "$image" -c true >/dev/null 2>&1; then
-    fail "the image ran /bin/sh"
-fi
-if ! "$docker" run --rm --network none --entrypoint /bin/sh "$reference" -c true >/dev/null 2>&1; then
-    fail "the PostgreSQL image did not run /bin/sh, so asking for a shell proves nothing"
-fi
+must_pass "pgsnare is a file of root that nobody can write" pgsnare_is_sealed image
+must_pass "no file has the setuid or the setgid bit" no_setuid image
+must_reject "no file has the setuid or the setgid bit" no_setuid reference
+must_pass "only root owns files, apart from the home directory" only_root_owns image
+must_pass "nothing but a sticky directory can be written by everybody" not_writable_by_all image
+must_pass "no package manager cache is left" no_package_cache image
+must_pass "the CA certificates are there" has_certificates image
+
+# The checks that the PostgreSQL image does not fail by itself are shown to
+# fail on a list made up for the purpose.
+cat >"$work/made-up.list" <<'LIST'
+-rwsr-xr-x 0/0 100 usr/bin/su
+-rwxr-xr-x 0/0 100 usr/local/bin/pgsnare
+-rwxr-xr-x 1000/1000 100 usr/local/bin/other
+-rw-rw-rw- 0/0 100 etc/anything
+drwxrwxrwx 0/0 0 var/anything/
+-rw-r--r-- 0/0 100 var/cache/apk/APKINDEX.tar.gz
+-rw-r--r-- 0/0 100 var/lib/apt/lists/index
+LIST
+must_reject "pgsnare is a file of root that nobody can write" pgsnare_is_sealed made-up
+must_reject "no file has the setuid or the setgid bit" no_setuid made-up
+must_reject "only root owns files, apart from the home directory" only_root_owns made-up
+must_reject "nothing but a sticky directory can be written by everybody" not_writable_by_all made-up
+must_reject "no package manager cache is left" no_package_cache made-up
+must_reject "the CA certificates are there" has_certificates made-up
+# A sticky directory and the home directory are allowed.
+cat >"$work/allowed.list" <<'LIST'
+drwxrwxrwt 0/0 0 tmp/
+drwx------ 65532/65532 0 home/nonroot/
+LIST
+must_pass "a sticky directory and the home directory are allowed" bash -c \
+    "$(declare -f list_names not_writable_by_all only_root_owns); work='$work'; not_writable_by_all allowed && only_root_owns allowed"
 
 echo "image-test: the binary must need no interpreter and no library"
 "$docker" cp --follow-link "$container:/usr/local/bin/pgsnare" "$work/pgsnare" >/dev/null
