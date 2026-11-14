@@ -270,8 +270,17 @@ pub(super) fn single_select(text: &[u8]) -> bool {
     matches!(word.as_slice(), b"select" | b"table" | b"values")
 }
 
-/// Whether a token of `policy` may answer with `fake_data`.
+/// Whether a token of `policy`, or its row threshold, may answer with
+/// `fake_data`.
 fn wants_rows(policy: &PolicySnapshot) -> bool {
+    #[cfg(feature = "rules")]
+    if policy.rules().is_some_and(|rules| {
+        rules
+            .row_threshold_actions()
+            .is_some_and(|actions| actions.contains(Action::FakeData))
+    }) {
+        return true;
+    }
     policy.tokens().iter().any(|token| {
         token.actions.contains(Action::FakeData)
             || token
@@ -480,6 +489,14 @@ impl Raised {
         }
     }
 
+    /// Adds the responses of a rule hit in the same message.
+    #[cfg(feature = "rules")]
+    pub(super) fn with(mut self, actions: ActionSet) -> Self {
+        self.kill |= actions.contains(Action::Kill);
+        self.fake |= actions.contains(Action::FakeData);
+        self
+    }
+
     /// Ends the session if a hit asked for it, and otherwise passes the
     /// message on, or fails if a match could not be reported.
     pub(super) fn respond(
@@ -565,9 +582,11 @@ impl Ledger {
         body.db_user = context.db_user.map(str::to_owned);
         body.database = context.database.map(str::to_owned);
         body.application_name = context.application_name.map(str::to_owned);
-        body.query = place
-            .in_session
-            .then(|| place.statement.query(redaction, &*self.digest));
+        body.query = place.in_session.then(|| {
+            place
+                .statement
+                .query(redaction, &*self.digest, context.policy.matcher())
+        });
         body.session_flagged = self.flagged;
         body
     }
@@ -686,7 +705,8 @@ impl Ledger {
 
     /// Raises the hit of a rule that the statement at `place` set off, and
     /// returns the responses to carry out. `decided` is the response the
-    /// rule asks for.
+    /// rule asks for, and `rows_so_far` the rows of the result sent before
+    /// the message, for the rule that counts them.
     ///
     /// A rule hit is a hit like that of a honeytoken: an exempt session is
     /// counted and nothing else, the responses are those of
@@ -697,6 +717,7 @@ impl Ledger {
         &mut self,
         rule_id: RuleId,
         decided: ActionSet,
+        rows_so_far: Option<u64>,
         place: &Place<'_>,
         out: &mut Output,
     ) -> ActionSet {
@@ -715,6 +736,7 @@ impl Ledger {
         let mut body = self.body(EventKind::RuleHit, place);
         body.rule_id = Some(rule_id.clone());
         body.action_taken = actions;
+        body.rows_so_far = rows_so_far;
         self.flagged = true;
 
         out.effects.push(Effect::RuleHit {
@@ -858,6 +880,14 @@ const fn is_copy_data(direction: Direction, tag: u8) -> bool {
     }
 }
 
+/// Whether a message of the server is a row of a result, as the row
+/// threshold counts rows.
+#[cfg(feature = "rules")]
+fn is_row(direction: Direction, tag: u8) -> bool {
+    direction == Direction::FromServer
+        && matches!(tag, backend::tag::DATA_ROW | backend::tag::COPY_DATA)
+}
+
 /// Whether a message is one of the client that runs a statement.
 fn is_statement(direction: Direction, tag: u8) -> bool {
     direction == Direction::FromClient
@@ -933,6 +963,17 @@ impl Inspector for Scanner {
             let matcher: &Matcher = context.policy.matcher();
             self.ledger.raise(matcher.scan(frame.body()), &place, out)
         };
+        // A row may pass the row threshold. Its response joins those of
+        // the hits in the row before the session acts on any of them.
+        #[cfg(feature = "rules")]
+        let raised = if is_row(direction, tag) {
+            let actions = self
+                .rules
+                .row(self.tracker.rows(), &place, &mut self.ledger, out);
+            raised.with(actions)
+        } else {
+            raised
+        };
         let replaced = self
             .ledger
             .responder
@@ -991,6 +1032,18 @@ impl Inspector for Scanner {
                 false
             }
         };
+        // A row in parts counts like a whole one. Nothing of it has been
+        // passed on yet, so the client can still be told.
+        #[cfg(feature = "rules")]
+        if is_row(direction, tag) {
+            let actions = self
+                .rules
+                .row(self.tracker.rows(), &place, &mut self.ledger, out);
+            if actions.contains(Action::Kill) {
+                let client_can_be_told = self.from_server.chunked.is_none();
+                return Raised::by_rules(true).respond(client_can_be_told, context, out);
+            }
+        }
         let half = half_of(&mut self.from_client, &mut self.from_server, direction);
         let (stream, copy) = if is_copy_data(direction, tag) {
             (half.take_copy(context.policy), Some(half.copies_ended))

@@ -78,11 +78,15 @@ use crate::session::SessionOrigin;
 
 #[cfg(test)]
 mod fake_tests;
+#[cfg(all(test, feature = "rules"))]
+mod fingerprint_tests;
 mod inspect;
 #[cfg(test)]
 mod kill_tests;
 mod messages;
 mod names;
+#[cfg(all(test, feature = "rules"))]
+mod row_threshold_tests;
 #[cfg(all(test, feature = "rules"))]
 mod rule_hit_tests;
 #[cfg(feature = "rules")]

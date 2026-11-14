@@ -76,11 +76,14 @@ use std::sync::{Arc, OnceLock};
 use pgsnare_proto::frontend::{self, Target};
 use pgsnare_proto::{Frame, backend};
 
+use crate::detect::Matcher;
 use crate::event::{Query, StatementDigest};
 use crate::policy::QueryRedaction;
 #[cfg(feature = "rules")]
-use crate::rules::{Analysis, ParseFailure};
+use crate::rules::{Analysis, ParseFailure, RowThreshold};
 
+#[cfg(feature = "rules")]
+use super::rules::{Rows, parsed_query};
 use super::scan::single_select;
 
 /// The most messages of a client that can wait for their answer.
@@ -113,6 +116,15 @@ pub(super) struct Kept {
     /// until the answer is there, and for a text nobody asked about.
     #[cfg(feature = "rules")]
     analysis: OnceLock<Result<Arc<Analysis>, ParseFailure>>,
+    /// The row threshold the analysis armed, under the rules the text was
+    /// judged by. Empty when there is no analysis.
+    #[cfg(feature = "rules")]
+    threshold: OnceLock<Option<RowThreshold>>,
+    /// What an event shows of the text under `fingerprint` in the parser's
+    /// form, when the analysis allows it. Empty until the analysis is
+    /// there.
+    #[cfg(feature = "rules")]
+    parsed: OnceLock<Option<Query>>,
 }
 
 #[cfg(test)]
@@ -134,6 +146,10 @@ impl Kept {
             fingerprint: OnceLock::new(),
             #[cfg(feature = "rules")]
             analysis: OnceLock::new(),
+            #[cfg(feature = "rules")]
+            threshold: OnceLock::new(),
+            #[cfg(feature = "rules")]
+            parsed: OnceLock::new(),
         }
     }
 
@@ -152,9 +168,44 @@ impl Kept {
     }
 
     /// The answer of the parser, once there is one.
-    #[cfg(all(test, feature = "rules"))]
+    #[cfg(feature = "rules")]
     pub(super) fn analysis(&self) -> Option<&Result<Arc<Analysis>, ParseFailure>> {
         self.analysis.get()
+    }
+
+    /// Keeps the row threshold the analysis of the text armed. The first
+    /// one stays.
+    #[cfg(feature = "rules")]
+    pub(super) fn armed(&self, threshold: Option<RowThreshold>) {
+        let _ = self.threshold.set(threshold);
+    }
+
+    /// The row threshold the analysis of the text armed, `None` when the
+    /// text has no analysis.
+    #[cfg(feature = "rules")]
+    pub(super) fn threshold(&self) -> Option<&Option<RowThreshold>> {
+        self.threshold.get()
+    }
+
+    /// What an event shows of the text under `fingerprint` in the parser's
+    /// form, or `None` when it must show the digest. Made once from the
+    /// analysis kept with the text; only the check of the form against the
+    /// honeytokens of `matcher` is done each time, on at most
+    /// `MAX_NORMALISED_BYTES`, whatever the length of the text.
+    #[cfg(feature = "rules")]
+    fn parsed_query(&self, matcher: &Matcher) -> Option<Query> {
+        let analysis = self.analysis()?.as_ref().ok()?;
+        let parsed = self
+            .parsed
+            .get_or_init(|| parsed_query(analysis))
+            .as_ref()?;
+        let normalized = parsed.normalized.as_deref()?;
+        // A honeytoken in what is left of the text, such as a name: the
+        // digest instead.
+        if matcher.scan(normalized.as_bytes()).next().is_some() {
+            return None;
+        }
+        Some(parsed.clone())
     }
 
     fn scan_single_select(&self) -> bool {
@@ -217,14 +268,32 @@ impl Statement<'_> {
     /// What an event shows of the statement under `redaction`. Worked out
     /// once for each mode for a text the tracker holds, so a reload that
     /// changes the mode is followed.
-    pub(super) fn query(&self, redaction: QueryRedaction, digest: &dyn StatementDigest) -> Query {
+    ///
+    /// Under `fingerprint`, a text with an analysis is shown in the
+    /// parser's form, constants left out, unless that form holds a
+    /// honeytoken of `matcher` or may hold a constant still; see
+    /// `rules::parsed_query`. Otherwise it is the digest of the text.
+    pub(super) fn query(
+        &self,
+        redaction: QueryRedaction,
+        digest: &dyn StatementDigest,
+        matcher: &Matcher,
+    ) -> Query {
+        #[cfg(not(feature = "rules"))]
+        let _: &Matcher = matcher;
         match self {
             Self::Unknown => Query::unknown(redaction),
             Self::Own { bytes, .. } => Query::from_statement(bytes, redaction, digest),
             Self::Kept(kept) => {
                 let made = match redaction {
                     QueryRedaction::Full => &kept.full,
-                    QueryRedaction::Fingerprint => &kept.fingerprint,
+                    QueryRedaction::Fingerprint => {
+                        #[cfg(feature = "rules")]
+                        if let Some(parsed) = kept.parsed_query(matcher) {
+                            return parsed;
+                        }
+                        &kept.fingerprint
+                    }
                     QueryRedaction::None => return Query::withheld(),
                 };
                 made.get_or_init(|| kept.make_query(redaction, digest))
@@ -239,9 +308,6 @@ impl Statement<'_> {
     ///
     /// The answer was worked out once, when the statement arrived: a
     /// message that names the statement costs nothing for it.
-    ///
-    /// Nothing but the tests reads it yet: the rules that judge a statement
-    /// when it runs are still to come.
     #[cfg(all(test, feature = "rules"))]
     pub(super) fn analysis(&self) -> Option<&Result<Arc<Analysis>, ParseFailure>> {
         match self {
@@ -317,12 +383,24 @@ fn name(bytes: &[u8]) -> Result<Name, Unexpected> {
     Ok(bytes.into())
 }
 
+/// A portal the server has confirmed.
+struct Portal {
+    text: Arc<Kept>,
+    /// The rows the portal has returned, over every `Execute` of it.
+    #[cfg(feature = "rules")]
+    rows: Rows,
+}
+
 /// Follows the statements of one session.
 #[derive(Default)]
 pub(super) struct Tracker {
     pending: VecDeque<Pending>,
     statements: BTreeMap<Name, Text>,
-    portals: BTreeMap<Name, Text>,
+    portals: BTreeMap<Name, Portal>,
+    /// The rows of the result of the `Query` at the front of the queue,
+    /// over every statement of its text.
+    #[cfg(feature = "rules")]
+    query_rows: Rows,
     /// The bytes of statement text held.
     used: Arc<AtomicUsize>,
     /// The server skips what the client sends until a `Sync` that has not
@@ -468,6 +546,10 @@ impl Tracker {
             Step::Stay => {}
             Step::Done => {
                 if let Some(entry) = self.pending.pop_front() {
+                    #[cfg(feature = "rules")]
+                    {
+                        self.query_rows = Rows::default();
+                    }
                     self.settle(entry);
                 }
             }
@@ -612,6 +694,10 @@ impl Tracker {
         self.pending.clear();
         self.statements.clear();
         self.portals.clear();
+        #[cfg(feature = "rules")]
+        {
+            self.query_rows = Rows::default();
+        }
         self.skipping = false;
         self.lost = Some(u64::try_from(owed).unwrap_or(u64::MAX));
     }
@@ -649,11 +735,33 @@ impl Tracker {
 
     /// The text of a statement or portal the server has confirmed.
     fn confirmed(&self, target: Target, name: &[u8]) -> Text {
-        let map = match target {
-            Target::Statement => &self.statements,
-            Target::Portal => &self.portals,
-        };
-        map.get(name).cloned().flatten()
+        match target {
+            Target::Statement => self.statements.get(name).cloned().flatten(),
+            Target::Portal => self
+                .portals
+                .get(name)
+                .map(|portal| Arc::clone(&portal.text)),
+        }
+    }
+
+    /// The count of rows of the result the server is sending now: that of
+    /// the `Query` being answered, or that of the portal an `Execute` runs.
+    /// `None` when the tracker does not know which result it is.
+    ///
+    /// A result ends with its `Query`, and with its portal: a portal that
+    /// returns its rows over several `Execute`s is one result.
+    #[cfg(feature = "rules")]
+    pub(super) fn rows(&mut self) -> Option<&mut Rows> {
+        if self.is_lost() {
+            return None;
+        }
+        match self.pending.front() {
+            Some(Pending::Query(_)) => Some(&mut self.query_rows),
+            Some(Pending::Execute { portal }) => {
+                self.portals.get_mut(portal).map(|portal| &mut portal.rows)
+            }
+            _ => None,
+        }
     }
 
     /// The text of the statement or portal a message of the client names,
@@ -704,8 +812,17 @@ impl Tracker {
             } => {
                 let text = self.confirmed(Target::Statement, &statement);
                 self.portals.remove(&portal);
-                if text.is_some() && self.portals.len() < MAX_PORTALS {
-                    self.portals.insert(portal, text);
+                if let Some(text) = text
+                    && self.portals.len() < MAX_PORTALS
+                {
+                    self.portals.insert(
+                        portal,
+                        Portal {
+                            text,
+                            #[cfg(feature = "rules")]
+                            rows: Rows::default(),
+                        },
+                    );
                 }
             }
             Pending::Close {

@@ -89,7 +89,7 @@ fn functions_only(on_failure: OnParseFailure, scope: RuleScope) -> RuleSet {
 
 /// A policy with `rules`, in which one place for a tarpitted session
 /// exists.
-fn policy(rules: RuleSet) -> PolicySnapshot {
+pub(super) fn policy(rules: RuleSet) -> PolicySnapshot {
     let tarpit = TarpitSettings::new(
         Duration::from_millis(2_000),
         Duration::from_millis(30_000),
@@ -110,7 +110,7 @@ fn policy(rules: RuleSet) -> PolicySnapshot {
 /// A session of `user` on `listener` that can carry out every response,
 /// was given a cancel key, and whose server reads statements as the parser
 /// does.
-fn session_of(
+pub(super) fn session_of(
     listener: Option<&str>,
     user: &str,
     places: &Arc<TarpitPlaces>,
@@ -157,13 +157,13 @@ fn session_of(
 }
 
 /// A session of `app` on the listener `main`.
-fn session(policy: PolicySnapshot) -> Harness {
+pub(super) fn session(policy: PolicySnapshot) -> Harness {
     session_of(Some("main"), "app", &Arc::new(TarpitPlaces::new()), policy)
 }
 
 /// Sends `message`, which carries the statement `sql`, and answers the
 /// request of the session with what the parser makes of `sql`.
-fn judge(harness: &mut Harness, message: &[u8], sql: &str) {
+pub(super) fn judge(harness: &mut Harness, message: &[u8], sql: &str) {
     harness.client(message);
     let requests = asked(harness);
     assert_eq!(requests.len(), 1, "{sql}");
@@ -173,13 +173,13 @@ fn judge(harness: &mut Harness, message: &[u8], sql: &str) {
 }
 
 /// Sends `sql` as a `Query` and has it judged.
-fn run(harness: &mut Harness, sql: &str) {
+pub(super) fn run(harness: &mut Harness, sql: &str) {
     judge(harness, &query(sql), sql);
 }
 
 /// The rule hits that were counted: the rule, whether the session is
 /// exempt, what the rule asks for and what was carried out.
-fn rule_hits(harness: &Harness) -> Vec<(&str, bool, ActionSet, ActionSet)> {
+pub(super) fn rule_hits(harness: &Harness) -> Vec<(&str, bool, ActionSet, ActionSet)> {
     harness
         .effects
         .iter()
@@ -200,7 +200,7 @@ fn fired(harness: &Harness) -> Vec<&str> {
     rule_hits(harness).into_iter().map(|hit| hit.0).collect()
 }
 
-fn rule_events(harness: &Harness) -> Vec<&EventBody> {
+pub(super) fn rule_events(harness: &Harness) -> Vec<&EventBody> {
     harness
         .events()
         .into_iter()
@@ -208,7 +208,7 @@ fn rule_events(harness: &Harness) -> Vec<&EventBody> {
         .collect()
 }
 
-fn fatal() -> Vec<u8> {
+pub(super) fn fatal() -> Vec<u8> {
     let mut bytes = Vec::new();
     admin_shutdown(&mut bytes).unwrap();
     bytes

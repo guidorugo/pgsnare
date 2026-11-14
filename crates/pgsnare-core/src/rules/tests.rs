@@ -643,6 +643,75 @@ fn the_row_threshold_is_armed_by_a_read_of_a_listed_table() {
 }
 
 #[test]
+fn a_statement_that_runs_what_was_stored_arms_the_row_threshold() {
+    // `EXECUTE` and `FETCH` run a statement this analysis cannot see.
+    let rules = every_rule();
+    let armed = |sql: &str| rules.row_threshold(&read(sql), &app());
+    assert!(armed("EXECUTE stored").is_some());
+    assert!(armed("FETCH 1000 FROM c").is_some());
+    assert!(armed("SELECT 1").is_none());
+}
+
+#[test]
+fn a_result_without_an_analysis_is_held_to_the_row_threshold_of_its_scope() {
+    let rules = every_rule();
+    let threshold = rules.blind_row_threshold(&app()).unwrap();
+    assert_eq!(threshold.rule.as_str(), ROW_THRESHOLD);
+    assert_eq!(threshold.max_rows, 100);
+    assert!(
+        RuleSet::builder()
+            .build()
+            .blind_row_threshold(&app())
+            .is_none()
+    );
+    let scoped = RuleSet::builder()
+        .row_threshold(
+            &["users".to_owned()],
+            10,
+            ActionSet::ALERT,
+            RuleScope::new(None, None, &["app".to_owned()]),
+        )
+        .unwrap()
+        .build();
+    assert!(scoped.blind_row_threshold(&app()).is_none());
+    let other = Subject {
+        listener: "main",
+        user: Some("report"),
+    };
+    assert!(scoped.blind_row_threshold(&other).is_some());
+}
+
+#[test]
+fn normalising_replaces_the_constants_of_the_statements_it_walks() {
+    let normalised = |sql: &str| {
+        try_read(sql.as_bytes(), Limits::default().normalised(true))
+            .unwrap()
+            .normalised()
+            .map(str::to_owned)
+    };
+    for sql in [
+        "SELECT * FROM users WHERE pin = 4711 AND name = 'secret'",
+        "SELECT E'secret', U&'secret', B'0101', X'ff', $$secret$$, $q$secret$q$",
+        "UPDATE users SET pin = 4711 WHERE name = 'secret' RETURNING *",
+        "INSERT INTO users VALUES (4711, 'secret')",
+        "SET application_name = 'secret'",
+    ] {
+        let shown = normalised(sql).unwrap();
+        assert!(
+            !shown.contains("secret") && !shown.contains("4711"),
+            "{shown}"
+        );
+    }
+    // What the normaliser leaves: comments, and the constants of the
+    // statements it does not walk. The session falls back to the digest
+    // for these.
+    let shown = normalised("SELECT 1 /* secret */").unwrap();
+    assert!(shown.contains("secret"), "{shown}");
+    let shown = normalised("COMMENT ON TABLE users IS 'secret'").unwrap();
+    assert!(shown.contains("secret"), "{shown}");
+}
+
+#[test]
 fn a_rule_applies_per_listener_and_per_user() {
     let on = |scope: &RuleScope, listener: &str, user: Option<&str>| {
         scope.applies(&Subject { listener, user })

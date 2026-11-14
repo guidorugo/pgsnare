@@ -40,6 +40,31 @@
 //! - `fake_data`: there is no result yet that rows could be added to, so
 //!   it is carried out as `alert`, and the event says `alert`.
 //!
+//! # The row threshold
+//!
+//! The fourth rule judges a result, not a statement: it fires when a
+//! result has more rows than `max_rows`, once for that result, through the
+//! same [`Ledger::rule_hit`]. Each `DataRow` the server sends counts, and so
+//! does each `CopyData` of a `COPY ... TO STDOUT`, which the server sends
+//! one per row; a row that arrives in parts counts as well. Counting a row
+//! costs the same whatever the statement: the threshold is worked out
+//! once, when the analysis arrives, and kept with the text.
+//!
+//! - The statement arms the threshold when its analysis names a listed
+//!   table that it reads, or when it runs what an earlier statement
+//!   stored (`EXECUTE`, `FETCH`), whose tables it cannot show.
+//! - A statement without an analysis, of any reason, and a statement the
+//!   tracker does not know, may read any table: their results are held to
+//!   the threshold whenever the rule applies to the session.
+//! - A result is everything a `Query` returns, over all statements of its
+//!   text, or everything a portal returns, over all `Execute`s of it. Where
+//!   the tracker does not know the result, rows are counted together until
+//!   the transaction ends.
+//!
+//! The responses are those of the other rules, with one difference: there
+//! is a result, so `fake_data` follows the same conditions as for a
+//! honeytoken, and is carried out as `alert` where it cannot be.
+//!
 //! A statement is judged where its text arrives. An `Execute` of a
 //! prepared statement or a portal raises nothing again, and a statement
 //! prepared before a reload is not judged by the rules loaded since. The
@@ -115,6 +140,19 @@
 //!
 //! # Events
 //!
+//! Under `query_redaction: fingerprint`, an event about a statement that
+//! has an analysis shows the parser's form of it: the text with every
+//! constant replaced by a placeholder (`normalized`), and the parser's
+//! fingerprint, 16 hexadecimal digits that are the same for statements
+//! that differ only in their constants. Both are made by the parser
+//! threads with the analysis, once, and never on this thread. The digest
+//! of the whole text, 64 hexadecimal digits, takes their place when the
+//! statement has no analysis, when the form is longer than an event shows,
+//! when one of the statements of the text is of a kind whose constants
+//! the parser does not replace everywhere, when the form still holds a
+//! comment or a string, and when it holds a honeytoken of the policy in
+//! force.
+//!
 //! A `parse_failure` event names the message and shows the statement as
 //! the redaction mode of the policy allows, like any other event. It never
 //! holds the parser's own message, which quotes the statement.
@@ -126,9 +164,12 @@ use std::sync::Arc;
 use pgsnare_proto::{Frame, backend, frontend};
 
 use crate::actions;
-use crate::event::EventKind;
+use crate::event::{EventKind, Query};
+use crate::policy::QueryRedaction;
 use crate::policy::{Action, ActionSet};
-use crate::rules::{Analysis, OnParseFailure, ParseFailure, RuleSet, StatementFlags, Subject};
+use crate::rules::{
+    Analysis, OnParseFailure, ParseFailure, RowThreshold, RuleSet, StatementFlags, Subject,
+};
 use crate::session::{Direction, Effect, Output, StatementText};
 
 use super::scan::{Ledger, Place, Raised, exempts};
@@ -147,6 +188,34 @@ struct Waiting {
     name: Option<&'static str>,
 }
 
+/// The rows of one result, as the row threshold counts them.
+#[derive(Debug, Default)]
+pub(super) struct Rows {
+    /// `None` until the first row; then the threshold the result is held
+    /// to, if any. It does not change for the rest of the result.
+    armed: Option<Option<RowThreshold>>,
+    count: u64,
+    fired: bool,
+}
+
+impl Rows {
+    /// Counts one row of the result. `arm` gives the threshold, and is
+    /// called at the first row only. Returns the threshold and the count
+    /// when the result passes it, once.
+    fn count(
+        &mut self,
+        arm: impl FnOnce() -> Option<RowThreshold>,
+    ) -> Option<(&RowThreshold, u64)> {
+        let threshold = self.armed.get_or_insert_with(arm).as_ref()?;
+        self.count = self.count.saturating_add(1);
+        if self.fired || self.count <= threshold.max_rows {
+            return None;
+        }
+        self.fired = true;
+        Some((threshold, self.count))
+    }
+}
+
 /// What a scanner keeps for the SQL rules.
 #[derive(Default)]
 pub(super) struct Hook {
@@ -159,6 +228,9 @@ pub(super) struct Hook {
     /// Whether the server reported `standard_conforming_strings` as
     /// anything but `on`.
     lenient_strings: bool,
+    /// The rows of results the tracker does not know, until the
+    /// transaction ends.
+    blind: Rows,
 }
 
 /// Who the statements of a session come from.
@@ -183,6 +255,76 @@ fn rules_for<'a>(context: &'a Context<'a>) -> Option<&'a Arc<RuleSet>> {
         .policy
         .rules()
         .filter(|rules| rules.applies_to(&subject(context)))
+}
+
+/// The kinds of statement whose every constant the parser replaces when
+/// it makes its form of a text. Of other kinds, such as `COMMENT`, `CREATE
+/// VIEW` or `PREPARE`, it leaves the constants in place, and a number would
+/// get through the check of [`parsed_query`].
+const NORMALISED_KINDS: [&str; 9] = [
+    "SelectStmt",
+    "InsertStmt",
+    "UpdateStmt",
+    "DeleteStmt",
+    "MergeStmt",
+    "VariableSetStmt",
+    "TransactionStmt",
+    "CallStmt",
+    "DeclareCursorStmt",
+];
+
+/// Whether the parser's form of a text may still hold something of the
+/// text that is not a name or a keyword: a comment, which the parser keeps
+/// as written, or a string or dollar-quoted string it did not replace.
+fn may_hold_a_constant(normalised: &str) -> bool {
+    let bytes = normalised.as_bytes();
+    normalised.contains('\'')
+        || normalised.contains("--")
+        || normalised.contains("/*")
+        // A placeholder is `$` and digits; anything else after `$` is a
+        // dollar quote.
+        || bytes.iter().enumerate().any(|(at, byte)| {
+            *byte == b'$'
+                && !bytes
+                    .get(at.saturating_add(1))
+                    .is_some_and(u8::is_ascii_digit)
+        })
+}
+
+/// What an event shows of a statement under `fingerprint` in the parser's
+/// form, made from its analysis: `None` when the form is not there or may
+/// hold a constant, and the digest of the text must be shown instead.
+///
+/// The check against the honeytokens is not here, because the tokens can
+/// change with a reload: the tracker makes it each time.
+pub(super) fn parsed_query(analysis: &Analysis) -> Option<Query> {
+    let normalised = analysis.normalised()?;
+    let fingerprint = analysis.fingerprint()?;
+    if !analysis
+        .kinds()
+        .iter()
+        .all(|kind| NORMALISED_KINDS.contains(kind))
+        || may_hold_a_constant(normalised)
+    {
+        return None;
+    }
+    Some(Query::fingerprint(
+        format!("{fingerprint:016x}"),
+        Some(normalised.to_owned()),
+    ))
+}
+
+/// The row threshold a result of `statement` is held to.
+fn armed(statement: &Statement<'_>, context: &Context<'_>) -> Option<RowThreshold> {
+    if let Statement::Kept(kept) = statement
+        && let Some(armed) = kept.threshold()
+    {
+        return armed.clone();
+    }
+    context
+        .policy
+        .rules()?
+        .blind_row_threshold(&subject(context))
 }
 
 /// Counts a statement that has no analysis, raises the event the policy
@@ -230,6 +372,14 @@ impl Hook {
     /// A whole message of the server: follows the settings that decide how
     /// the database reads a statement.
     pub(super) fn server(&mut self, frame: Frame<'_>) {
+        if frame.tag() == backend::tag::READY_FOR_QUERY {
+            // Portals end with the transaction, and so does what is counted
+            // for results that are not known.
+            if frame.body().first() != Some(&b'T') {
+                self.blind = Rows::default();
+            }
+            return;
+        }
         if frame.tag() != backend::tag::PARAMETER_STATUS {
             return;
         }
@@ -287,7 +437,11 @@ impl Hook {
         let Some(rules) = rules_for(context) else {
             return Verdict::Forward;
         };
-        let limits = rules.limits();
+        // The parser's form of the statement is what an event shows under
+        // `fingerprint`, so it is made with the analysis, once.
+        let limits = rules
+            .limits()
+            .normalised(context.policy.query_redaction() == QueryRedaction::Fingerprint);
 
         let held = match sql {
             None => Err(ParseFailure::Unreadable),
@@ -416,6 +570,11 @@ impl Hook {
             }
         });
         waiting.text.analysed(outcome.clone());
+        if let Ok(analysis) = &outcome {
+            waiting
+                .text
+                .armed(waiting.rules.row_threshold(analysis, &subject(context)));
+        }
 
         let statement = Statement::Kept(Arc::clone(&waiting.text));
         let place = Place {
@@ -443,7 +602,7 @@ impl Hook {
         // acts on any of them, as for the tokens of one message.
         let mut kill = false;
         for (rule_id, decided) in waiting.rules.evaluate(&analysis, &subject(context)) {
-            let actions = ledger.rule_hit(rule_id, decided, &place, out);
+            let actions = ledger.rule_hit(rule_id, decided, None, &place, out);
             kill |= actions.contains(Action::Kill);
         }
         // Code the parser did not read: for that part there is no analysis.
@@ -462,6 +621,33 @@ impl Hook {
         Raised::by_rules(kill)
             .respond(client_can_be_told, context, out)
             .map(Some)
+    }
+
+    /// A row of a result, at `place`: a `DataRow` or a `CopyData` of the
+    /// server. `rows` is the count of the result as the tracker knows it.
+    /// Returns the responses to carry out when the row passes the row
+    /// threshold of the result.
+    pub(super) fn row(
+        &mut self,
+        rows: Option<&mut Rows>,
+        place: &Place<'_>,
+        ledger: &mut Ledger,
+        out: &mut Output,
+    ) -> ActionSet {
+        let counted = rows.unwrap_or(&mut self.blind);
+        let Some((threshold, count)) = counted.count(|| armed(place.statement, place.context))
+        else {
+            return ActionSet::EMPTY;
+        };
+        // The rows sent before this one.
+        let sent = count.saturating_sub(1);
+        ledger.rule_hit(
+            threshold.rule.clone(),
+            threshold.actions,
+            Some(sent),
+            place,
+            out,
+        )
     }
 
     /// Whether a statement waits for its analysis.

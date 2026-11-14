@@ -6,7 +6,7 @@ use core::fmt;
 
 use crate::policy::{ActionSet, RuleId};
 
-use super::analysis::{Analysis, Relation, RelationUse};
+use super::analysis::{Analysis, Relation, RelationUse, StatementFlags};
 use super::name::QualifiedName;
 use super::precheck::{DEFAULT_MAX_PARSE_BYTES, Limits};
 
@@ -282,7 +282,9 @@ impl RuleSet {
     }
 
     /// The row threshold a statement arms: set when the rule applies to
-    /// `subject` and the statement reads a listed table.
+    /// `subject` and the statement reads a listed table, or runs what an
+    /// earlier statement stored (`EXECUTE`, `FETCH`), whose tables the
+    /// analysis cannot see.
     #[must_use]
     pub fn row_threshold(
         &self,
@@ -290,14 +292,33 @@ impl RuleSet {
         subject: &Subject<'_>,
     ) -> Option<RowThreshold> {
         let rule = self.row_threshold.as_ref()?;
-        let (tables, max_rows) = &rule.what;
-        let armed = rule.scope.applies(subject)
-            && analysis.relations().iter().any(|relation| {
+        let (tables, _) = &rule.what;
+        let armed = analysis.flags().contains(StatementFlags::RUNS_STORED)
+            || analysis.relations().iter().any(|relation| {
                 relation.usage().contains(RelationUse::READ) && listed(tables, relation)
             });
-        armed.then(|| RowThreshold {
+        if armed {
+            self.blind_row_threshold(subject)
+        } else {
+            None
+        }
+    }
+
+    /// The response of the row threshold, when it is on.
+    #[must_use]
+    pub fn row_threshold_actions(&self) -> Option<ActionSet> {
+        self.row_threshold.as_ref().map(|rule| rule.actions)
+    }
+
+    /// The row threshold of a result whose statement has no analysis, or
+    /// is not known: set whenever the rule applies to `subject`, since
+    /// the statement may read any table.
+    #[must_use]
+    pub fn blind_row_threshold(&self, subject: &Subject<'_>) -> Option<RowThreshold> {
+        let rule = self.row_threshold.as_ref()?;
+        rule.scope.applies(subject).then(|| RowThreshold {
             rule: rule.id.clone(),
-            max_rows: *max_rows,
+            max_rows: rule.what.1,
             actions: rule.actions,
         })
     }
