@@ -59,7 +59,7 @@ impl fmt::Debug for RelationUse {
 
 /// What a statement text contains, beyond relations and functions.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub struct StatementFlags(u8);
+pub struct StatementFlags(u16);
 
 impl StatementFlags {
     /// Nothing of note.
@@ -78,6 +78,16 @@ impl StatementFlags {
     /// A statement that runs one that was stored earlier: `EXECUTE`,
     /// `FETCH`, `MOVE`. What runs is not in this text.
     pub const RUNS_STORED: Self = Self(32);
+    /// A statement that can change how the database reads the text of the
+    /// statements after it: `SET` or `RESET` of `client_encoding` or
+    /// `standard_conforming_strings`, `SET NAMES`, `RESET ALL`, `DISCARD`.
+    pub const SETTINGS: Self = Self(64);
+    /// A statement that stores a query or code under a name of its own:
+    /// `CREATE VIEW`, `CREATE TABLE ... AS`, `SELECT ... INTO`,
+    /// `CREATE MATERIALIZED VIEW`, `CREATE RULE`, and `CREATE FUNCTION` or
+    /// `CREATE PROCEDURE`. A later statement reaches the same rows by that
+    /// name.
+    pub const STORES: Self = Self(128);
 
     /// Whether every flag in `other` is set here too.
     #[must_use]
@@ -90,11 +100,20 @@ impl StatementFlags {
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
+
+    /// Whether any flag in `other` is set here.
+    #[must_use]
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
 }
+
+/// The function of the database that changes a setting.
+const SET_CONFIG: &str = "set_config";
 
 impl fmt::Debug for StatementFlags {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "StatementFlags({:#08b})", self.0)
+        write!(f, "StatementFlags({:#010b})", self.0)
     }
 }
 
@@ -217,6 +236,22 @@ impl Analysis {
     #[must_use]
     pub const fn flags(&self) -> StatementFlags {
         self.flags
+    }
+
+    /// Whether running the text can change how the database reads the
+    /// statements after it: it changes one of the settings that decide
+    /// that, calls the function that sets a setting, or runs code or a
+    /// stored statement that this analysis does not show.
+    #[must_use]
+    pub fn may_change_settings(&self) -> bool {
+        let hidden = StatementFlags::SETTINGS
+            .union(StatementFlags::OPAQUE_BODY)
+            .union(StatementFlags::RUNS_STORED);
+        self.flags.intersects(hidden)
+            || self
+                .functions
+                .iter()
+                .any(|function| function.name.eq_ignore_ascii_case(SET_CONFIG))
     }
 
     /// Whether everything the statements name is in the lists. When a list

@@ -282,9 +282,12 @@ impl RuleSet {
     }
 
     /// The row threshold a statement arms: set when the rule applies to
-    /// `subject` and the statement reads a listed table, or runs what an
-    /// earlier statement stored (`EXECUTE`, `FETCH`), whose tables the
-    /// analysis cannot see.
+    /// `subject` and the statement names a listed table, whatever it does
+    /// with it, or runs what an earlier statement stored (`EXECUTE`,
+    /// `FETCH`), whose tables the analysis cannot see.
+    ///
+    /// A statement that only writes a table can return its rows all the
+    /// same, so how the table is used is not asked.
     #[must_use]
     pub fn row_threshold(
         &self,
@@ -294,14 +297,35 @@ impl RuleSet {
         let rule = self.row_threshold.as_ref()?;
         let (tables, _) = &rule.what;
         let armed = analysis.flags().contains(StatementFlags::RUNS_STORED)
-            || analysis.relations().iter().any(|relation| {
-                relation.usage().contains(RelationUse::READ) && listed(tables, relation)
-            });
+            || analysis
+                .relations()
+                .iter()
+                .any(|relation| listed(tables, relation));
         if armed {
             self.blind_row_threshold(subject)
         } else {
             None
         }
+    }
+
+    /// Whether a statement stores a query or code, under a name of its
+    /// own, that can reach a table of the row threshold: it makes a view,
+    /// a table from a query, a rule or a function, and either names a
+    /// listed table or carries code the analysis does not show. Results
+    /// read by that name later do not name the table.
+    #[must_use]
+    pub fn stores_a_listed_read(&self, analysis: &Analysis) -> bool {
+        let Some(rule) = &self.row_threshold else {
+            return false;
+        };
+        let (tables, _) = &rule.what;
+        let flags = analysis.flags();
+        flags.contains(StatementFlags::OPAQUE_BODY)
+            || (flags.contains(StatementFlags::STORES)
+                && analysis
+                    .relations()
+                    .iter()
+                    .any(|relation| listed(tables, relation)))
     }
 
     /// The response of the row threshold, when it is on.

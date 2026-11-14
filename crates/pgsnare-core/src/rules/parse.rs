@@ -78,17 +78,26 @@ pub fn analyse(
 /// The reason behind an error of the parser's library. The message of a
 /// parse error quotes the statement, so it is looked at here and goes no
 /// further.
-fn failure(error: &pg_query::Error) -> ParseFailure {
+///
+/// [`ParseFailure::Rejected`] and [`ParseFailure::TooDeep`] say something
+/// about the statement, and are the same each time it is read. An error
+/// that comes from the state of the process, such as memory the parser
+/// could not get, is [`ParseFailure::Unreadable`]: nobody may keep it as
+/// the answer for the statement.
+pub(super) fn failure(error: &pg_query::Error) -> ParseFailure {
     const TOO_DEEP: [&str; 3] = [
         "stack depth limit exceeded",
         "memory exhausted",
         "parse tree is nested too deeply",
     ];
+    const NO_MEMORY: [&str; 2] = ["out of memory", "invalid memory alloc request size"];
     match error {
         pg_query::Error::Conversion(_) => ParseFailure::EmbeddedNul,
         pg_query::Error::Parse(message) => {
             if TOO_DEEP.iter().any(|start| message.starts_with(start)) {
                 ParseFailure::TooDeep
+            } else if NO_MEMORY.iter().any(|start| message.starts_with(start)) {
+                ParseFailure::Unreadable
             } else {
                 ParseFailure::Rejected
             }
@@ -119,6 +128,9 @@ struct Frame {
     /// name of a called function.
     qualifier: Option<String>,
     last_part: Option<String>,
+    /// The field that name was found in. A node can name a function in
+    /// more than one of its fields.
+    name_field: &'static str,
     /// Relations this statement reads, with whether something has narrowed
     /// the rows down so far.
     reads: Vec<(usize, bool)>,
@@ -147,6 +159,46 @@ impl Frame {
 struct Walker {
     frames: Vec<Frame>,
     analysis: Analysis,
+    /// How many of the nodes the walk is inside of are
+    /// [`DEFINED_OVER_FUNCTIONS`].
+    definitions: u32,
+}
+
+/// Statements that make or change an object that runs functions, and name
+/// those functions as the values of options: an operator, an aggregate, a
+/// type, a range, a text search parser, a foreign-data wrapper, the support
+/// function of a function. A value there that is a name or a string is
+/// taken for the name of a function.
+const DEFINED_OVER_FUNCTIONS: [&str; 8] = [
+    "DefineStmt",
+    "CreateRangeStmt",
+    "AlterOperatorStmt",
+    "AlterTypeStmt",
+    "CreateFdwStmt",
+    "AlterFdwStmt",
+    "CreateFunctionStmt",
+    "AlterFunctionStmt",
+];
+
+/// The settings that decide how the database reads the text of a
+/// statement.
+const READING_SETTINGS: [&str; 2] = ["client_encoding", "standard_conforming_strings"];
+
+/// The longest name the database keeps, in bytes.
+const IDENTIFIER_BYTES: usize = 63;
+
+/// A name as the database keeps one: cut to the length of an identifier.
+/// The parser has cut every identifier already; a string that stands where
+/// a name is expected has any length.
+fn clipped(mut name: String) -> String {
+    if name.len() > IDENTIFIER_BYTES {
+        let end = (0..=IDENTIFIER_BYTES)
+            .rev()
+            .find(|end| name.is_char_boundary(*end))
+            .unwrap_or_default();
+        name.truncate(end);
+    }
+    name
 }
 
 /// Nodes that sit between a relation and the statement that reads it.
@@ -171,11 +223,20 @@ impl Walker {
 
     fn enter(&mut self, name: &'static str) {
         match name {
-            "DoStmt" | "CreateFunctionStmt" => {
-                self.analysis.add_flags(StatementFlags::OPAQUE_BODY);
-            }
+            "DoStmt" => self.analysis.add_flags(StatementFlags::OPAQUE_BODY),
+            "CreateFunctionStmt" => self
+                .analysis
+                .add_flags(StatementFlags::OPAQUE_BODY.union(StatementFlags::STORES)),
             "ExecuteStmt" | "FetchStmt" => self.analysis.add_flags(StatementFlags::RUNS_STORED),
+            // `DISCARD ALL` sets every setting back.
+            "DiscardStmt" => self.analysis.add_flags(StatementFlags::SETTINGS),
+            "ViewStmt" | "CreateTableAsStmt" | "IntoClause" | "RuleStmt" => {
+                self.analysis.add_flags(StatementFlags::STORES);
+            }
             _ => {}
+        }
+        if DEFINED_OVER_FUNCTIONS.contains(&name) {
+            self.definitions = self.definitions.saturating_add(1);
         }
         self.frames.push(Frame {
             name,
@@ -198,6 +259,7 @@ impl Walker {
         match (top.name, top.field) {
             ("String", "sval") | ("RangeVar", "schemaname") => value.clone_into(&mut top.first),
             ("RangeVar", "relname") => value.clone_into(&mut top.second),
+            ("VariableSetStmt", "name") => value.clone_into(&mut top.first),
             ("CopyStmt", "filename") => top.has_filename = !value.is_empty(),
             _ => {}
         }
@@ -232,13 +294,36 @@ impl Walker {
             self.analysis
                 .add_function(frame.qualifier.as_deref().unwrap_or_default(), name);
         }
+        if DEFINED_OVER_FUNCTIONS.contains(&frame.name) {
+            self.definitions = self.definitions.saturating_sub(1);
+        }
         match frame.name {
             "String" => self.leave_string(frame),
+            "VariableSetStmt" => {
+                // `RESET ALL` names no setting. The database compares the
+                // names of settings without regard to case.
+                if frame.first.is_empty()
+                    || READING_SETTINGS
+                        .iter()
+                        .any(|setting| frame.first.eq_ignore_ascii_case(setting))
+                {
+                    self.analysis.add_flags(StatementFlags::SETTINGS);
+                }
+            }
             "AConst" => {
                 let mut around = self.frames.iter_mut().rev();
-                if around.next().is_some_and(|node| node.name == "Node")
-                    && let Some(statement) = around.next()
-                {
+                // A cast of a constant is a constant still: `true::bool`,
+                // `NULL::bigint`.
+                let holder = loop {
+                    if around.next().is_none_or(|node| node.name != "Node") {
+                        break None;
+                    }
+                    match around.next() {
+                        Some(cast) if cast.is("TypeCast", "arg") => {}
+                        other => break other,
+                    }
+                };
+                if let Some(statement) = holder {
                     if statement.field == "where_clause" {
                         // `WHERE true` leaves no row out.
                         statement.where_is_constant = true;
@@ -273,8 +358,15 @@ impl Walker {
                 }
             }
             "InsertStmt" => {
+                // With RETURNING, rows of the table reach the client: the
+                // new ones, and with ON CONFLICT those that were there.
+                let usage = if frame.has_returning {
+                    RelationUse::WRITTEN.union(RelationUse::READ)
+                } else {
+                    RelationUse::WRITTEN
+                };
                 for index in frame.targets {
-                    self.analysis.use_relation(index, RelationUse::WRITTEN);
+                    self.analysis.use_relation(index, usage);
                 }
             }
             "UpdateStmt" | "DeleteStmt" | "MergeStmt" => {
@@ -307,12 +399,40 @@ impl Walker {
             return;
         }
         let Some(holder) = around.next() else { return };
-        if matches!(holder.field, "funcname" | "func_name")
-            || holder.is("ObjectWithArgs", "objname")
-        {
-            holder.qualifier = holder.last_part.take();
-            holder.last_part = Some(frame.first);
+        let in_definition = self.definitions > 0;
+        let names_a_function = match (holder.name, holder.field) {
+            (_, "funcname" | "func_name")
+            | ("ObjectWithArgs", "objname")
+            | ("CreatePLangStmt", "plhandler" | "plinline" | "plvalidator")
+            | ("CreateAmStmt", "handler_name") => true,
+            // The value of an option, where options name functions:
+            // `FUNCTION = 'f'`.
+            ("DefElem", "arg") => in_definition,
+            // The same value written as a name: `FUNCTION = schema.f`,
+            // `HANDLER schema.f`.
+            ("TypeName", "names") | ("List", "items") => {
+                in_definition
+                    && around.next().is_some_and(|node| node.name == "Node")
+                    && around
+                        .next()
+                        .is_some_and(|option| option.is("DefElem", "arg"))
+            }
+            _ => false,
+        };
+        if !names_a_function {
+            return;
         }
+        // A name in another field of the same node is another function.
+        if holder.name_field != holder.field
+            && let Some(name) = holder.last_part.take()
+        {
+            let qualifier = holder.qualifier.take();
+            self.analysis
+                .add_function(qualifier.as_deref().unwrap_or_default(), &name);
+        }
+        holder.name_field = holder.field;
+        holder.qualifier = holder.last_part.take();
+        holder.last_part = Some(clipped(frame.first));
     }
 
     fn leave_relation(&mut self, frame: &Frame) {

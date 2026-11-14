@@ -107,6 +107,26 @@ fn a_message_that_quotes_the_statement_does_not_change_the_reason() {
 }
 
 #[test]
+fn an_error_that_is_not_about_the_statement_is_told_apart() {
+    use super::parse::failure;
+
+    let parse = |message: &str| failure(&pg_query::Error::Parse(message.to_owned()));
+    // The parser could not get memory: the next try may go well.
+    assert_eq!(parse("out of memory"), ParseFailure::Unreadable);
+    assert_eq!(
+        parse("invalid memory alloc request size 1073741824"),
+        ParseFailure::Unreadable
+    );
+    // These are about the statement, and the same every time.
+    assert_eq!(
+        parse("syntax error at or near \"out of memory\""),
+        ParseFailure::Rejected
+    );
+    assert_eq!(parse("memory exhausted"), ParseFailure::TooDeep);
+    assert_eq!(parse("stack depth limit exceeded"), ParseFailure::TooDeep);
+}
+
+#[test]
 fn nesting_ten_thousand_deep_never_reaches_the_parser() {
     let limits = Limits::with_max_bytes(1 << 20);
     let n = 10_000;
@@ -350,7 +370,11 @@ fn how_a_relation_is_used_is_told_apart() {
         ),
         ("COPY users FROM STDIN", written),
         ("INSERT INTO users VALUES (1)", written),
-        ("INSERT INTO users VALUES (1) RETURNING *", written),
+        // The rows it returns are rows of the table.
+        (
+            "INSERT INTO users VALUES (1) RETURNING *",
+            written.union(read_only),
+        ),
         ("INSERT INTO t SELECT * FROM users", unbounded),
         ("CREATE TABLE t AS SELECT * FROM users", unbounded),
         ("SELECT * INTO t FROM users", unbounded),
@@ -385,6 +409,268 @@ fn how_a_relation_is_used_is_told_apart() {
     }
     assert_eq!(usage("SELECT * INTO t FROM users", "t"), written);
     assert_eq!(usage("INSERT INTO t SELECT * FROM users", "t"), written);
+    // With RETURNING, rows of the table that is written reach the client.
+    assert_eq!(
+        usage("INSERT INTO t VALUES (1) RETURNING *", "t"),
+        written.union(read_only)
+    );
+    assert_eq!(
+        usage(
+            "INSERT INTO t VALUES (1) ON CONFLICT (id) DO UPDATE SET id = 2 RETURNING t.*",
+            "t"
+        ),
+        written.union(read_only)
+    );
+}
+
+#[test]
+fn a_cast_of_a_constant_narrows_nothing() {
+    let unbounded = RelationUse::UNBOUNDED_READ;
+    let read_only = RelationUse::READ;
+    for (sql, expected) in [
+        ("SELECT * FROM users WHERE true::bool", unbounded),
+        ("SELECT * FROM users WHERE 't'::text::bool", unbounded),
+        ("SELECT * FROM users WHERE CAST(1 AS bool)", unbounded),
+        ("SELECT * FROM users LIMIT NULL::bigint", unbounded),
+        ("SELECT * FROM users LIMIT CAST(NULL AS bigint)", unbounded),
+        (
+            "DELETE FROM users WHERE true::bool RETURNING *",
+            unbounded.union(RelationUse::WRITTEN),
+        ),
+        // A cast inside a comparison is part of a filter.
+        ("SELECT * FROM users WHERE id = 1::int", read_only),
+        ("SELECT * FROM users LIMIT 5::bigint", read_only),
+    ] {
+        assert_eq!(usage(sql, "users"), expected, "{sql}");
+    }
+}
+
+#[test]
+fn a_function_named_as_the_value_of_an_option_is_found() {
+    for (sql, expected) in [
+        (
+            "CREATE OPERATOR pg_temp.@# (RIGHTARG = text, FUNCTION = pg_catalog.pg_read_file)",
+            "pg_catalog.pg_read_file",
+        ),
+        (
+            "CREATE OPERATOR @# (RIGHTARG = text, PROCEDURE = pg_read_file)",
+            "pg_read_file",
+        ),
+        (
+            "CREATE OPERATOR @# (RIGHTARG = text, FUNCTION = 'pg_read_file')",
+            "pg_read_file",
+        ),
+        (
+            "CREATE OPERATOR @# (RIGHTARG = text, FUNCTION = \"pg_read_file\")",
+            "pg_read_file",
+        ),
+        (
+            "CREATE AGGREGATE pg_temp.a(text) (SFUNC = textcat, STYPE = text, \
+             FINALFUNC = pg_read_file, INITCOND = '')",
+            "pg_read_file",
+        ),
+        (
+            "CREATE AGGREGATE a (BASETYPE = text, SFUNC = pg_read_file, STYPE = text)",
+            "pg_read_file",
+        ),
+        (
+            "CREATE TYPE t (INPUT = pg_read_file, OUTPUT = textout)",
+            "pg_read_file",
+        ),
+        (
+            "CREATE TYPE r AS RANGE (SUBTYPE = float8, SUBTYPE_DIFF = pg_read_file)",
+            "pg_read_file",
+        ),
+        (
+            "ALTER OPERATOR @# (NONE, text) SET (RESTRICT = pg_read_file)",
+            "pg_read_file",
+        ),
+        ("ALTER TYPE t SET (RECEIVE = pg_read_file)", "pg_read_file"),
+        (
+            "CREATE FOREIGN DATA WRAPPER w HANDLER pg_catalog.pg_read_file",
+            "pg_catalog.pg_read_file",
+        ),
+        (
+            "CREATE FOREIGN DATA WRAPPER w VALIDATOR pg_read_file",
+            "pg_read_file",
+        ),
+        (
+            "ALTER FOREIGN DATA WRAPPER w HANDLER pg_read_file",
+            "pg_read_file",
+        ),
+        (
+            "CREATE ACCESS METHOD m TYPE TABLE HANDLER pg_read_file",
+            "pg_read_file",
+        ),
+        (
+            "CREATE FUNCTION f(text) RETURNS text LANGUAGE internal AS 'pg_read_file'",
+            "pg_read_file",
+        ),
+        (
+            "CREATE FUNCTION g(int) RETURNS int LANGUAGE sql SUPPORT pg_read_file AS 'SELECT 1'",
+            "pg_read_file",
+        ),
+    ] {
+        let found = functions(sql);
+        assert!(
+            found.iter().any(|name| name == expected),
+            "{sql}: {found:?}"
+        );
+    }
+    // Each of the functions of a language is in a field of its own.
+    assert_eq!(
+        functions("CREATE LANGUAGE l HANDLER pg_read_file INLINE s.pg_sleep VALIDATOR lo_import"),
+        ["lo_import", "pg_read_file", "s.pg_sleep"]
+    );
+    // A string that is longer than a name is cut like one.
+    let long = "f".repeat(100);
+    assert_eq!(
+        functions(&format!(
+            "CREATE OPERATOR @# (RIGHTARG = text, FUNCTION = '{long}')"
+        )),
+        ["f".repeat(63), "text".to_owned()]
+    );
+    // An option of a statement that is not built on functions names none:
+    // what it holds can be a password.
+    for sql in [
+        "COPY t TO STDOUT (FORMAT csv)",
+        "CREATE ROLE r PASSWORD 'pg_read_file'",
+        "CREATE TABLE t (a int) WITH (fillfactor = 70)",
+        "EXPLAIN (FORMAT json) SELECT 1",
+        "CREATE SEQUENCE s OWNED BY t.a",
+    ] {
+        assert!(functions(sql).is_empty(), "{sql}");
+    }
+}
+
+#[test]
+fn a_statement_that_may_change_how_the_next_one_is_read_says_so() {
+    for sql in [
+        "SET standard_conforming_strings = off",
+        "SET standard_conforming_strings TO DEFAULT",
+        "SET \"Standard_Conforming_Strings\" = off",
+        "SET LOCAL standard_conforming_strings = off",
+        "SET SESSION standard_conforming_strings = off",
+        "RESET standard_conforming_strings",
+        "SET client_encoding = 'LATIN1'",
+        "SET CLIENT_ENCODING TO 'SJIS'",
+        "SET NAMES 'LATIN1'",
+        "RESET client_encoding",
+        "RESET ALL",
+        "DISCARD ALL",
+        "SELECT 1; RESET ALL",
+        "ALTER ROLE app SET standard_conforming_strings = off",
+    ] {
+        let analysis = read(sql);
+        assert!(analysis.flags().contains(StatementFlags::SETTINGS), "{sql}");
+        assert!(analysis.may_change_settings(), "{sql}");
+    }
+    // The function that sets a setting, code that is not read, and a
+    // statement that was stored.
+    for sql in [
+        "SELECT set_config('standard_conforming_strings', 'off', false)",
+        "SELECT pg_catalog.set_config($1, $2, true)",
+        "SELECT \"set_config\"('a', 'b', false)",
+        "SELECT * FROM t WHERE a = (SELECT set_config('a', 'b', false))",
+        "DO $$ BEGIN PERFORM 1; END $$",
+        "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+        "EXECUTE stored",
+        "FETCH 1 FROM c",
+    ] {
+        let analysis = read(sql);
+        assert!(
+            !analysis.flags().contains(StatementFlags::SETTINGS),
+            "{sql}"
+        );
+        assert!(analysis.may_change_settings(), "{sql}");
+    }
+    for sql in [
+        "SELECT 1",
+        "BEGIN",
+        "COMMIT",
+        "ROLLBACK",
+        "SET search_path = public",
+        "SET statement_timeout = 0",
+        "SET TIME ZONE 'UTC'",
+        "SET ROLE app",
+        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
+        "SHOW standard_conforming_strings",
+        "SELECT current_setting('standard_conforming_strings')",
+        "SELECT 'SET standard_conforming_strings = off'",
+    ] {
+        let analysis = read(sql);
+        assert!(
+            !analysis.flags().contains(StatementFlags::SETTINGS),
+            "{sql}"
+        );
+        assert!(!analysis.may_change_settings(), "{sql}");
+    }
+}
+
+#[test]
+fn a_statement_that_stores_a_query_or_code_says_so() {
+    let rules = every_rule();
+    for (sql, stores, listed) in [
+        (
+            "CREATE VIEW v AS SELECT * FROM users WHERE id > 0",
+            true,
+            true,
+        ),
+        ("CREATE TEMP VIEW v AS SELECT * FROM users", true, true),
+        (
+            "CREATE OR REPLACE VIEW v AS SELECT * FROM orders",
+            true,
+            false,
+        ),
+        (
+            "CREATE TABLE t AS SELECT * FROM users WHERE id > 0",
+            true,
+            true,
+        ),
+        (
+            "CREATE MATERIALIZED VIEW m AS SELECT * FROM cards WHERE id > 0",
+            true,
+            true,
+        ),
+        ("SELECT * INTO TEMP t FROM users WHERE id > 0", true, true),
+        (
+            "CREATE RULE r AS ON SELECT TO t DO INSTEAD SELECT * FROM users WHERE id > 0",
+            true,
+            true,
+        ),
+        (
+            "CREATE SCHEMA s CREATE VIEW v AS SELECT * FROM users WHERE id > 0",
+            true,
+            true,
+        ),
+        // Code in a string may read any table.
+        (
+            "CREATE FUNCTION f() RETURNS SETOF int LANGUAGE sql AS 'SELECT 1'",
+            true,
+            true,
+        ),
+        ("DO $$ BEGIN PERFORM 1; END $$", false, true),
+        ("SELECT * FROM users WHERE id > 0", false, false),
+        ("CREATE TABLE t (LIKE users)", false, false),
+        (
+            "INSERT INTO t SELECT * FROM users WHERE id > 0",
+            false,
+            false,
+        ),
+    ] {
+        let analysis = read(sql);
+        assert_eq!(
+            analysis.flags().contains(StatementFlags::STORES),
+            stores,
+            "{sql}"
+        );
+        assert_eq!(rules.stores_a_listed_read(&analysis), listed, "{sql}");
+    }
+    // Without the row threshold there is nothing a stored query could
+    // get around.
+    let other = RuleSet::builder().build();
+    assert!(!other.stores_a_listed_read(&read("CREATE VIEW v AS SELECT * FROM users")));
 }
 
 #[test]
@@ -407,7 +693,7 @@ fn the_flags_tell_what_else_a_statement_does() {
     );
     assert_eq!(
         flags("CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'"),
-        StatementFlags::OPAQUE_BODY
+        StatementFlags::OPAQUE_BODY.union(StatementFlags::STORES)
     );
     assert_eq!(flags("EXECUTE p(1)"), StatementFlags::RUNS_STORED);
     assert_eq!(flags("FETCH ALL FROM c"), StatementFlags::RUNS_STORED);
@@ -633,7 +919,18 @@ fn the_row_threshold_is_armed_by_a_read_of_a_listed_table() {
     assert_eq!(threshold.actions, ActionSet::of(&[Action::Tarpit]));
     assert!(armed("DELETE FROM cards WHERE id > 5 RETURNING *").is_some());
     assert!(armed("SELECT * FROM orders").is_none());
-    assert!(armed("INSERT INTO users VALUES (1) RETURNING *").is_none());
+    // A table that is only written can have its rows returned all the
+    // same, so any use of a listed table arms the threshold.
+    assert!(armed("INSERT INTO users VALUES (1) RETURNING *").is_some());
+    assert!(
+        armed(
+            "INSERT INTO users (id) SELECT g FROM generate_series(1, 9) g \
+             ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id RETURNING users.*"
+        )
+        .is_some()
+    );
+    assert!(armed("INSERT INTO users VALUES (1)").is_some());
+    assert!(armed("INSERT INTO orders SELECT 1 RETURNING *").is_none());
     assert!(
         RuleSet::builder()
             .build()
