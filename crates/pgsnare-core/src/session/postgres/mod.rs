@@ -77,6 +77,8 @@ use crate::extension::{LoginStrategy, ProtocolModule, ProtocolSession, TlsReques
 use crate::session::SessionOrigin;
 
 mod inspect;
+#[cfg(test)]
+mod kill_tests;
 mod messages;
 mod names;
 mod scan;

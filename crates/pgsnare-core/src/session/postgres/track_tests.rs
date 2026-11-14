@@ -822,16 +822,16 @@ fn the_response_escalates_after_the_configured_hits_and_a_client_cannot_start_th
     assert!(counted(&mut harness).is_empty());
 
     harness.client(&query("SELECT 1"));
-    harness.server(&join(&[&row(), &row()]));
-    // Only `alert` is carried out so far, whatever was decided.
-    assert_eq!(counted(&mut harness), [(false, kill(), ALERT); 2]);
-    for body in harness.events() {
-        assert_eq!(body.action_taken, ALERT);
-    }
-
     // Each token has a count of its own.
     harness.server(&data_row(CANARY.as_bytes()));
     assert_eq!(counted(&mut harness), [(false, ALERT, ALERT)]);
+
+    harness.server(&join(&[&row(), &row()]));
+    // The third hit is killed, and the session sees nothing after it.
+    for body in harness.events() {
+        assert_eq!(body.action_taken, kill());
+    }
+    assert_eq!(counted(&mut harness), [(false, kill(), kill())]);
 }
 
 #[test]

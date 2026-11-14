@@ -48,8 +48,18 @@
 //! bytes that matched, nor any other part of the message.
 //!
 //! The policy decides the response from the token and from how often the
-//! session has hit it. The one response that is carried out so far is
-//! `alert`, and the message is passed on.
+//! session has hit it. Two responses are carried out so far:
+//!
+//! - `alert`: the hit is reported, and the message is passed on.
+//! - `kill`: the message is held back, and the session ends with
+//!   [`actions::kill`] once every hit of the message has been raised.
+//!   The client is told with the error of the policy when it is at the
+//!   end of a message, that is unless a message from the server is being
+//!   passed on in chunks. A hit in a later chunk of such a message closes
+//!   both connections without an error.
+//!
+//! A decision for responses none of which is built yet is carried out as
+//! `alert`. The event and [`Effect::TokenHit`] say what was carried out.
 //!
 //! # The statement of an event
 //!
@@ -113,9 +123,10 @@ use std::sync::Arc;
 use pgsnare_proto::startup::StartupMessage;
 use pgsnare_proto::{Chunk, Frame, FrameHeader, backend, frontend};
 
+use crate::actions;
 use crate::detect::{Match, Matcher, ScanError, StreamScanner};
 use crate::event::{EventBody, EventKind, Query, StatementDigest};
-use crate::policy::{ActionSet, PolicySnapshot, TokenId};
+use crate::policy::{Action, ActionSet, PolicySnapshot, TokenId};
 use crate::session::{Direction, Effect, Output};
 
 use super::names::{STARTUP_MESSAGE, message_name};
@@ -182,12 +193,53 @@ impl Half {
 /// The most tokens whose hits a scanner counts one by one.
 pub(super) const MAX_COUNTED_TOKENS: usize = 1024;
 
-/// The responses that are carried out, of those the policy decided.
-///
-/// Only `alert` is built: whatever was decided, the hit is reported and
-/// the message is passed on.
-const fn carried_out(_decided: ActionSet) -> ActionSet {
-    ActionSet::ALERT
+/// The responses that are built.
+const BUILT: [Action; 2] = [Action::Alert, Action::Kill];
+
+/// The responses that are carried out, of those the policy decided: the
+/// built ones, or `alert` when none of them is built.
+fn carried_out(decided: ActionSet) -> ActionSet {
+    let mut actions = ActionSet::EMPTY;
+    for action in BUILT {
+        if decided.contains(action) {
+            actions.insert(action);
+        }
+    }
+    if actions.is_empty() {
+        ActionSet::ALERT
+    } else {
+        actions
+    }
+}
+
+/// What the hits of one search ask of the session.
+struct Raised {
+    /// Whether a hit is answered with `kill`.
+    kill: bool,
+    /// A match that could not be reported.
+    error: Option<InspectionError>,
+}
+
+impl Raised {
+    /// Ends the session if a hit asked for it, and otherwise passes the
+    /// message on, or fails if a match could not be reported.
+    fn respond(
+        self,
+        client_can_be_told: bool,
+        context: &Context<'_>,
+        out: &mut Output,
+    ) -> Result<Verdict, InspectionError> {
+        if self.kill {
+            actions::kill(
+                &context.policy.actions().kill,
+                client_can_be_told,
+                context.cancel_request,
+                out,
+            );
+            return Ok(Verdict::End);
+        }
+        self.error.map_or(Ok(Verdict::Forward), Err)
+    }
 }
 
 /// Where the bytes that are searched come from.
@@ -255,19 +307,23 @@ impl Ledger {
 
     /// Raises a hit for each token among `matches`, once.
     ///
-    /// A match that cannot be reported does not hide the others: the error
-    /// is returned after every hit has been raised.
+    /// A match that cannot be reported does not hide the others, and a
+    /// `kill` does not either: every hit is raised before the session
+    /// acts on any of them.
     fn raise(
         &mut self,
         matches: impl Iterator<Item = Result<Match, ScanError>>,
         place: &Place<'_>,
         out: &mut Output,
-    ) -> Result<(), InspectionError> {
+    ) -> Raised {
         let mut seen = BTreeSet::new();
-        let mut result = Ok(());
+        let mut raised = Raised {
+            kill: false,
+            error: None,
+        };
         for found in matches {
             let Ok(found) = found else {
-                result = Err(InspectionError::new("a message could not be searched"));
+                raised.error = Some(InspectionError::new("a message could not be searched"));
                 continue;
             };
             if !seen.insert(found.token_index()) {
@@ -276,17 +332,19 @@ impl Ledger {
             // The matcher and the policy name a token alike. They are
             // built from the same configuration.
             let Ok(token_id) = TokenId::new(found.token_id().as_str()) else {
-                result = Err(InspectionError::new(
+                raised.error = Some(InspectionError::new(
                     "a token was found that the policy cannot name",
                 ));
                 continue;
             };
-            self.hit(token_id, place, out);
+            let actions = self.hit(token_id, place, out);
+            raised.kill |= actions.contains(Action::Kill);
         }
-        result
+        raised
     }
 
-    fn hit(&mut self, token_id: TokenId, place: &Place<'_>, out: &mut Output) {
+    /// Raises one hit and returns the responses to carry out.
+    fn hit(&mut self, token_id: TokenId, place: &Place<'_>, out: &mut Output) -> ActionSet {
         let context = place.context;
         let policy = context.policy;
 
@@ -304,7 +362,7 @@ impl Ledger {
                 decided: ActionSet::EMPTY,
                 actions: ActionSet::EMPTY,
             });
-            return;
+            return ActionSet::EMPTY;
         }
 
         let number = self.count(&token_id);
@@ -325,6 +383,7 @@ impl Ledger {
             actions,
         });
         out.effects.push(Effect::Emit(Box::new(body)));
+        actions
     }
 }
 
@@ -341,7 +400,8 @@ impl Ledger {
 /// [`Effect::Emit`], once for each token in a message, unless the policy
 /// exempts the session: then it is only counted. The event names the
 /// statement the message belongs to, as far as the redaction mode of the
-/// policy shows it. The message is passed on.
+/// policy shows it. The message is passed on, unless a hit is answered
+/// with `kill`: then the session ends.
 ///
 /// Each `Query`, `Execute` and `FunctionCall` of the client is counted
 /// with [`Effect::QuerySeen`], and reported with a `session_activity`
@@ -435,8 +495,9 @@ impl Inspector for Scanner {
             context,
         };
         let matches = context.policy.matcher().scan(message.as_bytes());
-        self.ledger.raise(matches, &place, out)?;
-        Ok(Verdict::Forward)
+        self.ledger
+            .raise(matches, &place, out)
+            .respond(true, context, out)
     }
 
     fn frame(
@@ -462,19 +523,21 @@ impl Inspector for Scanner {
             out.effects.push(Effect::QuerySeen);
             self.ledger.activity(&place, out);
         }
-        if is_copy_data(direction, tag) {
+        let raised = if is_copy_data(direction, tag) {
             let half = half_of(&mut self.from_client, &mut self.from_server, direction);
             let mut stream = half.take_copy(context.policy);
-            let result = self
+            let raised = self
                 .ledger
                 .raise(stream.scanner.feed(frame.body()), &place, out);
             half.copy = Some(stream);
-            result?;
+            raised
         } else {
             let matcher: &Matcher = context.policy.matcher();
-            self.ledger.raise(matcher.scan(frame.body()), &place, out)?;
-        }
-        Ok(Verdict::Forward)
+            self.ledger.raise(matcher.scan(frame.body()), &place, out)
+        };
+        // A whole message from the server is never inside another one.
+        let client_can_be_told = self.from_server.chunked.is_none();
+        raised.respond(client_can_be_told, context, out)
     }
 
     fn stream_start(
@@ -537,7 +600,7 @@ impl Inspector for Scanner {
             context,
         };
         let matches = chunked.stream.scanner.feed(chunk.data());
-        let result = self.ledger.raise(matches, &place, out);
+        let raised = self.ledger.raise(matches, &place, out);
         if chunk.is_last()
             && let Some(chunked) = half.chunked.take()
             && chunked.copy == Some(half.copies_ended)
@@ -545,8 +608,11 @@ impl Inspector for Scanner {
             // The COPY this message belongs to goes on.
             half.copy = Some(chunked.stream);
         }
-        result?;
-        Ok(Verdict::Forward)
+        // The client has had the first part of a message from the server
+        // that this chunk belongs to, or is in the middle of another one.
+        let client_can_be_told =
+            direction == Direction::FromClient && self.from_server.chunked.is_none();
+        raised.respond(client_can_be_told, context, out)
     }
 
     fn copy_started(&mut self, direction: Direction) {

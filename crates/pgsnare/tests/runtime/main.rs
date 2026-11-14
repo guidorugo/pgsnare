@@ -7,6 +7,7 @@
 //! The tests are one program, so that what they share is compiled once and
 //! every part of it is used.
 
+mod kill;
 mod relay;
 mod scan;
 mod support;
