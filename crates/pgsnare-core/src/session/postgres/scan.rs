@@ -64,7 +64,8 @@
 //! # The statement of an event
 //!
 //! A tracker (the `track` module) tells which statement a message belongs
-//! to. An event shows of it what [`Query::from_statement`] gives under the
+//! to. An event shows of it what
+//! [`Query::from_statement`](crate::event::Query::from_statement) gives under the
 //! redaction mode of the snapshot in force, and never the text as such.
 //! When the tracker does not know the statement, the event says that the
 //! statement is unknown. The hit is raised all the same.
@@ -126,7 +127,7 @@ use pgsnare_proto::{Chunk, Frame, FrameHeader, backend, frontend};
 use crate::actions::{self, FakeRows, Tarpit, TarpitPlaces};
 use crate::bait::Entropy;
 use crate::detect::{Match, Matcher, ScanError, StreamScanner};
-use crate::event::{EventBody, EventKind, Query, StatementDigest};
+use crate::event::{EventBody, EventKind, StatementDigest};
 use crate::policy::{Action, ActionSet, PolicySnapshot, TokenId};
 use crate::session::{Direction, Effect, Output};
 
@@ -232,7 +233,7 @@ fn without(actions: ActionSet, action: Action) -> ActionSet {
 /// Whether `text` is one statement that reads rows and reports them as
 /// `SELECT n`: a `SELECT`, `TABLE` or `VALUES`, with no `;` but at its
 /// end. Anything else, a leading comment included, is not.
-fn single_select(text: &[u8]) -> bool {
+pub(super) fn single_select(text: &[u8]) -> bool {
     let trimmed = text.trim_ascii();
     let body = trimmed.strip_suffix(b";").unwrap_or(trimmed);
     if body.contains(&b';') {
@@ -319,7 +320,7 @@ impl Responder {
     fn before(
         &mut self,
         frame: Frame<'_>,
-        statement: Option<&[u8]>,
+        statement: &Statement<'_>,
         context: &Context<'_>,
     ) -> bool {
         let tag = frame.tag();
@@ -351,7 +352,7 @@ impl Responder {
                 false
             }
             (Direction::FromServer, backend::tag::DATA_ROW) => {
-                self.rows.is_some() && !self.limited && statement.is_some_and(single_select)
+                self.rows.is_some() && !self.limited && statement.single_select()
             }
             _ => false,
         }
@@ -462,8 +463,8 @@ struct Place<'a> {
     name: Option<&'static str>,
     /// Whether a statement can be behind the message. Not so at startup.
     in_session: bool,
-    /// The text of that statement, when the tracker knows it.
-    statement: Option<&'a [u8]>,
+    /// That statement, as far as the tracker knows it.
+    statement: &'a Statement<'a>,
     /// Whether made-up rows can be added to the result the message is in.
     rows: bool,
     context: &'a Context<'a>,
@@ -507,10 +508,9 @@ impl Ledger {
         body.db_user = context.db_user.map(str::to_owned);
         body.database = context.database.map(str::to_owned);
         body.application_name = context.application_name.map(str::to_owned);
-        body.query = place.in_session.then(|| match place.statement {
-            Some(text) => Query::from_statement(text, redaction, &*self.digest),
-            None => Query::unknown(redaction),
-        });
+        body.query = place
+            .in_session
+            .then(|| place.statement.query(redaction, &*self.digest));
         body.session_flagged = self.flagged;
         body
     }
@@ -761,7 +761,7 @@ impl Inspector for Scanner {
             direction: Direction::FromClient,
             name: Some(STARTUP_MESSAGE),
             in_session: false,
-            statement: None,
+            statement: &Statement::Unknown,
             rows: false,
             context,
         };
@@ -787,12 +787,12 @@ impl Inspector for Scanner {
             .ledger
             .responder
             .as_mut()
-            .is_some_and(|responder| responder.before(frame, statement.bytes(), context));
+            .is_some_and(|responder| responder.before(frame, &statement, context));
         let place = Place {
             direction,
             name: message_name(direction, tag),
             in_session: true,
-            statement: statement.bytes(),
+            statement: &statement,
             rows,
             context,
         };
@@ -846,7 +846,7 @@ impl Inspector for Scanner {
                 direction,
                 name,
                 in_session: true,
-                statement: statement.bytes(),
+                statement: &statement,
                 rows: false,
                 context,
             };
@@ -884,7 +884,7 @@ impl Inspector for Scanner {
             direction,
             name: chunked.name,
             in_session: true,
-            statement: chunked.statement.bytes(),
+            statement: &chunked.statement,
             rows: false,
             context,
         };

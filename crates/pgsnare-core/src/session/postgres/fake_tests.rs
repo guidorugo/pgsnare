@@ -4,6 +4,7 @@
 //! known description, the row count raised to match, and `alert` in every
 //! case where rows cannot be added safely.
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use crate::actions::TarpitPlaces;
@@ -14,8 +15,9 @@ use crate::policy::{
 };
 use crate::session::Effect;
 
-use super::scan_tests::{EMAIL, EMAIL_ID, Harness, LIMIT, frame, join};
+use super::scan_tests::{EMAIL, EMAIL_ID, Harness, LIMIT, data_row, frame, join};
 use super::tarpit_tests::session_in;
+use super::track::{QUERIES_MADE, SINGLE_SELECT_SCANS};
 
 const ADDED: u32 = 3;
 const INT4: u32 = 23;
@@ -474,4 +476,42 @@ fn escalation_turns_alert_into_fake_data() {
         [ActionSet::ALERT, set(&[Action::FakeData])]
     );
     assert_eq!((second.len(), tag.as_str()), (6, "SELECT 6"));
+}
+
+#[test]
+fn a_held_statement_is_searched_for_its_kind_once() {
+    let mut harness = session(set(&[Action::FakeData]));
+    let before = SINGLE_SELECT_SCANS.with(Cell::get);
+    let (data, tag) = run(&mut harness, SELECT, &answer(&users(0), "SELECT 3"));
+    assert_eq!((data.len(), tag.as_str()), (6, "SELECT 6"), "rows added");
+    assert_eq!(
+        SINGLE_SELECT_SCANS.with(Cell::get) - before,
+        1,
+        "once for the statement, not once for each row"
+    );
+}
+
+#[test]
+fn the_query_of_a_held_statement_is_made_once() {
+    let mut harness = session(set(&[Action::Alert]));
+    let before = QUERIES_MADE.with(Cell::get);
+    let hit = data_row(EMAIL.as_bytes());
+    harness.client(&query(SELECT));
+    harness.server(&join(&[
+        &users(0),
+        &hit,
+        &hit,
+        &hit,
+        &complete("SELECT 3"),
+        &frame(b'Z', b"I"),
+    ]));
+    let events = harness.events();
+    assert_eq!(events.len(), 3, "one event for each hit");
+    assert!(events[0].query.as_ref().is_some_and(|query| query.known));
+    assert!(events.iter().all(|event| event.query == events[0].query));
+    assert_eq!(
+        QUERIES_MADE.with(Cell::get) - before,
+        1,
+        "once for the statement, not once for each hit"
+    );
 }
