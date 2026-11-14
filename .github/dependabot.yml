@@ -86,3 +86,17 @@ updates:
       # version, and a new major version is taken by hand.
       - dependency-name: "postgres"
         update-types: ["version-update:semver-major"]
+
+  # The images in the manifests of the Kubernetes tests. The node image of
+  # the cluster is not updated here: it belongs to the release of `kind` in
+  # deploy/tools/tools.txt and is changed together with it, by hand.
+  - package-ecosystem: docker
+    directory: /deploy/tests/kubernetes
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    ignore:
+      - dependency-name: "postgres"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "kindest/node"
