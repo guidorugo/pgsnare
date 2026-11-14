@@ -22,16 +22,17 @@
 # version in step with rust-toolchain.toml.
 FROM rust:1.99.1-slim-trixie@sha256:f6c4a35d21dbb3c89d7a8d056c193e94fc09037f2b58dd858b09c39a47dd02d7 AS build
 
-# musl-tools compiles the C code that pgsnare links (its cryptography
-# library) against musl. clang provides libclang, which the code generator
-# of the optional SQL parser needs.
+# musl-tools compiles the C code that pgsnare links against musl: its
+# cryptography library and the SQL parser of the rules. The parser needs
+# no libclang: the declarations of its C interface are made ahead of time
+# (crates/bindgen-prebuilt).
 #
 # musl-gcc reads the headers of musl and no others. The C code also includes
 # headers of the Linux kernel, which do not depend on the C library, so the
 # three directories that hold them are linked into the directory of musl.
 RUN set -eu; \
     apt-get update; \
-    apt-get install --yes --no-install-recommends musl-tools clang; \
+    apt-get install --yes --no-install-recommends musl-tools; \
     rm -rf /var/lib/apt/lists/*; \
     gnu="/usr/include/$(uname -m)-linux-gnu"; \
     musl="/usr/include/$(uname -m)-linux-musl"; \
@@ -62,9 +63,17 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
 # A static binary for the architecture of this machine, with the default
-# features and exactly the dependencies of Cargo.lock. The build fails
-# unless the result asks for no interpreter and no shared library.
+# features, the SQL rules among them, and exactly the dependencies of
+# Cargo.lock. The build fails unless the result asks for no interpreter and
+# no shared library.
+#
+# It also fails when protoc is on the PATH: the build script of the SQL
+# parser would then generate its Rust types again and overwrite the ones
+# that came with the crate, which the rules were written and tested against.
 RUN set -eu; \
+    if command -v protoc >/dev/null; then \
+        echo "the build stage must not contain protoc" >&2; exit 1; \
+    fi; \
     case "$(uname -m)" in \
         x86_64) target=x86_64-unknown-linux-musl ;; \
         aarch64) target=aarch64-unknown-linux-musl ;; \

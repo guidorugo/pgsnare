@@ -25,8 +25,10 @@
 #   4. With a read-only root filesystem, without capabilities and with
 #      `no-new-privileges`, the container finds a PostgreSQL container by
 #      name, becomes `healthy` through the health check of the image, lets
-#      a client log in, reports a seeded token as `token_hit`, and ends with
-#      status 0 on SIGTERM.
+#      a client log in, reports a seeded token as `token_hit`, ends a
+#      session that calls a function listed in an SQL rule and reports it as
+#      `rule_hit`, and ends with status 0 on SIGTERM. The rule shows that the
+#      image holds the SQL rules and that the parser works in this build.
 #
 # Checks 1 and 3, and the setuid check of 2, are also run against the
 # PostgreSQL image, which must fail them. The other checks of 2 are run
@@ -384,14 +386,21 @@ else
     fail "could not read the state of process 1 of the container from /proc"
 fi
 
+# psql_with SETTINGS ARGUMENTS...: SETTINGS are added to the connection
+# string.
+psql_with() {
+    local settings="$1"
+    shift
+    compose --profile client run --rm --no-deps -T client \
+        --no-psqlrc --no-password --quiet --tuples-only --no-align \
+        --dbname "port=5432 user=postgres dbname=postgres sslmode=disable $settings" "$@"
+}
 # psql_to HOST ARGUMENTS...: the database itself is `postgres`, and the
 # proxy is `pgsnare`.
 psql_to() {
     local host="$1"
     shift
-    compose --profile client run --rm --no-deps -T client \
-        --no-psqlrc --no-password --quiet --tuples-only --no-align \
-        --dbname "host=$host port=5432 user=postgres dbname=postgres sslmode=disable" "$@"
+    psql_with "host=$host" "$@"
 }
 logged() {
     "$docker" logs "$proxy" 2>&1 | grep -F -- "$1" | grep -qF -- "${2:-}"
@@ -430,6 +439,38 @@ done
 if "$docker" logs "$proxy" 2>&1 | grep -qF -- "$token"; then
     fail "the output of pgsnare holds the value of the token"
 fi
+
+echo "image-test: a session that calls a function listed in a rule must be ended and reported"
+# The client asks for UTF8 because the rules read a statement only when the
+# database has been told how the client encodes it. The function is written
+# with a comment, a schema, other case and quotes: it is the parser that
+# must find it.
+ruled="host=pgsnare client_encoding=UTF8"
+answer="$(psql_with "$ruled" --command 'SELECT 6 * 7' 2>&1)" || true
+[[ "$answer" == 42 ]] \
+    || fail "a statement that no rule concerns did not get its answer: $answer"
+if logged '"kind":"rule_hit"'; then
+    fail "a rule_hit was reported before a listed function was called, so the next check proves nothing"
+fi
+status=0
+started="$(date +%s)"
+answer="$(psql_with "$ruled" --command 'SELECT /* x */ Pg_Catalog."pg_sleep"(300)' 2>&1)" || status=$?
+if [[ "$status" -eq 0 ]] \
+    || ! grep -qF "terminating connection due to administrator command" <<<"$answer" \
+    || [[ "$(($(date +%s) - started))" -ge 60 ]]; then
+    fail "a session that called a listed function was not ended at once with the error (exit status $status):"
+    echo "$answer" | sed 's/^/    /' >&2
+fi
+tries=0
+until logged '"kind":"rule_hit"' '"rule_id":"functions"'; do
+    tries=$((tries + 1))
+    if [[ "$tries" -ge 50 ]]; then
+        fail "no rule_hit event for the rule that fired: the image may not hold the SQL rules"
+        break
+    fi
+    sleep 0.2
+done
+[[ "$tries" -ge 50 ]] || echo "image-test: ok: the SQL rule ended the session and was reported as rule_hit"
 
 echo "image-test: pgsnare must end with status 0 on SIGTERM"
 "$docker" kill --signal TERM "$proxy" >/dev/null
