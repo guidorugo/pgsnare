@@ -522,10 +522,10 @@ for version in $versions; do
         failed=1
     fi
     # Written so that a search of the text would not see the function:
-    # a comment, another case, a schema, quotes.
+    # a comment, a schema, other case, quotes ("pg_sleep" is the same name).
     for statement in \
         "SELECT pg_sleep(300)" \
-        "SELECT /* x */ Pg_Catalog.\"PG_SLEEP\"(300)"; do
+        "SELECT /* x */ Pg_Catalog.\"pg_sleep\"(300)"; do
         status=0
         started="$(date +%s)"
         output="$(psql_as "$ruled" --command "$statement" 2>&1)" || status=$?
