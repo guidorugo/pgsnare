@@ -589,6 +589,15 @@ impl Driver {
             match effect {
                 Effect::Close(leg) => self.close_after_flush(leg),
                 Effect::Emit(body) => self.context.events.submit(body),
+                Effect::QuerySeen => self.context.status.query_seen(),
+                Effect::TokenHit {
+                    token_id,
+                    exempt,
+                    actions,
+                } => {
+                    self.context.status.token_hit(&token_id, exempt);
+                    self.context.status.actions_taken(actions);
+                }
                 Effect::Delay(delay) => {
                     let until = Instant::now() + delay;
                     self.hold_client_until =

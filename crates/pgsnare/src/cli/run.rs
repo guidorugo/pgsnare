@@ -97,7 +97,7 @@ fn start(args: &Args, redaction: &Redaction) -> Result<(), String> {
             .map_err(|error| error.to_string())?,
     );
     let policy = config.policy(1).map_err(|error| error.to_string())?;
-    let module = Postgres::new();
+    let module = Postgres::scanning();
     let listeners = listeners(&config, &module)?;
 
     // The sinks add what they must keep to themselves to what the redactor

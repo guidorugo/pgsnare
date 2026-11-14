@@ -8,5 +8,6 @@
 //! every part of it is used.
 
 mod relay;
+mod scan;
 mod support;
 mod tls;
