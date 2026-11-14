@@ -9,10 +9,11 @@
 
 use std::fmt;
 
-use pgsnare_core::policy::OnError;
+use pgsnare_core::policy::{Action, ActionSet, OnError};
 
 use super::Config;
 use super::error::At;
+use super::rules::ParseFailurePolicy;
 use super::sinks::{Sink, UrlSource};
 use super::tls::UpstreamTlsMode;
 
@@ -45,6 +46,10 @@ impl Config {
     /// - A webhook that sends events over plain HTTP, or that would accept
     ///   a plain `http` URL from its environment variable or file.
     /// - An admin or metrics listener that other machines can reach.
+    /// - A SQL rule that judges a statement and answers with `kill` or
+    ///   `tarpit`, while `rules.on_parse_failure` is not `block`: a
+    ///   statement that cannot be analysed is then passed on, and the rule
+    ///   does not judge it.
     ///
     /// Only the configuration is looked at. Nothing is read from disk and
     /// nothing is connected to.
@@ -104,6 +109,29 @@ impl Config {
                      unencrypted, and whoever is on the way can read and change them",
                 ),
                 _ => {}
+            }
+        }
+
+        if let Some(rules) = &self.rules
+            && rules.on_parse_failure != ParseFailurePolicy::Block
+        {
+            // The row threshold counts the rows of a result, also of a
+            // statement that was not analysed, so it is not among them.
+            let certain = |actions: ActionSet| {
+                actions.contains(Action::Kill) || actions.contains(Action::Tarpit)
+            };
+            let judged = [
+                rules.catalog_enumeration.as_ref().map(|rule| rule.actions),
+                rules.unbounded_read.as_ref().map(|rule| rule.actions),
+                rules.functions.as_ref().map(|rule| rule.actions),
+            ];
+            if judged.into_iter().flatten().any(certain) {
+                warn(
+                    root.field("rules").field("on_parse_failure"),
+                    "a rule answers a statement with kill or tarpit, and a statement that \
+                     cannot be analysed is passed on without being judged by it: only block \
+                     makes the response of such a rule certain",
+                );
             }
         }
 
@@ -269,6 +297,53 @@ events:
         assert_eq!(
             warnings(&format!("{BASE}metrics: {{ listen: \"[::]:9642\" }}\n")).len(),
             1
+        );
+    }
+
+    #[test]
+    fn a_rule_that_ends_sessions_while_unread_statements_pass_is_a_warning() {
+        if !cfg!(feature = "rules") {
+            return;
+        }
+        let warning = "rules.on_parse_failure: a rule answers a statement with kill or tarpit, \
+                       and a statement that cannot be analysed is passed on without being \
+                       judged by it: only block makes the response of such a rule certain";
+        let with = |rules: &str| warnings(&format!("{BASE}rules:\n{rules}"));
+        for policy in [
+            "",
+            "  on_parse_failure: alert\n",
+            "  on_parse_failure: allow\n",
+        ] {
+            for rule in [
+                "  functions: { names: [pg_sleep], actions: [alert, kill] }\n",
+                "  functions: { names: [pg_sleep], actions: [tarpit] }\n",
+                "  catalog_enumeration: { actions: [kill] }\n",
+                "  unbounded_read: { tables: [users], actions: [alert, tarpit] }\n",
+            ] {
+                assert_eq!(
+                    with(&format!("{policy}{rule}")),
+                    [warning],
+                    "{policy}{rule}"
+                );
+            }
+            // A rule that only reports loses nothing it promised, and the
+            // row threshold counts the rows of every result.
+            for rule in [
+                "  functions: { names: [pg_sleep] }\n",
+                "  functions: { names: [pg_sleep], actions: [alert, fake_data] }\n",
+                "  row_threshold: { tables: [users], max_rows: 10, actions: [kill] }\n",
+            ] {
+                assert!(
+                    with(&format!("{policy}{rule}")).is_empty(),
+                    "{policy}{rule}"
+                );
+            }
+        }
+        assert!(
+            with(
+                "  on_parse_failure: block\n  functions: { names: [pg_sleep], actions: [kill] }\n"
+            )
+            .is_empty()
         );
     }
 

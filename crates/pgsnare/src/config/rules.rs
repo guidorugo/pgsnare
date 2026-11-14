@@ -69,8 +69,12 @@ pub struct Rules {
 /// that below 100 MiB per thread.
 pub const DEFAULT_MAX_PARSE_BYTES: u64 = 64 * 1024;
 
-/// The largest accepted [`Rules::max_parse_bytes`]: 64 MiB.
-pub const MAX_MAX_PARSE_BYTES: u64 = 64 * 1024 * 1024;
+/// The largest accepted [`Rules::max_parse_bytes`]: 1 MiB.
+///
+/// At about 1,500 times the size of a statement, a statement of this size
+/// can take 1.5 GiB on each parser thread while it is read. A larger
+/// value would let one statement use up the memory of the host.
+pub const MAX_MAX_PARSE_BYTES: u64 = 1024 * 1024;
 
 const fn default_max_parse_bytes() -> u64 {
     DEFAULT_MAX_PARSE_BYTES
@@ -280,7 +284,11 @@ impl Rules {
             );
         }
         if self.max_parse_bytes == 0 || self.max_parse_bytes > MAX_MAX_PARSE_BYTES {
-            problems.add(&at.field("max_parse_bytes"), "must be between 1B and 64MiB");
+            problems.add(
+                &at.field("max_parse_bytes"),
+                "must be between 1B and 1MiB: reading a statement can take about 1,500 times \
+                 its size in memory on each parser thread",
+            );
         }
         if let Some(rule) = &self.catalog_enumeration {
             let here = at.field("catalog_enumeration");
@@ -438,14 +446,14 @@ functions: { names: [pg_read_file, lo_export, pg_sleep], actions: [kill] }
 
     #[test]
     fn invalid_rules_are_rejected() {
-        assert_eq!(
-            problems("max_parse_bytes: 0B\n"),
-            ["rules.max_parse_bytes: must be between 1B and 64MiB"]
-        );
-        assert_eq!(
-            problems("max_parse_bytes: 65MiB\n"),
-            ["rules.max_parse_bytes: must be between 1B and 64MiB"]
-        );
+        let size = "rules.max_parse_bytes: must be between 1B and 1MiB: reading a statement \
+                    can take about 1,500 times its size in memory on each parser thread";
+        assert_eq!(problems("max_parse_bytes: 0B\n"), [size]);
+        // The largest value is one whose worst case a host can carry.
+        assert!(problems("max_parse_bytes: 1MiB\n").is_empty());
+        assert_eq!(problems("max_parse_bytes: 1048577B\n"), [size]);
+        assert_eq!(problems("max_parse_bytes: 4MiB\n"), [size]);
+        assert_eq!(problems("max_parse_bytes: 64MiB\n"), [size]);
         assert_eq!(
             problems("unbounded_read: { tables: [] }\n"),
             ["rules.unbounded_read.tables: at least one name is required"]
