@@ -1,0 +1,166 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Values of the pgsnare chart: a central proxy in front of one database.
+#
+# Three values have no usable default and must be set: image.digest,
+# database.host and tokens.secretNames. With the defaults, clients must use
+# TLS, so proxy.clientTLS.secretName is needed too. README.md describes
+# every value and the Secrets to create first.
+#
+# The chart renders no Secret and takes no secret as a value. Honeytoken
+# values, private keys, the address of a webhook and its signing key come
+# from Secrets that exist already and are named here.
+#
+# An unknown value is an error: values.schema.json lists what exists.
+
+image:
+  # Registry and path, without a tag and without a digest.
+  repository: ghcr.io/guidorugo/pgsnare
+  # Required: sha256: and 64 hexadecimal digits. The image is named by
+  # digest only, because a tag can be moved to another image.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# Names of existing Secrets of type kubernetes.io/dockerconfigjson.
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Replicas are independent of each other. With two, a node can be drained
+# while one pod keeps serving.
+replicaCount: 2
+
+proxy:
+  # The port of the pods and of the Service.
+  port: 5432
+  maxConnections: 1000
+  loginTimeout: 60s
+  # TLS between the applications and pgsnare.
+  clientTLS:
+    # disable, prefer or require
+    mode: require
+    # An existing Secret of type kubernetes.io/tls (tls.crt and tls.key).
+    # Required unless the mode is disable.
+    secretName: ""
+    # tls1.2 or tls1.3
+    minVersion: tls1.2
+
+# Who may connect to the proxy. An empty list means nobody: the
+# NetworkPolicy then has no rule for the proxy port.
+#
+#   - namespace: shop            # left out: the namespace of the release
+#     podLabels:                 # required, at least one label
+#       app.kubernetes.io/name: api
+clients: []
+
+database:
+  # Required. The host name or address pgsnare connects to.
+  host: ""
+  port: 5432
+  # TLS between pgsnare and the database.
+  tls:
+    # disable, prefer, require or verify-full
+    mode: verify-full
+    # An existing Secret with the key ca.crt, used with verify-full. Left
+    # empty, the certificate authorities of the image are trusted.
+    caSecretName: ""
+    # The name the certificate must carry. Left empty: database.host.
+    serverName: ""
+    minVersion: tls1.2
+  # Where the database is, for the NetworkPolicy. An empty list means the
+  # proxy may not connect to any database.
+  #
+  #   - namespace: data          # pods in the cluster
+  #     podLabels:
+  #       app.kubernetes.io/name: postgresql
+  #   - cidr: 192.0.2.10/32      # an address outside the cluster
+  peers: []
+  # The port the database itself listens on, when a Service in between
+  # changes it. 0: the same as database.port.
+  peerPort: 0
+
+# The name service of the cluster, for the NetworkPolicy. With an empty
+# list the proxy cannot look up names, and database.host and the host of
+# every webhook must be addresses.
+dns:
+  port: 53
+  peers:
+    - namespace: kube-system
+      podLabels:
+        k8s-app: kube-dns
+
+tokens:
+  # Required, at least one. Existing Secrets with honeytoken files: every
+  # key that ends in .yaml is a token file, and every such Secret must hold
+  # at least one. Changing a Secret changes the tokens without a restart.
+  secretNames: []
+
+sinks:
+  # Events as JSON lines on standard output, for the log collector of the
+  # cluster.
+  stdout: true
+  # Webhooks. Each takes its address and its signing key from an existing
+  # Secret with the keys url and hmac-secret.
+  #
+  #   - secretName: pgsnare-webhook
+  #     port: 443                # for the NetworkPolicy
+  #     peers:                   # where the receiver is, as database.peers
+  #       - cidr: 192.0.2.20/32
+  #     config:                  # optional, as in the configuration file
+  #       timeout: 5s
+  #       max_retries: 5
+  #       queue_size: 1024
+  #       max_events_per_second: 20
+  webhooks: []
+  # Certificate authorities for webhooks, when the image does not know the
+  # one that signed a receiver's certificate: an existing Secret with the
+  # key ca.crt. It replaces the authorities of the image for webhooks, so
+  # it must hold every authority a webhook needs.
+  webhookCA:
+    secretName: ""
+
+metrics:
+  # The port of the metrics, opened only when scrapers are listed. It is
+  # plain HTTP without a login, it is not part of the Service, and the
+  # NetworkPolicy is its only protection.
+  port: 9642
+  # Who may read the metrics, written as clients. An empty list: the
+  # metrics stay on the loopback address of the pod.
+  scrapers: []
+
+# Settings that are copied into the configuration file as they are, under
+# the names of the configuration file. Only the settings named in
+# values.schema.json are accepted: listeners, tokens, sinks and the admin
+# and metrics listeners are not among them.
+config:
+  # on_error, max_buffered_frame
+  inspection: {}
+  # A list of { db_user, client_cidr }
+  exemptions: []
+  # kill, tarpit, fake_data
+  actions: {}
+  # query_redaction, dedup_window, queue_size, labels. The name and the
+  # namespace of the pod are added to every event by the chart.
+  events: {}
+
+shutdown:
+  # How long open sessions may finish after the pod was told to stop.
+  gracePeriodSeconds: 25
+  # How long the pod keeps accepting clients after it was told to stop,
+  # while the cluster takes it out of the Service. 0: no wait. More needs a
+  # cluster that has the sleep action for containers.
+  preStopSleepSeconds: 0
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    cpu: "1"
+    memory: 256Mi
+
+podLabels: {}
+podAnnotations: {}
+nodeSelector: {}
+priorityClassName: ""

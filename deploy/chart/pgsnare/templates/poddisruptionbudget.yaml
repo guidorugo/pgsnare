@@ -1,0 +1,17 @@
+{{/* SPDX-License-Identifier: Apache-2.0 */}}
+# One pod at a time may be taken away on purpose, for example when a node
+# is drained. A pod that is not ready may always be evicted, so that a
+# drain is not held up while the proxy is not serving anyway.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "pgsnare.fullname" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "pgsnare.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      {{- include "pgsnare.selectorLabels" . | nindent 6 }}

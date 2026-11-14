@@ -1,0 +1,70 @@
+{{/* SPDX-License-Identifier: Apache-2.0 */}}
+{{- $clients := include "pgsnare.peers" (dict "root" . "peers" .Values.clients "path" "clients" "pods" true) | trim -}}
+{{- $scrapers := include "pgsnare.peers" (dict "root" . "peers" .Values.metrics.scrapers "path" "metrics.scrapers" "pods" true) | trim -}}
+{{- $database := include "pgsnare.peers" (dict "root" . "peers" .Values.database.peers "path" "database.peers" "pods" false) | trim -}}
+{{- $dns := include "pgsnare.peers" (dict "root" . "peers" .Values.dns.peers "path" "dns.peers" "pods" false) | trim -}}
+{{- $webhooks := include "pgsnare.webhookEgress" . | trim -}}
+# Everything is refused in both directions except what the rules below
+# allow. A rule is rendered only when its list in the values has an item:
+# a rule without peers would allow everybody.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pgsnare.fullname" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "pgsnare.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "pgsnare.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  {{- if or $clients $scrapers }}
+  ingress:
+    {{- if $clients }}
+    # The listed clients, to the proxy port.
+    - from:
+        {{- $clients | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ int .Values.proxy.port }}
+    {{- end }}
+    {{- if $scrapers }}
+    # The listed scrapers, to the metrics port.
+    - from:
+        {{- $scrapers | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ int .Values.metrics.port }}
+    {{- end }}
+  {{- else }}
+  ingress: []
+  {{- end }}
+  {{- if or $database $dns $webhooks }}
+  egress:
+    {{- if $database }}
+    # The database.
+    - to:
+        {{- $database | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ int (default .Values.database.port .Values.database.peerPort) }}
+    {{- end }}
+    {{- if $dns }}
+    # The name service of the cluster, and no other server on its port.
+    - to:
+        {{- $dns | nindent 8 }}
+      ports:
+        - protocol: UDP
+          port: {{ int .Values.dns.port }}
+        - protocol: TCP
+          port: {{ int .Values.dns.port }}
+    {{- end }}
+    {{- if $webhooks }}
+    {{- $webhooks | nindent 4 }}
+    {{- end }}
+  {{- else }}
+  egress: []
+  {{- end }}
