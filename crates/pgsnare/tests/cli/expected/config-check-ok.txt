@@ -1,0 +1,1 @@
+ok: <dir>/pgsnare.yaml: pgsnare would start with 2 listeners, 2 honeytokens with 3 values, 1 sink and no warnings

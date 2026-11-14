@@ -1,0 +1,1 @@
+pgsnare token test: standard input is a terminal, and a value typed there is shown on the screen. Give the value through a file or a pipe, for example: pgsnare token test --config FILE < value.txt

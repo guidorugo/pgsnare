@@ -97,6 +97,7 @@ pgsnare cannot be used yet: it relays traffic and does not look at it. What exis
 - **Wire protocol.** Framing, message views and encoders for protocol 3.0 and 3.2, tested against traffic captured from PostgreSQL 15 to 18.
 - **Honeytoken matcher.** It finds token values in a stream of bytes, however the stream is split.
 - **Configuration and events.** The configuration format, with a [complete example](examples/config/pgsnare.yaml), and the event format.
+- **Honeytoken tools.** `pgsnare token generate` makes new honeytokens: made-up accounts, password hashes in the formats of bcrypt, Argon2id and SCRAM-SHA-256, API keys, card numbers and markers for free text. It prints the SQL statement that plants them and the token file that matches, and connects to nothing. `pgsnare token list` and `pgsnare token test` look into a configuration without ever showing a value. `pgsnare config check` reports every problem of a configuration and warns about settings that give up protection.
 - **Toolchain.** Builds run in containers with pinned versions. Every change is checked for formatting and lints, tests, fuzz targets, dependency advisories and licences, secrets, and private network addresses.
 
 The steps to the first release:
@@ -120,7 +121,7 @@ You need Docker with the Compose plugin, and `make`. Every build and test runs i
 | `make build` | Builds the workspace |
 | `make test` | Runs the tests of every crate, with and without the optional SQL rules |
 | `make lint` | Checks formatting, runs Clippy with warnings denied, and builds the API documentation |
-| `make itest` | Builds pgsnare and runs it in front of PostgreSQL 15 to 18: the differential scenarios, the login table and the container checks |
+| `make itest` | Builds pgsnare and runs it in front of PostgreSQL 15 to 18: the differential scenarios, the login table, the container checks, and what the commands print |
 | `make fuzz` | Runs every fuzz target for a short time |
 | `make deny` | Checks the advisories, licences and sources of every dependency |
 | `make scan` | Scans for secrets and private network addresses |
@@ -134,10 +135,10 @@ CI runs the last six on every pull request, and all of them must pass before it 
 | Path | Contents |
 |---|---|
 | `crates/pgsnare-proto` | The PostgreSQL wire format: framing, message views and encoders. No I/O. |
-| `crates/pgsnare-core` | Session logic, detection, policy, actions and the event format. No I/O. |
+| `crates/pgsnare-core` | Session logic, detection, policy, actions, bait generators and the event format. No I/O. |
 | `crates/pgsnare` | The runtime and the `pgsnare` command: listeners, TLS, configuration and sinks. |
 | `examples/config` | A complete configuration file, with every setting explained. |
-| `tests` | Integration tests. They compare what a client sees from PostgreSQL directly and through pgsnare, try every row of the login table, and check pgsnare as a container. |
+| `tests` | Integration tests. They compare what a client sees from PostgreSQL directly and through pgsnare, try every row of the login table, check pgsnare as a container, and give PostgreSQL what `pgsnare token generate` prints. |
 | `docs` | The design. |
 
 ## License

@@ -19,6 +19,7 @@ rules = ["pgsnare-core/rules"]
 
 [dependencies]
 clap.workspace = true
+getrandom.workspace = true
 pgsnare-core.workspace = true
 rustix.workspace = true
 rustls.workspace = true
@@ -33,3 +34,5 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 rcgen.workspace = true
+# A pseudo-terminal, for the test that `token test` refuses a terminal.
+rustix = { workspace = true, features = ["pty"] }

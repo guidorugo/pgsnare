@@ -27,6 +27,7 @@ pgsnare-proto = { path = "crates/pgsnare-proto", version = "0.0.0" }
 aho-corasick = "1.1.5"
 bytes = "1.12.1"
 clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+getrandom = { version = "0.4.3", default-features = false }
 proptest = "1.12.0"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 rustix = { version = "1.1.6", default-features = false, features = ["std", "process"] }

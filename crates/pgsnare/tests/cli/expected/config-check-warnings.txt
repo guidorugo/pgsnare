@@ -1,0 +1,7 @@
+warning: listeners[0].upstream_tls.mode: the certificate of the database is not verified: whoever answers at its address is taken for the database
+warning: inspection.on_error: fail_open lets a session go on without inspection when inspecting it fails: honeytokens then pass unseen
+warning: events.sinks[1].url: events are sent over plain HTTP: whoever is on the way can read and change them
+warning: admin.listen: the admin listener can be reached from other machines: it is meant for this machine alone
+warning: metrics.listen: the metrics listener can be reached from other machines: make sure that only the scraper can connect to it
+note: the configuration has no honeytokens, so pgsnare would detect nothing
+ok: <dir>/pgsnare.yaml: pgsnare would start with 2 listeners, 0 honeytokens with 0 values, 2 sinks and 5 warnings

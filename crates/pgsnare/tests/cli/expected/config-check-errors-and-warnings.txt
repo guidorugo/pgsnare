@@ -1,0 +1,7 @@
+error: <dir>/server.key: the file is open to the group or to others; it is owned by the user pgsnare runs as, so its mode must be 0600 or less
+error: listener main: <dir>/ca.crt: cannot read the file: entity not found
+warning: inspection.on_error: fail_open lets a session go on without inspection when inspecting it fails: honeytokens then pass unseen
+warning: admin.listen: the admin listener can be reached from other machines: it is meant for this machine alone
+note: files that hold secrets are open to other users: restrict the access to them; pgsnare run refuses to start unless it is given --allow-insecure-file-permissions
+note: the configuration has no honeytokens, so pgsnare would detect nothing
+failed: <dir>/pgsnare.yaml: pgsnare would not start: 2 errors and 2 warnings

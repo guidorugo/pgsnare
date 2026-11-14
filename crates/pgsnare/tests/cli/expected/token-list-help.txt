@@ -1,0 +1,21 @@
+List the honeytokens of a configuration, without their values
+
+Usage: pgsnare token list --config <FILE>
+
+Options:
+  -c, --config <FILE>
+          The configuration file. Its token files are read as well
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+The list shows, for every honeytoken: its id, the database, table and column it
+was planted in as the configuration says, its response and escalation, the
+number of its values, and whether letter case is ignored. A value is never
+shown, and neither is anything made from one.
+
+Example:
+  pgsnare token list --config /etc/pgsnare/pgsnare.yaml

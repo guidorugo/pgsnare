@@ -1,0 +1,5 @@
+error: <dir>/server.key: the file cannot be examined: entity not found
+error: listener main: <dir>/server.crt: cannot read the file: entity not found
+error: listener main: <dir>/ca.crt: cannot read the file: entity not found
+note: the configuration has no honeytokens, so pgsnare would detect nothing
+failed: <dir>/pgsnare.yaml: pgsnare would not start: 3 errors and no warnings

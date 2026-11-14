@@ -164,6 +164,11 @@ impl Problems {
         Self::default()
     }
 
+    /// How many problems were recorded so far.
+    pub(super) fn len(&self) -> usize {
+        self.list.len()
+    }
+
     /// Sets the file that later problems belong to.
     pub(super) fn set_file(&mut self, file: Option<PathBuf>) {
         self.file = file;

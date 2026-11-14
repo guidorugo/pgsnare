@@ -424,6 +424,108 @@ fn a_token_value_in_a_broken_token_file_does_not_reach_the_error() {
 }
 
 #[test]
+fn files_are_listed_once_and_in_order() {
+    let (a, b) = (Path::new("/a"), Path::new("/b"));
+    assert_eq!(unique([a, b, a, b, a].into_iter()), [a, b]);
+    assert!(unique(std::iter::empty()).is_empty());
+}
+
+#[test]
+fn the_files_that_hold_secrets_are_what_was_read_and_every_private_key() {
+    let dir = TempDir::new();
+    let main = dir.write(
+        "pgsnare.yaml",
+        "\
+listeners:
+  - name: first
+    listen: 0.0.0.0:5432
+    upstream: db.example.com:5432
+    client_tls: { mode: require, cert: certs/server.crt, key: certs/server.key }
+    upstream_tls: { mode: verify-full, ca: certs/root.crt }
+  - name: second
+    listen: 0.0.0.0:5433
+    upstream: db.example.com:5432
+    client_tls: { mode: prefer, cert: certs/server.crt, key: certs/server.key }
+    upstream_tls: { mode: disable }
+  - name: third
+    listen: 0.0.0.0:5434
+    upstream: db.example.com:5432
+    client_tls: { mode: require, cert: certs/other.crt, key: /etc/pgsnare/other.key }
+    upstream_tls: { mode: disable }
+  - name: plain
+    listen: 0.0.0.0:5435
+    upstream: db.example.com:5432
+    client_tls: { mode: disable }
+    upstream_tls: { mode: disable }
+token_files: [\"tokens/*.yaml\"]
+events:
+  sinks:
+    - { type: stdout }
+    - { type: file, path: events.jsonl }
+    - { type: webhook, url_file: hook-url, hmac_secret_file: hook-secret }
+",
+    );
+    let first = dir.write("tokens/a.yaml", token_file("a", "first-value-0001"));
+    let second = dir.write("tokens/b.yaml", token_file("b", "second-value-0002"));
+
+    let loaded = load(&main).unwrap();
+    assert_eq!(
+        loaded.secret_files(),
+        [
+            // What was read, in the order it was read.
+            main.as_path(),
+            first.as_path(),
+            second.as_path(),
+            // The key of every listener that has one, each once. A key that
+            // two listeners share is one file.
+            dir.path("certs/server.key").as_path(),
+            Path::new("/etc/pgsnare/other.key"),
+        ]
+    );
+    // Certificates and authorities are public, and the files of a sink are
+    // not read by the loader.
+    let listed = loaded.secret_files();
+    for other in [
+        "certs/server.crt",
+        "certs/root.crt",
+        "events.jsonl",
+        "hook-url",
+        "hook-secret",
+    ] {
+        assert!(!listed.contains(&dir.path(other).as_path()), "{other}");
+    }
+}
+
+#[test]
+fn a_value_that_contains_a_value_of_another_file_names_both_files() {
+    let dir = TempDir::new();
+    let main = dir.write(
+        "pgsnare.yaml",
+        format!(
+            "{MAIN}token_files: [tokens.yaml]\n{}",
+            token_file("short", "alpha-0001-zulu")
+        ),
+    );
+    let tokens = dir.write(
+        "tokens.yaml",
+        token_file("long", "prefix-alpha-0001-zulu-suffix"),
+    );
+    let LoadError::Invalid(error) = load(&main).unwrap_err() else {
+        panic!("expected an invalid configuration");
+    };
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "{}: tokens[0].values[0]: this value contains another value, so data that matches \
+             it would set off both (see tokens[0].values[0] in {})",
+            tokens.display(),
+            main.display()
+        )
+    );
+    assert!(!error.to_string().contains("alpha"), "{error}");
+}
+
+#[test]
 fn wildcards_match_as_a_shell_would() {
     for (pattern, name) in [
         ("*.yaml", "tokens.yaml"),

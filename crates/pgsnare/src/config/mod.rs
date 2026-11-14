@@ -51,6 +51,7 @@
 
 use std::path::PathBuf;
 
+use pgsnare_core::detect::{BuildError, Matcher, TokenSpec};
 use pgsnare_core::policy::{PolicyError, PolicySnapshot};
 use serde::Deserialize;
 
@@ -68,6 +69,7 @@ mod sinks;
 mod tls;
 mod token;
 pub mod units;
+mod warnings;
 mod yaml;
 
 pub use actions::{Actions, FakeData, Kill, Tarpit};
@@ -100,6 +102,7 @@ pub use tls::{ClientTls, ClientTlsMode, TlsVersion, UpstreamTls, UpstreamTlsMode
 pub use token::{
     MAX_VALUE_BYTES, MIN_VALUE_BYTES, Token, TokenFile, TokenOrigin, TokenScope, TokenValue,
 };
+pub use warnings::Warning;
 
 use error::{At, Problems};
 
@@ -246,6 +249,20 @@ impl Config {
             .actions(self.actions.policy())
             .query_redaction(self.events.query_redaction)
             .build()
+    }
+
+    /// Compiles the honeytokens into the matcher that finds them in
+    /// traffic.
+    ///
+    /// # Errors
+    ///
+    /// A checked configuration always gives a matcher: the loader asks the
+    /// matcher about the tokens before it accepts them. The error is passed
+    /// on all the same, so that a mistake in this crate cannot turn into a
+    /// panic.
+    pub fn matcher(&self) -> Result<Matcher, BuildError> {
+        let specs: Vec<TokenSpec> = self.tokens.iter().map(Token::spec).collect();
+        Matcher::build(&specs)
     }
 
     /// Calls `visit` with every file path of the configuration.
