@@ -51,11 +51,18 @@
 //! once, when the analysis arrives, and kept with the text.
 //!
 //! - The statement arms the threshold when its analysis names a listed
-//!   table that it reads, or when it runs what an earlier statement
-//!   stored (`EXECUTE`, `FETCH`), whose tables it cannot show.
+//!   table, whatever it does with it, or when it runs what an earlier
+//!   statement stored (`EXECUTE`, `FETCH`), whose tables it cannot show.
 //! - A statement without an analysis, of any reason, and a statement the
 //!   tracker does not know, may read any table: their results are held to
 //!   the threshold whenever the rule applies to the session.
+//! - A statement can store a query under a name of its own: a view, a
+//!   table made from a query, a rule, a function. Once the session has
+//!   passed on such a statement that names a listed table, or a statement
+//!   that carries code, or any statement without an analysis, every later
+//!   result of the session is held to the threshold, whatever it names.
+//!   What was stored before the session, or by another one, is not known
+//!   here: a view over a listed table must be listed itself.
 //! - A result is everything a `Query` returns, over all statements of its
 //!   text, or everything a portal returns, over all `Execute`s of it. Where
 //!   the tracker does not know the result, rows are counted together until
@@ -96,7 +103,7 @@
 //! | The message is malformed | at once |
 //! | The statement is longer than `max_parse_bytes` | at once |
 //! | The message arrives in parts, too large to hold | at its header |
-//! | The session's `client_encoding` is not `UTF8`, or `standard_conforming_strings` is off | at once |
+//! | The session's `client_encoding` is not `UTF8`, `standard_conforming_strings` is not `on`, or either is not known | at once |
 //! | The parser refused the statement, or it nests too deep | when the runtime answers |
 //! | The analysis is incomplete: a list in it was full | when the runtime answers |
 //! | The parser threads were busy, did not answer in time, or one panicked | when the runtime answers |
@@ -130,13 +137,29 @@
 //!
 //! The parser reads UTF-8, and reads strings as the database does with
 //! `standard_conforming_strings` on. The hook follows what the server
-//! reports of both settings. Until the server has reported
-//! `client_encoding`, it is taken as unknown, and no statement is
-//! analysed.
+//! reports of both settings. Until the server has reported both, they are
+//! taken as unknown, and no statement is analysed.
 //!
-//! A change of either setting is known here only when the server reports
-//! it. A client that changes one and sends its next statement without
-//! waiting for the answer has that statement read under the old setting.
+//! The server reports a change with its answer, and a client need not
+//! wait for the answer before it sends its next statement. So a statement
+//! is only analysed when the settings are known for the moment the
+//! database reads it, see [`Reading`]:
+//!
+//! - After a statement that may change a setting has been passed on,
+//!   nothing is analysed until the server has answered it. Such a
+//!   statement is one whose analysis says so
+//!   ([`Analysis::may_change_settings`]), one that has no analysis, a
+//!   `FunctionCall`, and an `Execute` of a statement that is one of these
+//!   or is not known.
+//! - A change made inside a transaction is undone when the transaction
+//!   fails, and any statement can fail. From such a statement until the
+//!   server reports that no transaction is open, a statement is only
+//!   analysed when the server has answered everything sent before it.
+//!
+//! A statement that is not analysed for this reason is a statement
+//! without an analysis. A function or procedure of the database that
+//! changes one of the two settings when it is called is not seen: its
+//! code is not in the statement.
 //!
 //! # Events
 //!
@@ -186,6 +209,221 @@ struct Waiting {
     text: Arc<Kept>,
     /// The name of the message that carries the statement.
     name: Option<&'static str>,
+    /// Whether the database runs the statement when it gets the message:
+    /// a `Query`. A `Parse` only stores it.
+    runs: bool,
+}
+
+/// What is known of the two settings that decide how the database reads
+/// the text of a statement, for the moment it reads the next one.
+///
+/// The server reports a setting when it changes, before the
+/// `ReadyForQuery` that ends the answer to what changed it. So the reports
+/// are the truth once the server has answered everything that may have
+/// changed a setting, and they stay the truth for as long as nothing
+/// passed on since can change one.
+///
+/// The messages of the client that the server answers with a
+/// `ReadyForQuery` are counted, and so are those answers. A message that
+/// the server does not answer after all only makes the count of what is
+/// outstanding too high, which keeps statements from being analysed and
+/// never allows an analysis.
+///
+/// One such message is common: a `Sync` sent while the server reads the
+/// data of a `COPY ... FROM STDIN`, which the server ignores. Client
+/// libraries send one behind every `Execute`. It is taken out of the count
+/// again when the server reports that the copy ended well, see
+/// [`CopyIn`]. Any other message the server leaves unanswered stays in
+/// the count: from then on, a statement that may change a setting leaves
+/// the session without analyses.
+#[derive(Debug, Default)]
+struct Reading {
+    /// Whether the server reported `client_encoding` as `UTF8`. `None`
+    /// until it has reported one.
+    utf8: Option<bool>,
+    /// Whether the server reported `standard_conforming_strings` as `on`.
+    /// `None` until it has reported one.
+    conforming: Option<bool>,
+    /// The messages passed on that the server answers with a
+    /// `ReadyForQuery`: `Query`, `Sync`, `FunctionCall`.
+    sent: u64,
+    /// The `ReadyForQuery` of the server that answer them. Never more
+    /// than `sent`: the one that ends the login answers none.
+    answered: u64,
+    /// The count `answered` has to reach before the server has answered
+    /// every statement that may have changed a setting.
+    changed_until: u64,
+    /// A statement that may have changed a setting was passed on, and
+    /// the server has not yet answered it and reported that no
+    /// transaction is open. Until then the change may not be reported
+    /// yet, or may be undone by a statement that fails.
+    provisional: bool,
+    /// A `Parse`, `Bind`, `Execute` or the like was passed on since the
+    /// last message the server answers with a `ReadyForQuery`.
+    unsynced: bool,
+    /// How many `Query` and `Execute` messages were passed on since the
+    /// server was last known to have answered everything.
+    runs: u8,
+    /// What was passed on since the last `Query` or `Execute`.
+    copy: CopyIn,
+    /// A copy the server announced and the client ended, whose statement
+    /// is no longer the last: where its `Sync` messages began and how
+    /// many they were.
+    ended: Option<(u64, u64)>,
+}
+
+/// The messages passed on since the last `Query` or `Execute`, as far as
+/// they matter if that statement is a `COPY ... FROM STDIN`.
+///
+/// While the server reads the data of such a copy it ignores `Sync`, and
+/// answers none of them. Whether it did so is only certain afterwards:
+/// when it reports the copy as complete, it has read everything from the
+/// statement to the first `CopyDone` as part of the copy. Had the copy
+/// failed, at any point, it would have reported an error instead, and
+/// some of those `Sync` messages may have been answered.
+#[derive(Debug, Default)]
+struct CopyIn {
+    /// The count of [`Reading::sent`] when the statement was passed on.
+    base: u64,
+    /// The `Sync` messages counted since, before the client ended the
+    /// copy.
+    syncs: u64,
+    /// The client sent `CopyDone` or `CopyFail`.
+    closed: bool,
+    /// The client sent, before it ended the copy, a message that makes
+    /// the server leave a copy with an error.
+    spoiled: bool,
+    /// The server announced a copy, and the statement is the only one
+    /// that can have begun it.
+    announced: bool,
+}
+
+impl Reading {
+    /// Whether the database reads the next message of the client as the
+    /// parser does. Asked before the message is counted.
+    ///
+    /// While a change may be open, that is so only when the server has
+    /// answered everything: then nothing is on its way that could make a
+    /// change, or fail and undo one.
+    const fn known(&self) -> bool {
+        matches!(self.utf8, Some(true))
+            && matches!(self.conforming, Some(true))
+            && (!self.provisional || (self.answered >= self.sent && !self.unsynced))
+    }
+
+    /// A message of the client is passed on.
+    fn passed(&mut self, tag: u8) {
+        // The server has answered everything sent before this message.
+        if self.answered >= self.sent && !self.unsynced {
+            self.runs = 0;
+        }
+        match tag {
+            frontend::tag::QUERY | frontend::tag::SYNC | frontend::tag::FUNCTION_CALL => {
+                self.sent = self.sent.saturating_add(1);
+                self.unsynced = false;
+            }
+            // The server does nothing that could fail or change a setting.
+            frontend::tag::FLUSH
+            | frontend::tag::TERMINATE
+            | frontend::tag::COPY_DATA
+            | frontend::tag::COPY_DONE
+            | frontend::tag::COPY_FAIL => {}
+            _ => self.unsynced = true,
+        }
+        match tag {
+            frontend::tag::QUERY | frontend::tag::EXECUTE => {
+                // A copy that is complete on the side of the client keeps
+                // its place until the server has said how it ended.
+                if self.copy.announced && self.copy.closed && !self.copy.spoiled {
+                    self.ended = Some((self.copy.base, self.copy.syncs));
+                }
+                self.copy = CopyIn {
+                    base: self.sent,
+                    ..CopyIn::default()
+                };
+                self.runs = self.runs.saturating_add(1);
+            }
+            frontend::tag::SYNC => {
+                if !self.copy.closed && !self.copy.spoiled {
+                    self.copy.syncs = self.copy.syncs.saturating_add(1);
+                }
+            }
+            frontend::tag::FLUSH | frontend::tag::TERMINATE | frontend::tag::COPY_DATA => {}
+            frontend::tag::COPY_DONE | frontend::tag::COPY_FAIL => self.copy.closed = true,
+            _ => {
+                if !self.copy.closed {
+                    self.copy.spoiled = true;
+                }
+            }
+        }
+    }
+
+    /// The server announces that it reads the data of a copy. Only one
+    /// statement may be in question: with more than one on its way, the
+    /// copy can belong to an earlier one than the last.
+    const fn copy_announced(&mut self) {
+        if self.runs == 1 {
+            self.copy.announced = true;
+        }
+    }
+
+    /// The server reports a statement as complete. After the announcement
+    /// of a copy, it is the copy.
+    fn completed(&mut self) {
+        let ended = self.ended.take().or_else(|| {
+            let copy = &mut self.copy;
+            let ended =
+                (copy.announced && copy.closed && !copy.spoiled).then_some((copy.base, copy.syncs));
+            copy.announced = false;
+            copy.syncs = 0;
+            ended
+        });
+        let Some((base, syncs)) = ended else { return };
+        // The server read these `Sync` messages as part of the copy and
+        // answers none of them: they leave the count, and what was counted
+        // after them moves up.
+        let last = base.saturating_add(syncs);
+        self.sent = self.sent.saturating_sub(syncs).max(self.answered);
+        if self.changed_until > last {
+            self.changed_until = self.changed_until.saturating_sub(syncs);
+        } else if self.changed_until > base {
+            self.changed_until = base.saturating_add(1);
+        }
+    }
+
+    /// The message passed on last runs something that may change a
+    /// setting. The server has answered it with the `ReadyForQuery` of
+    /// the message itself, or with that of the `Sync` still to come.
+    const fn may_have_changed(&mut self) {
+        self.changed_until = if self.unsynced {
+            self.sent.saturating_add(1)
+        } else {
+            self.sent
+        };
+        self.provisional = true;
+    }
+
+    /// A `ReadyForQuery` of the server, with the state of the transaction
+    /// it reports, when that could be read.
+    const fn ready(&mut self, transaction: Option<u8>) {
+        // A copy that had ended well would have been reported before this.
+        self.ended = None;
+        self.copy.announced = false;
+        if self.answered < self.sent {
+            self.answered = self.answered.saturating_add(1);
+        }
+        // Outside a transaction nothing is left that could be undone.
+        if matches!(transaction, Some(b'I')) && self.answered >= self.changed_until {
+            self.provisional = false;
+        }
+    }
+
+    /// A report of a setting could not be read: neither is known until
+    /// the server reports it again.
+    const fn lost(&mut self) {
+        self.utf8 = Some(false);
+        self.conforming = Some(false);
+    }
 }
 
 /// The rows of one result, as the row threshold counts them.
@@ -222,15 +460,15 @@ pub(super) struct Hook {
     /// The `id` of the next request.
     next_id: u64,
     waiting: Option<Waiting>,
-    /// Whether the server reported `client_encoding` as `UTF8`. `None`
-    /// until it has reported one.
-    utf8: Option<bool>,
-    /// Whether the server reported `standard_conforming_strings` as
-    /// anything but `on`.
-    lenient_strings: bool,
+    /// How the database reads a statement, as far as it is known.
+    reading: Reading,
     /// The rows of results the tracker does not know, until the
     /// transaction ends.
     blind: Rows,
+    /// The session passed on a statement that may have stored a query or
+    /// code that reaches a table of the row threshold. From then on every
+    /// result is held to the threshold, whatever its statement names.
+    wide: bool,
 }
 
 /// Who the statements of a session come from.
@@ -315,8 +553,9 @@ pub(super) fn parsed_query(analysis: &Analysis) -> Option<Query> {
 }
 
 /// The row threshold a result of `statement` is held to.
-fn armed(statement: &Statement<'_>, context: &Context<'_>) -> Option<RowThreshold> {
-    if let Statement::Kept(kept) = statement
+fn armed(statement: &Statement<'_>, wide: bool, context: &Context<'_>) -> Option<RowThreshold> {
+    if !wide
+        && let Statement::Kept(kept) = statement
         && let Some(armed) = kept.threshold()
     {
         return armed.clone();
@@ -356,6 +595,18 @@ fn raise(
     actions
 }
 
+/// Whether what an `Execute` runs may change a setting: anything but a
+/// statement the tracker holds with an analysis that says it does not.
+fn runs_unread(statement: &Statement<'_>) -> bool {
+    match statement {
+        Statement::Kept(kept) => !matches!(
+            kept.analysis(),
+            Some(Ok(analysis)) if !analysis.may_change_settings()
+        ),
+        _ => true,
+    }
+}
+
 /// Ends a session whose statement must not reach the database. Nothing of
 /// the statement was passed on, so there is nothing to cancel.
 pub(super) fn block(context: &Context<'_>, client_can_be_told: bool, out: &mut Output) -> Verdict {
@@ -373,26 +624,33 @@ impl Hook {
     /// the database reads a statement.
     pub(super) fn server(&mut self, frame: Frame<'_>) {
         if frame.tag() == backend::tag::READY_FOR_QUERY {
+            let transaction = frame.body().first().copied();
+            self.reading.ready(transaction);
             // Portals end with the transaction, and so does what is counted
             // for results that are not known.
-            if frame.body().first() != Some(&b'T') {
+            if transaction != Some(b'T') {
                 self.blind = Rows::default();
             }
             return;
+        }
+        match frame.tag() {
+            backend::tag::COPY_IN_RESPONSE => self.reading.copy_announced(),
+            backend::tag::COMMAND_COMPLETE => self.reading.completed(),
+            _ => {}
         }
         if frame.tag() != backend::tag::PARAMETER_STATUS {
             return;
         }
         let Ok(status) = backend::ParameterStatus::from_frame(frame) else {
-            self.settings_lost();
+            self.reading.lost();
             return;
         };
         match status.name() {
             b"client_encoding" => {
-                self.utf8 = Some(status.value().eq_ignore_ascii_case(b"UTF8"));
+                self.reading.utf8 = Some(status.value().eq_ignore_ascii_case(b"UTF8"));
             }
             b"standard_conforming_strings" => {
-                self.lenient_strings = status.value() != b"on";
+                self.reading.conforming = Some(status.value() == b"on");
             }
             _ => {}
         }
@@ -400,15 +658,14 @@ impl Hook {
 
     /// The header of a message of the server that arrives in parts.
     pub(super) fn server_chunked(&mut self, tag: u8) {
-        if tag == backend::tag::PARAMETER_STATUS {
-            self.settings_lost();
+        match tag {
+            backend::tag::PARAMETER_STATUS => self.reading.lost(),
+            // The state of the transaction is in a part not seen here.
+            backend::tag::READY_FOR_QUERY => self.reading.ready(None),
+            backend::tag::COPY_IN_RESPONSE => self.reading.copy_announced(),
+            backend::tag::COMMAND_COMPLETE => self.reading.completed(),
+            _ => {}
         }
-    }
-
-    /// A report of a setting could not be read: the encoding is unknown
-    /// until the server reports it again.
-    const fn settings_lost(&mut self) {
-        self.utf8 = Some(false);
     }
 
     /// A whole message of the client that the scanner is about to pass on,
@@ -421,7 +678,12 @@ impl Hook {
         client_can_be_told: bool,
         out: &mut Output,
     ) -> Verdict {
-        let sql = match frame.tag() {
+        let tag = frame.tag();
+        // What is known of the settings for the moment the database reads
+        // this message, which is before it does what the message asks.
+        let readable = self.reading.known();
+        self.reading.passed(tag);
+        let sql = match tag {
             frontend::tag::QUERY => frontend::Query::from_frame(frame)
                 .ok()
                 .map(|query| query.sql()),
@@ -429,12 +691,29 @@ impl Hook {
                 .ok()
                 .map(|parse| parse.sql()),
             frontend::tag::FUNCTION_CALL => {
-                return Self::function_call(place, ledger, client_can_be_told, out);
+                // The function it calls by number may be the one that
+                // changes a setting.
+                self.reading.may_have_changed();
+                return self.function_call(place, ledger, client_can_be_told, out);
+            }
+            frontend::tag::EXECUTE => {
+                if runs_unread(place.statement) {
+                    self.reading.may_have_changed();
+                }
+                return Verdict::Forward;
             }
             _ => return Verdict::Forward,
         };
+        // A `Query` runs its statement now. A `Parse` stores it, and the
+        // `Execute` that runs it is looked at when it comes.
+        let runs = tag == frontend::tag::QUERY;
         let context = place.context;
         let Some(rules) = rules_for(context) else {
+            // Nobody reads the statement, so it may be one that changes a
+            // setting. Rules loaded later must not take it for granted.
+            if runs {
+                self.reading.may_have_changed();
+            }
             return Verdict::Forward;
         };
         // The parser's form of the statement is what an event shows under
@@ -445,9 +724,7 @@ impl Hook {
 
         let held = match sql {
             None => Err(ParseFailure::Unreadable),
-            Some(_) if self.utf8 != Some(true) || self.lenient_strings => {
-                Err(ParseFailure::Encoding)
-            }
+            Some(_) if !readable => Err(ParseFailure::Encoding),
             Some(sql) if sql.len() > limits.max_bytes => Err(ParseFailure::TooLarge),
             // The session shows no message of the client while it holds
             // one. Should it, the second statement is not analysed.
@@ -457,10 +734,14 @@ impl Hook {
         let sql = match held {
             Ok(sql) => sql,
             Err(reason) => {
+                if runs {
+                    self.reading.may_have_changed();
+                }
                 let actions = raise(reason, rules, place, ledger, out);
                 return if actions.contains(Action::Kill) {
                     block(context, client_can_be_told, out)
                 } else {
+                    self.wide = true;
                     Verdict::Forward
                 };
             }
@@ -487,6 +768,7 @@ impl Hook {
             rules: Arc::clone(rules),
             text,
             name: place.name,
+            runs,
         });
         Verdict::Hold
     }
@@ -500,6 +782,7 @@ impl Hook {
 
     /// A whole `FunctionCall` of the client.
     fn function_call(
+        &mut self,
         place: &Place<'_>,
         ledger: &Ledger,
         client_can_be_told: bool,
@@ -513,6 +796,7 @@ impl Hook {
         if actions.contains(Action::Kill) {
             block(context, client_can_be_told, out)
         } else {
+            self.wide = true;
             Verdict::Forward
         }
     }
@@ -522,11 +806,21 @@ impl Hook {
     /// Returns whether the session must end before the message is passed
     /// on.
     pub(super) fn client_chunked(
+        &mut self,
         tag: u8,
         place: &Place<'_>,
         ledger: &Ledger,
         out: &mut Output,
     ) -> bool {
+        self.reading.passed(tag);
+        // Nothing reads what arrives in parts: whatever it runs may change
+        // a setting.
+        if matches!(
+            tag,
+            frontend::tag::QUERY | frontend::tag::FUNCTION_CALL | frontend::tag::EXECUTE
+        ) {
+            self.reading.may_have_changed();
+        }
         let (reason, rules) = match tag {
             frontend::tag::QUERY | frontend::tag::PARSE => {
                 (ParseFailure::Streamed, rules_for(place.context))
@@ -540,7 +834,9 @@ impl Hook {
         let Some(rules) = rules else {
             return false;
         };
-        raise(reason, rules, place, ledger, out).contains(Action::Kill)
+        let blocked = raise(reason, rules, place, ledger, out).contains(Action::Kill);
+        self.wide |= !blocked;
+        blocked
     }
 
     /// The answer of the runtime to the request `id`. Returns what becomes
@@ -574,6 +870,16 @@ impl Hook {
             waiting
                 .text
                 .armed(waiting.rules.row_threshold(analysis, &subject(context)));
+        }
+        // No other message of the client was passed on since this one, so
+        // it is still the last.
+        let unread = !matches!(&outcome, Ok(analysis) if !analysis.may_change_settings());
+        if waiting.runs && unread {
+            self.reading.may_have_changed();
+        }
+        // What the statement stores, a later one reads under another name.
+        if !matches!(&outcome, Ok(analysis) if !waiting.rules.stores_a_listed_read(analysis)) {
+            self.wide = true;
         }
 
         let statement = Statement::Kept(Arc::clone(&waiting.text));
@@ -634,8 +940,10 @@ impl Hook {
         ledger: &mut Ledger,
         out: &mut Output,
     ) -> ActionSet {
+        let wide = self.wide;
         let counted = rows.unwrap_or(&mut self.blind);
-        let Some((threshold, count)) = counted.count(|| armed(place.statement, place.context))
+        let Some((threshold, count)) =
+            counted.count(|| armed(place.statement, wide, place.context))
         else {
             return ActionSet::EMPTY;
         };

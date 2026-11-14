@@ -97,6 +97,8 @@ mod scan;
 #[cfg(test)]
 mod scan_tests;
 mod session;
+#[cfg(all(test, feature = "rules"))]
+mod settings_tests;
 #[cfg(test)]
 mod tarpit_tests;
 mod track;

@@ -348,3 +348,94 @@ fn an_exempt_session_is_counted_and_nothing_else() {
     );
     assert_eq!(harness.to_client, rows(0, 5));
 }
+
+#[test]
+fn a_statement_that_returns_the_rows_it_writes_is_held_to_the_threshold() {
+    let mut harness = session(policy(threshold(3, ALERT)));
+    run(
+        &mut harness,
+        "INSERT INTO users (id) SELECT g FROM generate_series(1, 9) g \
+         ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id RETURNING users.*",
+    );
+    harness.server(&rows(0, 4));
+    assert_eq!(threshold_hits(&harness).len(), 1);
+}
+
+#[test]
+fn a_read_by_a_name_the_session_gave_a_listed_table_is_held_to_the_threshold() {
+    for stored in [
+        "CREATE TEMP VIEW v AS SELECT * FROM users WHERE id IS NOT NULL",
+        "CREATE TEMP TABLE v AS SELECT * FROM users WHERE id IS NOT NULL",
+        "SELECT * INTO TEMP v FROM users WHERE id IS NOT NULL",
+        "CREATE MATERIALIZED VIEW v AS SELECT * FROM users WHERE id IS NOT NULL",
+        "CREATE RULE r AS ON SELECT TO v DO INSTEAD SELECT * FROM users WHERE id > 0",
+        // Code in a string, which is passed on under `alert`.
+        "CREATE FUNCTION v() RETURNS SETOF record LANGUAGE sql AS 'SELECT * FROM users'",
+        "DO $$ BEGIN CREATE TEMP VIEW v AS SELECT * FROM users; END $$",
+    ] {
+        let mut harness = session(policy(threshold(3, ALERT)));
+        run(&mut harness, stored);
+        harness.server(&join(&[&complete("SELECT 0"), &ready(b'I')]));
+        assert!(threshold_hits(&harness).is_empty(), "{stored}");
+
+        // The statement names no listed table.
+        run(&mut harness, "SELECT * FROM v");
+        harness.server(&rows(0, 3));
+        assert!(threshold_hits(&harness).is_empty(), "{stored}");
+        harness.server(&rows(3, 1));
+        assert_eq!(threshold_hits(&harness).len(), 1, "{stored}");
+    }
+}
+
+#[test]
+fn a_name_given_to_a_table_that_is_not_listed_changes_nothing() {
+    let mut harness = session(policy(threshold(3, ALERT)));
+    for sql in [
+        "CREATE TEMP VIEW v AS SELECT * FROM orders",
+        "SELECT * FROM users WHERE id = 1",
+        "INSERT INTO t SELECT * FROM users WHERE id = 1",
+    ] {
+        run(&mut harness, sql);
+        harness.server(&join(&[&complete("SELECT 0"), &ready(b'I')]));
+    }
+    run(&mut harness, "SELECT * FROM v");
+    harness.server(&rows(0, 9));
+    assert!(threshold_hits(&harness).is_empty());
+}
+
+#[test]
+fn after_a_statement_that_was_passed_on_unread_every_result_is_held_to_the_threshold() {
+    // Longer than the parser is given: it could have been a view.
+    let mut harness = session(policy(
+        RuleSet::builder()
+            .on_parse_failure(OnParseFailure::Alert)
+            .max_parse_bytes(1024)
+            .unwrap()
+            .row_threshold(&["users".to_owned()], 3, ALERT, RuleScope::default())
+            .unwrap()
+            .build(),
+    ));
+    let long = format!(
+        "CREATE TEMP VIEW v AS SELECT * FROM users /* {} */",
+        "x".repeat(1024)
+    );
+    harness.client(&query(&long));
+    assert!(asked(&mut harness).is_empty());
+    harness.server(&join(&[&complete("CREATE VIEW"), &ready(b'I')]));
+
+    run(&mut harness, "SELECT * FROM v");
+    harness.server(&rows(0, 4));
+    assert_eq!(threshold_hits(&harness).len(), 1);
+
+    // The same after a statement that arrives in parts.
+    let mut harness = session(policy(threshold(3, ALERT)));
+    let huge = format!(
+        "CREATE TEMP VIEW v AS SELECT * FROM users /* {} */",
+        "x".repeat(LIMIT)
+    );
+    harness.client(&query(&huge));
+    harness.server(&join(&[&complete("CREATE VIEW"), &ready(b'I')]));
+    run(&mut harness, "SELECT * FROM v");
+    harness.server(&rows(0, 4));
+    assert_eq!(threshold_hits(&harness).len(), 1);
+}

@@ -618,10 +618,11 @@ pub(super) mod with_rules {
     #[test]
     fn a_statement_the_database_reads_differently_is_not_analysed() {
         type Settings = &'static [(&'static [u8], &'static [u8])];
-        let cases: [Settings; 5] = [
-            // The server has reported nothing yet.
+        let cases: [Settings; 6] = [
+            // The server has reported nothing yet, or one of the two.
             &[],
             &[(b"standard_conforming_strings", b"on")],
+            &[(b"client_encoding", b"UTF8")],
             &[(b"client_encoding", b"LATIN1")],
             &[(b"client_encoding", b"SJIS")],
             &[
@@ -656,16 +657,21 @@ pub(super) mod with_rules {
         let message = query("SELECT 1");
         let mut harness = session(policy(OnParseFailure::Allow));
 
+        // The server answers each statement before the next is sent: one
+        // that was passed on unread may have changed a setting itself.
+        let answered = frame(b'Z', b"I");
         harness.server(&parameter(b"client_encoding", b"EUC_JP"));
         harness.client(&message);
         assert!(asked(&mut harness).is_empty());
         assert_eq!(failures(&harness).len(), 1);
+        harness.server(&answered);
 
         harness.server(&parameter(b"client_encoding", b"UTF8"));
         harness.server(&parameter(b"standard_conforming_strings", b"off"));
         harness.client(&message);
         assert!(asked(&mut harness).is_empty());
         assert_eq!(failures(&harness).len(), 2);
+        harness.server(&answered);
 
         // A setting that has nothing to do with it changes nothing.
         harness.server(&parameter(b"application_name", b"LATIN1"));

@@ -1026,7 +1026,7 @@ impl Inspector for Scanner {
         // A statement that arrives in parts cannot be held for the rules.
         #[cfg(feature = "rules")]
         let blocked = match direction {
-            Direction::FromClient => Hook::client_chunked(tag, &place, &self.ledger, out),
+            Direction::FromClient => self.rules.client_chunked(tag, &place, &self.ledger, out),
             Direction::FromServer => {
                 self.rules.server_chunked(tag);
                 false
