@@ -353,9 +353,15 @@ impl Driver {
             // Reading produces bytes for the other side, so a direction is
             // read only while the other side keeps up.
             let read_client = client_reader.is_some() && to_backend < HIGH_WATER;
-            // Nor is the server while the client is held back, so a
-            // tarpitted session holds no more than one read.
-            let read_backend = backend_reader.is_some() && to_client < HIGH_WATER && !client_held;
+            // Nor is the server while the client is held back, nor in a
+            // tarpitted session before the last read has reached the
+            // client, so such a session holds no more than one read and a
+            // new read cannot put off what is already due.
+            let tarpitted = self.tarpit_until.is_some();
+            let read_backend = backend_reader.is_some()
+                && to_client < HIGH_WATER
+                && !client_held
+                && !(tarpitted && to_client > 0);
             let (flush_client, flush_backend) = (
                 to_client == 0 && self.client_unflushed,
                 to_backend == 0 && self.backend_unflushed,
