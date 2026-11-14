@@ -143,6 +143,12 @@ verified="{ mode: verify-full, ca: /state/certs/ca.crt }"
     done
     listener "legacy-tls" "7000" "pglegacy:5432" "$plain" "$verified"
     cat <<'REST'
+tokens:
+  - id: itest-alert
+    values: ["itest-bait-alert-5d83c1"]
+  - id: itest-kill
+    values: ["itest-bait-kill-7e20a9"]
+    actions: [kill]
 events:
   sinks:
     - type: stdout
