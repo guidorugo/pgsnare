@@ -39,3 +39,10 @@ path = "fuzz_targets/session.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "rules"
+path = "fuzz_targets/rules.rs"
+test = false
+doc = false
+bench = false
