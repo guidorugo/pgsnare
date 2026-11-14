@@ -56,7 +56,7 @@ These are stated in the README and the design document and are repeated here, so
 **Detection**
 
 - **Transformed values.** A value hashed, cut, re-encoded or encrypted inside the database before it leaves does not match.
-- **Blind extraction.** Boolean or time-based SQL injection infers data without returning it. The optional SQL rules, not yet built, are meant to flag the functions such attacks rely on.
+- **Blind extraction.** Boolean or time-based SQL injection infers data without returning it. The optional SQL rules can flag the functions such attacks rely on.
 - **Rows already sent.** `kill` withholds the message that holds the token, not the earlier rows of the same result. A message larger than `inspection.max_buffered_frame` is scanned as a stream, and bytes before the token inside it can reach the client.
 - **Honeytokens used as a password are not detected.** Login messages are not scanned. A honeytoken used as a user name is detected, and so is one used in a query. Alternatives are on the [future work](../README.md#future-work) list.
 - **Bypass.** Traffic that does not pass through pgsnare is not seen. The network must force every connection through it. In the sidecar pattern the application can still reach the database directly, because one pod has one network identity.

@@ -13,7 +13,7 @@ pgsnare sits between your applications and one PostgreSQL server. This guide cov
 
 ## What the image holds
 
-- One static binary, `/usr/local/bin/pgsnare`, owned by root and not writable.
+- One static binary, `/usr/local/bin/pgsnare`, owned by root and not writable. It is built with the default features, so it contains the SQL rules and accepts a configuration with a `rules` section. The Helm chart cannot set rules yet (see its limits below).
 - An Alpine base, pinned by digest, with the CA certificates and the files that name users. **The base has a shell (busybox) and a package manager.** That is the owner's choice of base. Nothing installs a package at run time: the process is not root, has no capability and has a read-only root filesystem when started as below.
 - User and group `65532`, named by number so that Kubernetes can check it is not root.
 - The entry point `pgsnare`, and the default command `run --config /etc/pgsnare/pgsnare.yaml`.
