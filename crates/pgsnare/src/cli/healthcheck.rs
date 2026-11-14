@@ -27,7 +27,9 @@
 //!   to every address of the machine is asked over the loopback interface.
 //! - The connection is made from the very address it goes to. Only an
 //!   address of this machine can be used that way, so the request cannot
-//!   leave the machine, whatever the configuration says.
+//!   leave the machine, whatever the configuration says. The one exception
+//!   is a system that was set to let a process bind to an address that is
+//!   not its own (`ip_nonlocal_bind` on Linux).
 //! - The answer is a status and nothing more. A redirect is not followed:
 //!   it is not the answer of a healthy proxy.
 //! - The whole check has [`TIME_LIMIT`]. A listener that does not answer
