@@ -6,6 +6,8 @@ use core::fmt;
 use core::net::IpAddr;
 use std::sync::Arc;
 
+use crate::detect::Matcher;
+
 use super::{ActionSettings, Exemption, Inspection, QueryRedaction, TokenId, TokenPolicy};
 
 /// Everything the session logic needs to decide what a message means and
@@ -16,8 +18,13 @@ use super::{ActionSettings, Exemption, Inspection, QueryRedaction, TokenId, Toke
 /// message. Two sessions, or two messages of one session, may therefore see
 /// different snapshots, but nothing ever sees a half-updated one.
 ///
+/// The snapshot also holds the compiled [`Matcher`] of its tokens, so that
+/// the tokens a session looks for and the responses to them always come
+/// from the same configuration. Two snapshots cannot be compared: a
+/// compiled matcher has no equality.
+///
 /// Build one with [`PolicySnapshot::builder`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct PolicySnapshot {
     generation: u64,
     inspection: Inspection,
@@ -26,6 +33,8 @@ pub struct PolicySnapshot {
     exemptions: Vec<Exemption>,
     actions: ActionSettings,
     query_redaction: QueryRedaction,
+    /// Shared, so that cloning a snapshot never copies compiled patterns.
+    matcher: Arc<Matcher>,
 }
 
 impl PolicySnapshot {
@@ -94,6 +103,13 @@ impl PolicySnapshot {
     pub const fn query_redaction(&self) -> QueryRedaction {
         self.query_redaction
     }
+
+    /// The matcher that finds the values of the tokens in traffic. It finds
+    /// nothing when the snapshot has no tokens.
+    #[must_use]
+    pub fn matcher(&self) -> &Matcher {
+        &self.matcher
+    }
 }
 
 /// Why a snapshot could not be built.
@@ -123,6 +139,11 @@ pub enum PolicyError {
         /// What is wrong with it.
         reason: &'static str,
     },
+    /// The matcher does not fit the tokens.
+    Matcher {
+        /// What is wrong with it.
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for PolicyError {
@@ -132,6 +153,7 @@ impl fmt::Display for PolicyError {
             Self::Token { id, reason } => write!(f, "token `{id}`: {reason}"),
             Self::Exemption { index, reason } => write!(f, "exemption {index}: {reason}"),
             Self::Setting { section, reason } => write!(f, "{section}: {reason}"),
+            Self::Matcher { reason } => write!(f, "matcher: {reason}"),
         }
     }
 }
@@ -147,6 +169,7 @@ pub struct PolicySnapshotBuilder {
     exemptions: Vec<Exemption>,
     actions: ActionSettings,
     query_redaction: QueryRedaction,
+    matcher: Option<Matcher>,
 }
 
 impl PolicySnapshotBuilder {
@@ -206,12 +229,22 @@ impl PolicySnapshotBuilder {
         self
     }
 
+    /// Sets the matcher compiled from the values of the tokens. A snapshot
+    /// with tokens needs one, built from exactly those tokens: without it
+    /// the tokens would be named and never found.
+    #[must_use]
+    pub fn matcher(mut self, matcher: Matcher) -> Self {
+        self.matcher = Some(matcher);
+        self
+    }
+
     /// Checks everything and freezes it.
     ///
     /// # Errors
     ///
-    /// Returns the first problem found: a token id used twice, or an invalid
-    /// token, exemption or setting.
+    /// Returns the first problem found: a token id used twice, an invalid
+    /// token, exemption or setting, or a matcher that was not built from as
+    /// many tokens as the snapshot has.
     pub fn build(self) -> Result<PolicySnapshot, PolicyError> {
         let Self {
             generation,
@@ -220,6 +253,7 @@ impl PolicySnapshotBuilder {
             exemptions,
             actions,
             query_redaction,
+            matcher,
         } = self;
 
         let setting = |section, result: Result<(), &'static str>| {
@@ -251,6 +285,20 @@ impl PolicySnapshotBuilder {
                 .map_err(|reason| PolicyError::Exemption { index, reason })?;
         }
 
+        let matcher = match matcher {
+            Some(matcher) => matcher,
+            None => Matcher::build(&[]).map_err(|_| PolicyError::Matcher {
+                reason: "an empty matcher could not be built",
+            })?,
+        };
+        // A matcher for other tokens than these would leave a token
+        // undetected, or report one the policy has no response for.
+        if matcher.token_count() != tokens.len() {
+            return Err(PolicyError::Matcher {
+                reason: "it was not built from the tokens of the policy",
+            });
+        }
+
         Ok(PolicySnapshot {
             generation,
             inspection,
@@ -258,6 +306,7 @@ impl PolicySnapshotBuilder {
             exemptions,
             actions,
             query_redaction,
+            matcher: Arc::new(matcher),
         })
     }
 }
@@ -307,6 +356,7 @@ mod tests {
         Action, ActionSet, Escalation, FakeDataSettings, KillSettings, OnError, TarpitSettings,
     };
     use super::*;
+    use crate::detect::TokenSpec;
 
     fn token(id: &str) -> TokenPolicy {
         TokenPolicy::new(TokenId::new(id).unwrap())
@@ -314,6 +364,15 @@ mod tests {
 
     fn id(text: &str) -> TokenId {
         TokenId::new(text).unwrap()
+    }
+
+    /// A matcher for tokens with these ids, each with a value of its own.
+    fn matcher(ids: &[&str]) -> Matcher {
+        let specs: Vec<TokenSpec> = ids
+            .iter()
+            .map(|id| TokenSpec::new(*id, [format!("value-of-{id}@mail.example")]))
+            .collect();
+        Matcher::build(&specs).unwrap()
     }
 
     fn ip(text: &str) -> IpAddr {
@@ -332,6 +391,48 @@ mod tests {
         assert_eq!(snapshot.actions(), &ActionSettings::default());
         assert!(!snapshot.is_exempt(Some("backup"), ip("192.0.2.5")));
         assert_eq!(snapshot.token(&id("nope")), None);
+        assert!(snapshot.matcher().is_empty());
+    }
+
+    #[test]
+    fn the_matcher_of_a_snapshot_finds_the_values_of_its_tokens() {
+        let snapshot = PolicySnapshot::builder()
+            .token(token("alpha"))
+            .matcher(matcher(&["alpha"]))
+            .build()
+            .unwrap();
+        let found: Vec<_> = snapshot
+            .matcher()
+            .scan(b"1\tvalue-of-alpha@mail.example\n")
+            .map(|found| found.unwrap().token_id().as_str().to_owned())
+            .collect();
+        assert_eq!(found, ["alpha"]);
+        // A copy shares the compiled patterns.
+        assert_eq!(snapshot.clone().matcher().token_count(), 1);
+    }
+
+    #[test]
+    fn tokens_without_their_matcher_are_refused() {
+        let wrong = PolicyError::Matcher {
+            reason: "it was not built from the tokens of the policy",
+        };
+        // No matcher at all: the tokens would be named and never found.
+        let missing = PolicySnapshot::builder().token(token("alpha")).build();
+        assert_eq!(missing.unwrap_err(), wrong);
+        // A matcher for fewer tokens, and one for more.
+        let fewer = PolicySnapshot::builder()
+            .tokens([token("alpha"), token("beta")])
+            .matcher(matcher(&["alpha"]))
+            .build();
+        assert_eq!(fewer.unwrap_err(), wrong);
+        let more = PolicySnapshot::builder()
+            .matcher(matcher(&["alpha"]))
+            .build();
+        assert_eq!(more.unwrap_err(), wrong);
+        assert_eq!(
+            wrong.to_string(),
+            "matcher: it was not built from the tokens of the policy"
+        );
     }
 
     #[test]
@@ -357,6 +458,7 @@ mod tests {
             .inspection(Inspection::new(OnError::FailOpen, 4096))
             .token(escalating.clone())
             .tokens([token("zebra"), token("alpha")])
+            .matcher(matcher(&["users-admin-backup", "zebra", "alpha"]))
             .exemption(Exemption::new(Some("backup".to_owned()), None))
             .exemptions([Exemption::new(None, Some("192.0.2.0/24".parse().unwrap()))])
             .actions(actions.clone())
