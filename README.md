@@ -3,8 +3,8 @@
 A PostgreSQL proxy that catches data theft with honeytokens.
 
 > [!IMPORTANT]
-> pgsnare is under construction. It finds honeytokens and answers them, but no version has been released, the integration tests have so far run only `alert` and `kill` against PostgreSQL, and nothing here is ready for use.
-> [Status and roadmap](#status-and-roadmap) shows what exists today. The design is described in [docs/high-level-design.md](docs/high-level-design.md).
+> pgsnare is under construction. It finds honeytokens and answers them, and the repository holds a container image definition, a Helm chart, a Compose example and the release procedure, but **no version has been released**: there is no published image, chart or binary yet, and the release procedure has never run for real. The integration tests have so far run only `alert` and `kill` against PostgreSQL. Do not rely on pgsnare to protect production data yet.
+> [Status and roadmap](#status-and-roadmap) shows what exists today. The design is described in [docs/high-level-design.md](docs/high-level-design.md). To try it, follow the [quickstart](docs/quickstart.md).
 
 ## What it is
 
@@ -91,7 +91,7 @@ Limits to know about:
 
 - Detection is of the value as it travels. A value that is hashed, cut or re-encoded inside the database does not match, and `kill` withholds the message that holds the token, not the messages before it. A message larger than `max_buffered_frame` is scanned as a stream, and bytes before the token inside it can reach the client.
 - Statements are attributed by following the protocol, not by parsing SQL. A statement prepared or deallocated by an SQL command is not followed. When the proxy loses its place, the event says the statement is unknown, and the hit is still raised.
-- `query_redaction: full` puts statements into events as they were sent, so a password written in a statement is shown (token values are still removed). The default is `fingerprint`.
+- `query_redaction: full` is a debugging mode. It puts statements into events as they were sent, so **a password written in a statement is shown**, to everyone who can read the events and the log (token values are still removed). `fingerprint`, the default, is the setting to use in production.
 - If `fake_data` was decided and rows cannot be added at the end of the result, for example after a cursor `FETCH`, the result goes on unchanged, though the event says `fake_data`.
 
 ### Reload
@@ -114,18 +114,39 @@ A security tool should be clear about its limits.
 - **Blind extraction.** Boolean or time-based SQL injection infers data without ever returning it.
 - **Rows already sent.** `kill` withholds the row that contains the token, not the rows that came before it in the same result.
 - **Traffic that bypasses it.** The network must force database connections through pgsnare.
+- **A honeytoken used as a password.** Login messages are not scanned, so a honeytoken that an intruder sends as a password is not detected. A honeytoken used as a user name, or in a query, is. This is a known limit; alternatives are on the [future work](#future-work) list.
 
 The design document explains each of these and what reduces the exposure.
 
 ## Deployment options
 
-| Option | Shape |
-|---|---|
-| Standalone container | Docker or Podman, including Compose |
-| Kubernetes, central proxy | A Deployment and Service in front of the database, installed with a Helm chart |
-| Kubernetes, sidecar | A pgsnare container inside each application pod |
+| Option | Shape | Start here |
+|---|---|---|
+| Try it | PostgreSQL 18, pgsnare with seeded tokens and a demo webhook receiver, in Compose | [Quickstart](docs/quickstart.md), [`examples/compose`](examples/compose/README.md) |
+| Standalone container | Docker or Podman, including Compose | [Deploying pgsnare](docs/deployment.md) |
+| Kubernetes, central proxy | A Deployment and Service in front of the database, installed with a Helm chart | [Chart README](deploy/chart/pgsnare/README.md) |
+| Kubernetes, sidecar | A pgsnare container inside each application pod, as a native sidecar where the cluster supports it | [`deploy/sidecar`](deploy/sidecar/README.md) |
 
-Container images and the Helm chart will be published to the GitHub Container Registry. Because pgsnare relays logins instead of terminating them, the TLS setup has to follow a few rules; see [Authentication and TLS](docs/high-level-design.md#7-authentication-and-tls).
+Because pgsnare relays logins instead of terminating them, the TLS setup has to follow a few rules; see [Authentication and TLS](docs/high-level-design.md#7-authentication-and-tls) and [Deploying pgsnare](docs/deployment.md#tls-which-setup-to-choose).
+
+**The image.** One static binary on an Alpine base pinned by digest, run by user `65532`, with a health check that calls `pgsnare healthcheck`. It is built for x86_64 and aarch64. **The base has a shell and a package manager**: that is the owner's choice of base. What confines the process is that it is not root, holds no capability and has a read-only root filesystem when started as the chart and the examples start it.
+
+**Releases.** None exists yet. A release will be built only by CI, from a version tag that equals the version in `Cargo.toml` and points at a commit on `main`: the binaries and the image for both architectures, and the chart as an OCI artefact in the GitHub Container Registry (`ghcr.io/guidorugo`), with plain manifests rendered from the chart, checksums, SBOMs, signatures and build provenance. The release procedure is rehearsed on every change against a registry inside the CI runner, with a signing key made for the run; keyless signing, provenance and the real registry have not run. See [Verifying a release](docs/verifying-a-release.md) for how a release will be checked, and [Releasing](docs/releasing.md) for the owner's procedure. The first version is 0.0.1.
+
+**Guides.**
+
+- [Quickstart](docs/quickstart.md): the Compose example, from `up` to a first alert.
+- [Deploying pgsnare](docs/deployment.md): standalone and Kubernetes, and the TLS setups.
+- [Hardening guide](docs/hardening.md).
+- [Honeytoken placement](docs/honeytoken-placement.md).
+- [Threat model and known gaps](docs/threat-model.md).
+
+## Future work
+
+- **Look for alternatives to detect a honeytoken used as a password.** Login messages are not scanned today (see [What it will not catch](#what-it-will-not-catch)).
+- SQL rules (step 4 of the roadmap).
+- The first release, and with it the checks that cannot run before: keyless signing, provenance and publishing to the registry.
+- TLS on both legs in the cluster tests, other Kubernetes versions and other network plugins.
 
 ## Security
 
@@ -134,7 +155,7 @@ Container images and the Helm chart will be published to the GitHub Container Re
 
 ## Status and roadmap
 
-pgsnare cannot be used yet: it detects and responds, but no version has been released, and the integration tests have so far run only `alert` and `kill` against PostgreSQL. What exists today:
+pgsnare cannot be relied on yet: it detects and responds, but no version has been released, and the integration tests have so far run only `alert` and `kill` against PostgreSQL. What exists today:
 
 - **Relay.** `pgsnare run` puts a proxy between clients and a database: TLS on both legs, logins, simple and extended queries, COPY, replication, notifications, function calls and cancellation, for protocol 3.0 and 3.2. Tests compare what a client sees from PostgreSQL 15 to 18 directly and through pgsnare, in every supported TLS setup.
 - **Detection.** Every message, in both directions, is scanned for honeytoken values before it is forwarded, and so are the startup parameters and the user name at login. A value split across reads, across the chunks of a large message or across `CopyData` messages is found. A hit becomes a `token_hit` event that names the token, the session and the statement.
@@ -145,6 +166,9 @@ pgsnare cannot be used yet: it detects and responds, but no version has been rel
 - **Honeytoken matcher.** It finds token values in a stream of bytes, however the stream is split.
 - **Configuration and events.** The configuration format, with a [complete example](examples/config/pgsnare.yaml), and the event format.
 - **Honeytoken tools.** `pgsnare token generate` makes new honeytokens: made-up accounts, password hashes in the formats of bcrypt, Argon2id and SCRAM-SHA-256, API keys, card numbers and markers for free text. It prints the SQL statement that plants them and the token file that matches, and connects to nothing. `pgsnare token list` and `pgsnare token test` look into a configuration without ever showing a value. `pgsnare config check` reports every problem of a configuration and warns about settings that give up protection.
+- **Image and chart.** [`deploy/Dockerfile`](deploy/Dockerfile) builds a static binary and an image for x86_64 and aarch64. CI tests the image as pulled from a registry: a numeric user, no setuid file, a read-only root filesystem with no capabilities, a login through it, a `token_hit`, a health check that turns `healthy` and a stop with status 0 on `SIGTERM`; and scans it for known vulnerabilities on every build and nightly. The [Helm chart](deploy/chart/pgsnare/README.md) is checked with `helm lint`, rendered against a pinned set of Kubernetes schemas, and installed into a `kind` cluster that enforces the restricted Pod Security Standard and NetworkPolicy. The cluster tests run on Kubernetes 1.37 only: install to first alert for the central proxy and the sidecar, a token added through a changed Secret without a restart, a rolling update that lets a long statement finish, and isolation of pods that are not on the allowed list. TLS in the cluster is not run: the TLS mounts are rendered and checked, and the example uses TLS on both legs.
+- **Examples and guides.** A [Compose example](examples/compose/README.md) with a smoke test that CI runs on every change, and the guides listed under [Deployment options](#deployment-options).
+- **Release procedure.** [`.github/workflows/release.yml`](.github/workflows/release.yml) runs only from a version tag and has never run. The scripts it uses are rehearsed on every change.
 - **Toolchain.** Builds run in containers with pinned versions. Every change is checked for formatting and lints, tests, fuzz targets, dependency advisories and licences, secrets, and private network addresses.
 
 The steps to the first release:
@@ -155,7 +179,7 @@ The steps to the first release:
 | 2. Detect and alert | Honeytokens, events and sinks. The first usable version | Built: detection, events, sinks, health and metrics. `tarpit`, `fake_data` and reload not yet run against PostgreSQL |
 | 3. Respond | Kill, tarpit, fake data and exemptions | Built, with the same limit |
 | 4. SQL rules | Optional checks on the statements themselves | Not started |
-| 5. Prove and ship | Detection corpus, fuzzing, benchmarks, container image, Helm chart and documentation | Not started |
+| 5. Prove and ship | Detection corpus, fuzzing, benchmarks, container image, Helm chart and documentation | Image, chart, examples, release procedure and guides built; the first release (0.0.1) is not made. Detection corpus and benchmarks: not run |
 
 Progress is tracked in [the pgsnare epic](https://github.com/guidorugo/pgsnare/issues/2).
 
@@ -175,6 +199,8 @@ You need Docker with the Compose plugin, and `make`. Every build and test runs i
 
 CI runs the last six on every pull request, and all of them must pass before it can be merged.
 
+The image, the chart, the cluster tests, the Compose example and the release rehearsal are not `make` targets: they run in CI only, in the workflow [`deploy.yml`](.github/workflows/deploy.yml), on every pull request, every push and nightly. They build and scan the image, check the chart, start a `kind` cluster and a Compose project, and rehearse a release against a registry inside the runner. Nothing of them publishes anything. The scripts are under `deploy/tests/`, and each can be read as the documented procedure.
+
 `tests/bench.sh` runs a small benchmark, against PostgreSQL directly and through pgsnare. It gives a baseline for one machine and is not part of CI.
 
 ## Repository layout
@@ -185,8 +211,16 @@ CI runs the last six on every pull request, and all of them must pass before it 
 | `crates/pgsnare-core` | Session logic (scanning, statement tracking, responses), detection, policy, actions (`kill`, `tarpit`, `fake_data`), bait generators and the event format. No I/O. |
 | `crates/pgsnare` | The runtime and the `pgsnare` command: listeners, TLS, configuration, the policy reload, the event dispatcher and its sinks, the health and metrics listeners, the log and the redaction layer. |
 | `examples/config` | A complete configuration file, with every setting explained. |
+| `examples/compose` | The Compose example: PostgreSQL 18, pgsnare with seeded tokens, a demo webhook receiver, and a smoke test. |
+| `deploy/Dockerfile` | The image, and the stage that exports the binary. |
+| `deploy/chart/pgsnare` | The Helm chart for the central proxy. |
+| `deploy/sidecar` | The sidecar definitions, native and classic. |
+| `deploy/release` | The scripts that publish, sign and verify a release. |
+| `deploy/tools` | The list of every downloaded tool, with its version and checksums, and the installer. |
+| `deploy/tests` | The tests of the image, the scan, the chart, the cluster, the release and the repository rules. They run in CI. |
 | `tests` | Integration tests. They compare what a client sees from PostgreSQL directly and through pgsnare, try every row of the login table, check pgsnare as a container, and give PostgreSQL what `pgsnare token generate` prints. |
-| `docs` | The design. |
+| `docs` | The design, the quickstart, the guides (deployment, hardening, honeytoken placement, threat model), and how to verify and make a release. |
+| `.github/workflows` | The checks (`lint`, `test`, `deny`, `scan`, `itest`, `fuzz`), the image and cluster checks (`deploy`) and the release workflow (`release`). |
 
 ## License
 

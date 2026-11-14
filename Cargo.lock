@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "pgsnare"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "aho-corasick",
  "aws-lc-rs",
@@ -676,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "pgsnare-core"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "aho-corasick",
  "pgsnare-proto",
@@ -687,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "pgsnare-proto"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "bytes",
  "proptest",

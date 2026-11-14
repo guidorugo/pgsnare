@@ -332,6 +332,7 @@ Result inspection cannot see everything, and the documentation must say so.
 - **Blind extraction.** Boolean or time-based SQL injection infers data without ever returning it. The optional SQL rules can flag the functions such attacks rely on.
 - **Rows already sent.** `kill` withholds the row containing the token, not the rows that preceded it in the same result. Token placement matters.
 - **Bypass.** Traffic that does not pass through pgsnare is not seen.
+- **Honeytokens used as a password.** Login messages (the password a client sends, in cleartext, as md5 or in a SASL exchange) are not scanned, so a honeytoken that an intruder sends as a password is not detected. A honeytoken used as a user name is, because the startup message is scanned, and so is one used in a query. This is a known limit and it is not hidden; looking for alternatives is future work (see the README).
 
 ## 9. Responses
 
@@ -622,9 +623,11 @@ Extensions are compiled in. There is no runtime plugin loading, no dynamic libra
 
 ### 14.1 The container image
 
-- One image holds the static binary, CA certificates and a non-root user. It has no shell and no package manager.
-- It is built for x86_64 and aarch64 and published to the GitHub Container Registry. Examples pin it by digest.
-- It runs as a non-root user with no Linux capabilities and a read-only root filesystem.
+- One image holds the static binary, CA certificates and a non-root user, on an Alpine base pinned by digest. **The base has a shell (busybox) and a package manager.** That is the owner's choice of base: it can be pinned, scanned and updated, and it has the certificates and user files. What keeps those tools harmless is not their absence but the confinement of the process (below). Nothing in the image installs a package at run time, and the image test checks what still holds: the user is numeric and not 0, no file has the setuid or setgid bit, nothing but the home directory belongs to anybody but root, no package manager cache is left, and the binary belongs to root and cannot be written.
+- The binary is static (musl), built with `--locked` and the default features; the image holds the very file that the release publishes. The user is `65532`, named by number so that Kubernetes can check it is not root. The entry point is `pgsnare`, and the health check is `pgsnare healthcheck` in exec form.
+- It is built for x86_64 and aarch64, each natively. It is meant to be published to the GitHub Container Registry as `ghcr.io/guidorugo/pgsnare` and the chart as `ghcr.io/guidorugo/charts/pgsnare`, by digest. **Nothing is published yet:** no release has been made. Examples pin it by digest.
+- It runs as a non-root user with no Linux capabilities and a read-only root filesystem, when started as the chart and the examples start it. The image test starts it that way.
+- Built and tested in CI: see section 17. Not verified: the musl build with the optional SQL parser, which is not in the default features of the code this image was built from.
 
 ### 14.2 Lifecycle
 
@@ -637,7 +640,7 @@ Extensions are compiled in. There is no runtime plugin loading, no dynamic libra
   - It asks the address that the configuration given with `--config` names for the admin listener, or the default address. A listener that is bound to every address is asked over loopback. No option takes an address or a URL.
   - It connects from the very address it connects to. Linux allows that only for an address of the machine itself, unless the system was set to let a process bind to an address that is not its own (`net.ipv4.ip_nonlocal_bind`, or the setting of the same name for IPv6). The request therefore stays on the machine.
   - It follows no redirect, and the whole check has 2 seconds.
-  - It is meant to back the health check of the image and Kubernetes exec probes, so that no health port has to be exposed. The image and the chart are not built yet.
+  - It backs the health check of the image and the Kubernetes exec probes of the chart, so that no health port is exposed. The health check of the image passes no `--config`, so it asks the default admin address; a configuration that moves the admin listener needs its own check.
 - Worker threads follow the container's CPU limit.
 
 ### 14.3 Standalone container
@@ -708,6 +711,22 @@ flowchart LR
 - Honeytoken values live in a Secret, not a ConfigMap. Changing the Secret takes effect without a restart.
 - The metrics listener is exposed only to the scrapers the NetworkPolicy allows.
 
+**What is built.**
+
+- The chart (`deploy/chart/pgsnare`) renders a Deployment (two replicas), a `ClusterIP` Service, a NetworkPolicy for both directions, a PodDisruptionBudget, a ServiceAccount and the configuration. It renders no Secret: tokens, TLS keys, the webhook address and its signing key come from existing Secrets named in the values and are mounted as whole read-only volumes with mode `0440`. A strict values schema refuses every value it does not know, a missing image digest and a token value in the values.
+- An empty list means nobody: with no `clients` the NetworkPolicy has no ingress rule, with no `database.peers` no egress to a database. Egress is the database, the cluster's name service on port 53 and each sink.
+- The pod meets the restricted standard in full, has a read-only root filesystem, mounts no service-account token, and has requests and limits. Probes run `pgsnare healthcheck` without `--config`, so a probe reads no file. The admin listener never leaves loopback; there is no value for it.
+- `terminationGracePeriodSeconds` is computed from the shutdown grace period, the time for the sinks and a margin.
+- The sidecar definitions (`deploy/sidecar`) are a native sidecar (an init container with `restartPolicy: Always` and a startup probe) and a variant for clusters without it.
+- Tested in a `kind` cluster on Kubernetes 1.37: install into a namespace that enforces the restricted standard (which also rejects a privileged pod), both patterns from install to a first alert, a token added through a changed Secret (62 seconds from the change to the active token in one run), a rolling update that lets a statement outlast the roll-out, and isolation with the policy deleted as a control.
+
+**Limits of what is built.**
+
+- TLS on either leg is not run in the cluster; the TLS mounts are rendered and checked, and the Compose example runs TLS on both legs.
+- One Kubernetes version (1.37) and one network plugin are tested, though the chart declares `>=1.30.0-0`. The chart cannot check that the plugin enforces NetworkPolicy.
+- One database and one listener for each release. The chart offers the `stdout` and webhook sinks and none for files or syslog, and no SQL rules. The listener binds IPv4 only. The chart accepts no `global` values.
+- A destination with changing addresses cannot be listed: an address range with prefix 0 is refused.
+
 ### 14.5 Scaling and client addresses
 
 - **Replicas are independent.** There is no shared state, and cancel requests work through any replica. Deduplication windows and tarpit caps apply per replica.
@@ -745,7 +764,8 @@ An attacker with root on the pgsnare host is out of scope.
 ### 15.3 Hardening
 
 - Runs as a non-root user with no Linux capabilities and a read-only root filesystem.
-- The image has no shell or package manager, has its base pinned by digest, and is scanned for known vulnerabilities on every build and nightly.
+- The image has its base pinned by digest, and is scanned for known vulnerabilities (high and critical fail the build) on every build and nightly. The base has a shell and a package manager, which the owner accepted; the process cannot use them to change the image, because it is not root, has no capability, cannot gain privileges and has a read-only root filesystem. The image test fails if a setuid file appears.
+- The scan covers the packages of the base; the crates in the binary are covered by the advisory check of section 15.5.
 - Every size or count taken from the network is bounded.
 - Key material stays in memory only and is wiped when dropped where the libraries allow. Core dumps are disabled.
 - A panic ends one session, one delivery attempt of a sink or one connection to the admin or metrics listener, not the process, and is counted by where it happened. A panic in the loop that accepts clients for a listener stops the proxy, which then exits with a status that is not zero (see [section 14.2](#142-lifecycle)). The counts must stay at zero in fuzzing and soak tests.
@@ -763,12 +783,29 @@ An attacker with root on the pgsnare host is out of scope.
 - Advisories, licences and sources are checked on every push and nightly. Only permissive licences are accepted.
 - A new dependency needs a stated reason in its pull request.
 - CI runs only actions written by GitHub or by verified publishers, each pinned to a commit SHA, with a read-only token unless a job needs more. No secrets are exposed to pull requests from forks.
+- Every other tool (the scanner, the chart and manifest tools, the cluster tools, the registry client, the signing tool, the SBOM generator) runs in a plain shell step from `deploy/tools/tools.txt`, which names its version, source and SHA-256 for each architecture; the installer checks the sum. Every image in `deploy/` and `examples/` is pinned by digest, and `scripts/check-repo.sh` refuses one that is not, a job that raises its permissions outside `release.yml`, and a job named like a required check.
+- `tools.txt` is updated by hand; the dependency bot cannot read it.
 
 ### 15.6 Release integrity
 
 - Releases are built only by CI, from a tagged commit.
 - Binaries, images and the Helm chart are signed and published with checksums, an SBOM and build provenance.
-- Release tags are protected against deletion and rewriting.
+- Release tags are protected against deletion and rewriting. That is a setting of the repository owner: the repository documents it ([Releasing](releasing.md)) and the release workflow cannot enforce it.
+
+**What is built.**
+
+- `release.yml` runs only on a version tag (`vX.Y.Z` or `vX.Y.Z-rc.N`). A first job checks that the tag matches a strict pattern, equals the version in `Cargo.toml` and points at a commit on `main`. The binaries, image and chart are built by jobs with a read-only token; one publishing job holds the write permissions, compiles nothing and takes the artefacts by checksum. It publishes the image for both architectures and the chart, the archives of the binaries, the plain manifests rendered from the chart, `SHA256SUMS`, SBOMs, signatures and build provenance, and creates the GitHub release as a draft. A last read-only job runs the documented verification against what was published. The release tests and scans its own build first.
+- Signing is keyless: the identity is this repository's release workflow on a version tag, recorded in a public transparency log. `verify.sh` accepts only that identity.
+- The scripts are the same in rehearsal and release; they differ only in the registry and the signing mode. The job `release-rehearsal` of the `deploy` workflow runs them on every change against a registry inside the runner, with a key made in the job, no transparency log and no identity token, then runs the verification and shows that a changed byte in a binary, an image of another digest and an unsigned chart each fail.
+- [Verifying a release](verifying-a-release.md) describes the verification by hand; [Releasing](releasing.md) is the owner's procedure.
+
+**Limits of what is built.**
+
+- **The release workflow has never run.** Keyless signing and its verification flags, the transparency log, build provenance, the push to the registry, the creation of the draft release and the environment gate are not verified until a first release candidate is made. The rehearsal covers the scripts, checksums, SBOMs and signatures with a local key.
+- The SBOM of the binaries lists every crate of `Cargo.lock`, which is more than is linked; the binary carries no list of its own. The SBOM of the image does not itemise the binary.
+- Provenance is recorded for each file, for the two-architecture image and for the chart, not for the image of each architecture, which is signed.
+- The tag's own signature is not checked by the workflow; the tag ruleset is the control.
+- The published image uses Docker media types.
 
 ### 15.7 Repository and process
 
@@ -804,7 +841,7 @@ These are design targets, not measurements.
 - **Leak test.** A `pgsnare` process is started with honeytokens, a password, a bind parameter, signing keys, a private key and a webhook URL that is a secret, all made for the run, and with every way out it has: each kind of sink, the log, the metrics, the health endpoints and what `pgsnare healthcheck` prints. Traffic that carries the secrets passes through it. Everything that came out is then searched for every secret, as it is and in the forms a careless line of code could have written it in. The test also shows that the search finds what it looks for, that every secret was where it could leak from, and that every output was written to. The traffic includes statements, bind parameters and login names that contain honeytokens in several forms, so hits raised from traffic reach every sink. The test runs with `query_redaction: fingerprint`; a separate test shows that under `full` a token value in a statement is still removed from the event, while a password written in a statement is not, because the redaction layer does not look for passwords.
 - **Commands and bait.** The output of every command is compared with expected output. What `token generate` prints is run by PostgreSQL 15 to 18, with names that try to get out of their quotes. The SCRAM-SHA-256 bait is given to PostgreSQL as a password, and the bcrypt bait to its `pgcrypto` extension. Every configuration that `config check` refuses is given to `pgsnare run`, which must refuse it too.
 - **Benchmarks.** One reproducible script with pinned CPU sets.
-- **Container and Kubernetes tests.** The image runs with a read-only root filesystem and all capabilities dropped. The chart is installed into a namespace that enforces the restricted Pod Security Standard. Tests cover both Kubernetes patterns from install to first alert, a token added through the mounted Secret, a rolling update with drain, and NetworkPolicy isolation.
+- **Container and Kubernetes tests.** All of them run in CI (the `deploy` workflow) and none on a developer machine. The image, as a registry hands it out, is started with a read-only root filesystem, all capabilities dropped and `no-new-privileges`: it finds a PostgreSQL container by name, lets a client log in, reports a seeded token as `token_hit`, becomes `healthy` through its own health check and ends with status 0 on `SIGTERM`. Each static check of the image is run against the PostgreSQL image, or a list of files made up for the purpose, and must fail there. The image is scanned on every build and nightly, and the scan first shows that it finds a package known to be vulnerable. The chart is checked with `helm lint --strict`, rendered with each values file, validated against pinned schemas, and asserted on as text, including refusals (an unknown value, a missing digest, a token value in the values). It is installed into a `kind` cluster whose namespace enforces the restricted Pod Security Standard, which must reject a privileged pod, with a network plugin that enforces NetworkPolicy. Tests cover both Kubernetes patterns from install to first alert (the central proxy with a receiver that verifies the signature, the sidecar in its native and classic form), a token added through the mounted Secret (its value raises nothing before and a hit after, in the same pod), a rolling update that lets a session finish within the grace period, and NetworkPolicy isolation (a pod without the client label and one in another namespace reach neither the proxy nor the metrics port; an allowed client and an allowed scraper do; with the policy deleted the refused pod gets through). The Compose example is run from `up` to a verified `token_hit` in under five minutes, with the time from query to receipt printed (one sample, not a percentile). Not run: TLS in the cluster, other Kubernetes versions, other network plugins, and a delay before a pod stops (`preStopSleepSeconds`).
 
 ## 18. Open points
 

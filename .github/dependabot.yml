@@ -61,3 +61,66 @@ updates:
       # by hand, as a service of its own.
       - dependency-name: "postgres"
         update-types: ["version-update:semver-major"]
+
+  # The images of deploy/Dockerfile. Its Rust image is the one of
+  # Dockerfile.dev: the two are updated together, and `make lint` fails
+  # until both agree with rust-toolchain.toml.
+  - package-ecosystem: docker
+    directory: /deploy
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+
+  # The images of the deployment tests: PostgreSQL, and the registry that
+  # runs inside a CI job.
+  - package-ecosystem: docker-compose
+    directories:
+      - /deploy/tests/*
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    ignore:
+      # As for the integration tests: PostgreSQL stays within its major
+      # version, and a new major version is taken by hand.
+      - dependency-name: "postgres"
+        update-types: ["version-update:semver-major"]
+
+  # The images in the manifests of the Kubernetes tests. The node image of
+  # the cluster is not updated here: it belongs to the release of `kind` in
+  # deploy/tools/tools.txt and is changed together with it, by hand.
+  - package-ecosystem: docker
+    directory: /deploy/tests/kubernetes
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    ignore:
+      - dependency-name: "postgres"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "kindest/node"
+
+  # The images of the Compose example: PostgreSQL, and the Python image
+  # of its webhook receiver. The image of pgsnare is given by digest when
+  # the example is started.
+  - package-ecosystem: docker-compose
+    directory: /examples/compose
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    ignore:
+      - dependency-name: "postgres"
+        update-types: ["version-update:semver-major"]
+
+  # The stand-in application image of the sidecar definitions.
+  - package-ecosystem: docker
+    directory: /deploy/sidecar
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    ignore:
+      - dependency-name: "postgres"
+        update-types: ["version-update:semver-major"]

@@ -1,0 +1,153 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# pgsnare in front of PostgreSQL 18, with seeded honeytokens and a webhook
+# receiver that verifies every signature. docs/quickstart.md walks through
+# it; smoke.sh is the same walk as a test.
+#
+#   setup     runs once and makes the keys, certificates, password and
+#             tokens (setup.sh). Nothing secret is in this directory.
+#   postgres  the database, with TLS; its first start plants the tokens
+#   pgsnare   the proxy; the image is given by digest in PGSNARE_IMAGE
+#   receiver  receiver/receiver.py, over TLS, prints each event it accepted
+#   client    psql through pgsnare, with TLS verified: docker compose run
+#
+# No port is published: everything talks on an internal network. pgsnare,
+# the receiver and psql run with a read-only root filesystem, without
+# capabilities and as users that are not root.
+#
+# PGSNARE_IMAGE must name the image by digest, for example
+# ghcr.io/guidorugo/pgsnare@sha256:<64 hexadecimal digits>.
+
+name: pgsnare-example
+
+x-postgres-image: &postgres-image
+  image: postgres:18.6-trixie@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
+
+x-confined: &confined
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  read_only: true
+
+services:
+  setup:
+    <<: [*postgres-image, *confined]
+    # Root, to give each volume to the user that reads it, and with no
+    # capability but the one that does that.
+    user: "0:0"
+    cap_add:
+      - CHOWN
+    network_mode: none
+    entrypoint: ["/example/setup.sh"]
+    tmpfs:
+      - /tmp
+    volumes:
+      - ./setup.sh:/example/setup.sh:ro
+      - pgsnare:/out/pgsnare
+      - receiver:/out/receiver
+      - postgres-secrets:/out/postgres
+      - postgres-init:/out/initdb
+      - client:/out/client
+
+  postgres:
+    <<: *postgres-image
+    user: postgres
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/secrets/database.crt
+      - -c
+      - ssl_key_file=/secrets/database.key
+    environment:
+      POSTGRES_PASSWORD_FILE: /secrets/password
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=scram-sha-256
+    healthcheck:
+      test: ["CMD", "pg_isready", "--host", "127.0.0.1", "--username", "postgres", "--dbname", "postgres"]
+      interval: 1s
+      timeout: 3s
+      retries: 120
+    volumes:
+      - postgres-secrets:/secrets:ro
+      - postgres-init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - example
+
+  receiver:
+    <<: *confined
+    image: python:3.15.2-slim-trixie@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928
+    user: "65533:65533"
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    command: ["python3", "/app/receiver.py", "serve"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      RECEIVER_LISTEN: 0.0.0.0:8443
+      RECEIVER_CERT: /receiver/receiver.crt
+      RECEIVER_KEY: /receiver/receiver.key
+      RECEIVER_HMAC_KEY_FILE: /receiver/hmac-key
+      RECEIVER_CA: /receiver/ca.crt
+    volumes:
+      - ./receiver/receiver.py:/app/receiver.py:ro
+      - receiver:/receiver:ro
+    networks:
+      - example
+
+  pgsnare:
+    <<: *confined
+    image: ${PGSNARE_IMAGE:?set PGSNARE_IMAGE to the pgsnare image by digest}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      receiver:
+        condition: service_started
+    environment:
+      # The authority of the receiver's certificate. It replaces the
+      # authorities of the image for the webhook.
+      SSL_CERT_FILE: /etc/pgsnare/receiver-ca.crt
+    mem_limit: 128m
+    volumes:
+      - pgsnare:/etc/pgsnare:ro
+    networks:
+      - example
+
+  client:
+    <<: [*postgres-image, *confined]
+    profiles:
+      - client
+    user: postgres
+    entrypoint: ["psql", "--no-psqlrc"]
+    environment:
+      PGHOST: pgsnare
+      PGUSER: postgres
+      PGDATABASE: postgres
+      PGSSLMODE: verify-full
+      PGSSLROOTCERT: /client/ca.crt
+      PGPASSFILE: /client/pgpass
+      PGCONNECT_TIMEOUT: "10"
+    volumes:
+      - client:/client:ro
+    networks:
+      - example
+
+volumes:
+  pgsnare:
+  receiver:
+  postgres-secrets:
+  postgres-init:
+  client:
+
+networks:
+  example:
+    internal: true
