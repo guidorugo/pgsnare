@@ -88,7 +88,13 @@ fn now() -> Timestamp {
     }
 }
 
-/// 128 bits from the secure random generator of the TLS provider.
+/// 128 bits for an identifier.
+///
+/// They come from the secure random generator of the TLS provider. When
+/// that generator reports a failure, they come from `fallback_u128`, which
+/// is not a secure random generator. This function is therefore for
+/// identifiers, which only have to differ from each other, and for nothing
+/// that has to be secret or hard to guess.
 fn random_u128() -> u128 {
     let mut bytes = [0u8; 16];
     if crate::tls::provider()
@@ -96,13 +102,21 @@ fn random_u128() -> u128 {
         .fill(&mut bytes)
         .is_err()
     {
-        // The generator of the operating system has failed. An identifier
-        // that is merely unlikely to repeat is better than none.
+        // The generator of the TLS provider has reported a failure. An
+        // identifier that is merely unlikely to repeat is better than none.
         return fallback_u128();
     }
     u128::from_be_bytes(bytes)
 }
 
+/// 128 bits that are unlikely to repeat, made without the generator of the
+/// TLS provider. They are not secure random numbers.
+///
+/// Each half is a 64-bit hash of the time of the clock, in nanoseconds
+/// since 1970, or of zero when the clock is set before 1970. The hasher is
+/// the one a `HashMap` of the standard library uses, under keys that the
+/// library chose at random, and each half gets a new one. Neither the
+/// clock nor that hasher is made to give a value that cannot be guessed.
 fn fallback_u128() -> u128 {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
