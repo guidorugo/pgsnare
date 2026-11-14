@@ -91,6 +91,10 @@ FOR_EACH_FUZZ_CRATE = for manifest in crates/*/fuzz/Cargo.toml; do \
 
 lint: image cargo-cache
 	$(RUN) $(DEV_IMAGE) scripts/check-repo.sh
+	@# With protoc on the PATH, the build script of the SQL parser would
+	@# generate its Rust types again and overwrite the ones the crate came
+	@# with, which the rules were written and tested against.
+	$(RUN) $(DEV_IMAGE) sh -c '! command -v protoc >/dev/null || { echo "lint: the development image must not contain protoc" >&2; exit 1; }'
 	$(RUN) $(DEV_IMAGE) cargo fmt --all --check
 	$(RUN) $(DEV_IMAGE) sh -c '$(call FOR_EACH_FUZZ_CRATE,--check)'
 	$(RUN) $(DEV_IMAGE) cargo clippy --workspace --all-targets $(LOCKED) -- -D warnings
