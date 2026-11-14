@@ -33,7 +33,7 @@ const MAX: Duration = Duration::from_millis(30_000);
 const LONGEST: Duration = Duration::from_secs(600);
 
 /// Bytes that change at every call.
-struct Counting(u64);
+pub(super) struct Counting(pub(super) u64);
 
 impl Entropy for Counting {
     fn fill(&mut self, dest: &mut [u8]) -> Result<(), EntropyError> {
@@ -83,7 +83,7 @@ fn email(actions: ActionSet) -> TokenPolicy {
 }
 
 /// A session that answers with `tarpit` and was given a cancel key.
-fn session_in(places: &Arc<TarpitPlaces>, policy: PolicySnapshot) -> Harness {
+pub(super) fn session_in(places: &Arc<TarpitPlaces>, policy: PolicySnapshot) -> Harness {
     let responses = Responses::new(
         || -> Box<dyn Entropy + Send> { Box::new(Counting(3)) },
         Arc::clone(places),

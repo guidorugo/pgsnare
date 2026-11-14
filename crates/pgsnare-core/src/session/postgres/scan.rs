@@ -123,7 +123,7 @@ use std::sync::Arc;
 use pgsnare_proto::startup::StartupMessage;
 use pgsnare_proto::{Chunk, Frame, FrameHeader, backend, frontend};
 
-use crate::actions::{self, Tarpit, TarpitPlaces};
+use crate::actions::{self, FakeRows, Tarpit, TarpitPlaces};
 use crate::bait::Entropy;
 use crate::detect::{Match, Matcher, ScanError, StreamScanner};
 use crate::event::{EventBody, EventKind, Query, StatementDigest};
@@ -216,6 +216,46 @@ fn carried_out(decided: ActionSet, built: ActionSet) -> ActionSet {
     }
 }
 
+/// `actions` without `action`, or `alert` when nothing is left.
+fn without(actions: ActionSet, action: Action) -> ActionSet {
+    let mut rest = ActionSet::EMPTY;
+    for kept in actions.iter().filter(|kept| *kept != action) {
+        rest.insert(kept);
+    }
+    if rest.is_empty() {
+        ActionSet::ALERT
+    } else {
+        rest
+    }
+}
+
+/// Whether `text` is one statement that reads rows and reports them as
+/// `SELECT n`: a `SELECT`, `TABLE` or `VALUES`, with no `;` but at its
+/// end. Anything else, a leading comment included, is not.
+fn single_select(text: &[u8]) -> bool {
+    let trimmed = text.trim_ascii();
+    let body = trimmed.strip_suffix(b";").unwrap_or(trimmed);
+    if body.contains(&b';') {
+        return false;
+    }
+    let word: Vec<u8> = body
+        .iter()
+        .take_while(|byte| byte.is_ascii_alphabetic())
+        .map(u8::to_ascii_lowercase)
+        .collect();
+    matches!(word.as_slice(), b"select" | b"table" | b"values")
+}
+
+/// Whether a token of `policy` may answer with `fake_data`.
+fn wants_rows(policy: &PolicySnapshot) -> bool {
+    policy.tokens().iter().any(|token| {
+        token.actions.contains(Action::FakeData)
+            || token
+                .escalate
+                .is_some_and(|escalation| escalation.to.contains(Action::FakeData))
+    })
+}
+
 /// What a scanner needs for the responses that go beyond `alert` and
 /// `kill`: a source of randomness for each session, and the places for
 /// tarpitted sessions of the whole proxy.
@@ -254,11 +294,114 @@ struct Responder {
     tarpits: Arc<TarpitPlaces>,
     /// Set once the session is tarpitted.
     tarpit: Option<Tarpit>,
+    /// The result the server is sending, while rows can be made up for it.
+    rows: Option<FakeRows>,
+    /// Whether the next `RowDescription` describes a prepared statement,
+    /// whose formats are not those of its results.
+    describing_statement: bool,
+    /// Whether the client has asked for a result in parts: a result may
+    /// then end without `CommandComplete`. Once set, it stays.
+    limited: bool,
 }
 
 impl Responder {
     fn built() -> ActionSet {
-        ActionSet::of(&[Action::Alert, Action::Kill, Action::Tarpit])
+        ActionSet::of(&[
+            Action::Alert,
+            Action::Kill,
+            Action::Tarpit,
+            Action::FakeData,
+        ])
+    }
+
+    /// Follows the results of the session, before `frame` is searched, and
+    /// tells whether a hit in it can add rows.
+    fn before(
+        &mut self,
+        frame: Frame<'_>,
+        statement: Option<&[u8]>,
+        context: &Context<'_>,
+    ) -> bool {
+        let tag = frame.tag();
+        match (from_wire(frame.direction()), tag) {
+            (Direction::FromClient, frontend::tag::EXECUTE) => {
+                let body = frame.body();
+                let all_rows = body
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .and_then(|end| body.get(end.checked_add(1)?..))
+                    .is_some_and(|rest| rest == [0, 0, 0, 0]);
+                self.limited |= !all_rows;
+                false
+            }
+            (Direction::FromServer, backend::tag::PARAMETER_DESCRIPTION) => {
+                self.describing_statement = true;
+                false
+            }
+            (Direction::FromServer, backend::tag::ROW_DESCRIPTION) => {
+                let statement = core::mem::take(&mut self.describing_statement);
+                self.rows = (!statement && wants_rows(context.policy))
+                    .then(|| FakeRows::describe(frame))
+                    .flatten();
+                false
+            }
+            (Direction::FromServer, backend::tag::NO_DATA) => {
+                self.describing_statement = false;
+                self.rows = None;
+                false
+            }
+            (Direction::FromServer, backend::tag::DATA_ROW) => {
+                self.rows.is_some() && !self.limited && statement.is_some_and(single_select)
+            }
+            _ => false,
+        }
+    }
+
+    /// Follows the results of the session once `frame` has been searched.
+    /// Returns whether made-up rows took the place of `frame`.
+    fn after(
+        &mut self,
+        frame: Frame<'_>,
+        raised: &Raised,
+        context: &Context<'_>,
+        out: &mut Output,
+    ) -> bool {
+        if from_wire(frame.direction()) != Direction::FromServer {
+            return false;
+        }
+        match frame.tag() {
+            backend::tag::DATA_ROW => {
+                if let Some(rows) = self.rows.as_mut() {
+                    if raised.fake {
+                        rows.choose();
+                    }
+                    rows.observe(frame, !raised.matched);
+                }
+                false
+            }
+            backend::tag::COMMAND_COMPLETE => self.rows.take().is_some_and(|rows| {
+                rows.is_chosen()
+                    && !raised.kill
+                    && raised.error.is_none()
+                    && rows
+                        .finish(
+                            context.policy.actions().fake_data.rows,
+                            frame,
+                            context.policy.matcher(),
+                            &mut *self.entropy,
+                            &mut out.to_client,
+                        )
+                        .is_some()
+            }),
+            backend::tag::READY_FOR_QUERY
+            | backend::tag::ERROR_RESPONSE
+            | backend::tag::PORTAL_SUSPENDED
+            | backend::tag::EMPTY_QUERY_RESPONSE => {
+                self.rows = None;
+                false
+            }
+            _ => false,
+        }
     }
 
     /// Tarpits the session, unless it is already. Returns `false` when no
@@ -283,6 +426,10 @@ impl Responder {
 struct Raised {
     /// Whether a hit is answered with `kill`.
     kill: bool,
+    /// Whether a hit asks for made-up rows.
+    fake: bool,
+    /// Whether anything was found, exempt or not.
+    matched: bool,
     /// A match that could not be reported.
     error: Option<InspectionError>,
 }
@@ -317,6 +464,8 @@ struct Place<'a> {
     in_session: bool,
     /// The text of that statement, when the tracker knows it.
     statement: Option<&'a [u8]>,
+    /// Whether made-up rows can be added to the result the message is in.
+    rows: bool,
     context: &'a Context<'a>,
 }
 
@@ -388,9 +537,12 @@ impl Ledger {
         let mut seen = BTreeSet::new();
         let mut raised = Raised {
             kill: false,
+            fake: false,
+            matched: false,
             error: None,
         };
         for found in matches {
+            raised.matched = true;
             let Ok(found) = found else {
                 raised.error = Some(InspectionError::new("a message could not be searched"));
                 continue;
@@ -408,6 +560,7 @@ impl Ledger {
             };
             let actions = self.hit(token_id, place, out);
             raised.kill |= actions.contains(Action::Kill);
+            raised.fake |= actions.contains(Action::FakeData);
         }
         raised
     }
@@ -455,6 +608,10 @@ impl Ledger {
                 killed.insert(Action::Alert);
             }
             actions = killed;
+        }
+        if actions.contains(Action::FakeData) && !place.rows {
+            // No result here that rows can be added to: `alert` instead.
+            actions = without(actions, Action::FakeData);
         }
 
         let mut body = self.body(EventKind::TokenHit, place);
@@ -514,6 +671,9 @@ impl Scanner {
             entropy: (responses.entropy)(),
             tarpits: Arc::clone(&responses.tarpits),
             tarpit: None,
+            rows: None,
+            describing_statement: false,
+            limited: false,
         };
         Self::build(digest, Some(responder))
     }
@@ -602,6 +762,7 @@ impl Inspector for Scanner {
             name: Some(STARTUP_MESSAGE),
             in_session: false,
             statement: None,
+            rows: false,
             context,
         };
         let matches = context.policy.matcher().scan(message.as_bytes());
@@ -622,11 +783,17 @@ impl Inspector for Scanner {
             Direction::FromClient => self.tracker.client(frame, context.in_copy),
             Direction::FromServer => self.tracker.server(tag, Some(frame.body())),
         };
+        let rows = self
+            .ledger
+            .responder
+            .as_mut()
+            .is_some_and(|responder| responder.before(frame, statement.bytes(), context));
         let place = Place {
             direction,
             name: message_name(direction, tag),
             in_session: true,
             statement: statement.bytes(),
+            rows,
             context,
         };
         if is_statement(direction, tag) {
@@ -645,9 +812,19 @@ impl Inspector for Scanner {
             let matcher: &Matcher = context.policy.matcher();
             self.ledger.raise(matcher.scan(frame.body()), &place, out)
         };
+        let replaced = self
+            .ledger
+            .responder
+            .as_mut()
+            .is_some_and(|responder| responder.after(frame, &raised, context, out));
         // A whole message from the server is never inside another one.
         let client_can_be_told = self.from_server.chunked.is_none();
-        raised.respond(client_can_be_told, context, out)
+        let verdict = raised.respond(client_can_be_told, context, out)?;
+        // The made-up rows end with a `CommandComplete` of their own.
+        Ok(match verdict {
+            Verdict::Forward if replaced => Verdict::Withhold,
+            other => other,
+        })
     }
 
     fn stream_start(
@@ -670,6 +847,7 @@ impl Inspector for Scanner {
                 name,
                 in_session: true,
                 statement: statement.bytes(),
+                rows: false,
                 context,
             };
             self.ledger.activity(&place, out);
@@ -707,6 +885,7 @@ impl Inspector for Scanner {
             name: chunked.name,
             in_session: true,
             statement: chunked.statement.bytes(),
+            rows: false,
             context,
         };
         let matches = chunked.stream.scanner.feed(chunk.data());

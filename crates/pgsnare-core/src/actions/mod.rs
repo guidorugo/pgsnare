@@ -8,8 +8,10 @@
 //!
 //! [`Output`]: crate::session::Output
 
+mod fake_data;
 mod kill;
 mod tarpit;
 
+pub use fake_data::FakeRows;
 pub use kill::kill;
 pub use tarpit::{Tarpit, TarpitPlace, TarpitPlaces};

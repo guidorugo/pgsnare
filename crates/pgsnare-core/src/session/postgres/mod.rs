@@ -76,6 +76,8 @@ use crate::event::StatementDigest;
 use crate::extension::{LoginStrategy, ProtocolModule, ProtocolSession, TlsRequest};
 use crate::session::SessionOrigin;
 
+#[cfg(test)]
+mod fake_tests;
 mod inspect;
 #[cfg(test)]
 mod kill_tests;
