@@ -49,7 +49,7 @@ pgsnare sees only what passes through it.
 - Set `events.query_redaction: fingerprint` in production. It is the default. An event then carries the SHA-256 hash of the statement as sent, and no text.
 - **`full` is a debugging mode.** It puts each statement into events as it was sent, cut at 4,096 bytes. Token values are still removed, but **a password written in a statement is shown**, as is any other secret in it, because the redaction layer does not look for passwords. Anyone who can read the sinks or the log then reads them. Use `full` briefly and on data you can afford to show.
 - `none` shows no statement.
-- Webhook receivers must check the signature, the timestamp and the event id of every request. The Compose example's receiver ([`examples/compose/receiver/receiver.py`](../examples/compose/receiver/receiver.py)) shows the checks, and design document section 12.3 states them. It is a demonstration, not a product.
+- Webhook receivers must check the signature, the timestamp and the event id of every request. The Compose example's receiver ([`examples/compose/receiver/receiver.py`](../examples/compose/receiver/receiver.py)) shows the checks, and design document section 12.3 states them. It keeps an event id for as long as the timestamp it came with is accepted, which can be up to twice the tolerance after the request arrived, and it gives a whole request a fixed time, not only each read. It is a demonstration, not a product.
 - Alert on `pgsnare_reload_failures_total` increasing (a token change that did not load) and watch that events are delivered: a full queue loses events and counts them.
 
 ## Limits to set

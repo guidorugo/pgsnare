@@ -10,7 +10,11 @@ the four checks of the signature scheme (design document, section 12.3):
 3. the HMAC-SHA256 of "timestamp.body" under the shared key matches the
    signature, compared in constant time;
 4. the event_id of the body was not accepted before (a repetition is
-   answered 200 and not printed again).
+   answered 200 and not printed again). An event_id is remembered for as
+   long as the timestamp it came with is accepted.
+
+A connection has REQUEST_TIMEOUT_SECONDS for its request, from the moment
+it is accepted, however slowly the request arrives.
 
 Every accepted event is printed to standard output as one JSON line,
 {"received_at": <seconds since 1970>, "event": {...}}. A refusal prints one
@@ -32,6 +36,7 @@ import hashlib
 import hmac
 import http.client
 import http.server
+import io
 import json
 import os
 import socket
@@ -47,6 +52,7 @@ MAX_BODY_BYTES = 256 * 1024
 MAX_REMEMBERED = 10_000
 MAX_CONNECTIONS = 32
 SOCKET_TIMEOUT_SECONDS = 10
+REQUEST_TIMEOUT_SECONDS = 15
 MIN_KEY_BYTES = 32
 HEX = frozenset("0123456789abcdef")
 
@@ -68,8 +74,14 @@ def sign(key, timestamp, body):
 
 
 class Verifier:
-    """The four checks. Remembers at most MAX_REMEMBERED event ids, each
-    for TOLERANCE_SECONDS; when it is full it answers "not now"."""
+    """The four checks. Remembers at most MAX_REMEMBERED event ids; when it
+    is full it answers "not now".
+
+    An event_id is forgotten when no request that carried it can pass the
+    check of the timestamp any more: TOLERANCE_SECONDS after the latest of
+    its timestamps, and not before TOLERANCE_SECONDS after it arrived. The
+    clock of the sender may be ahead of this one, so the time of arrival
+    alone would forget an event while its request is still accepted."""
 
     def __init__(self, key):
         self._key = key
@@ -97,15 +109,42 @@ class Verifier:
             return 400, "the body is not an event", None
         if not isinstance(event_id, str):
             return 400, "the body is not an event", None
+        # The last second in which a request with this timestamp passes.
+        until = max(now, int(timestamp)) + TOLERANCE_SECONDS
         with self._lock:
-            for old in [k for k, seen in self._seen.items() if now - seen > TOLERANCE_SECONDS]:
+            for old in [k for k, last in self._seen.items() if now > last]:
                 del self._seen[old]
             if event_id in self._seen:
+                self._seen[event_id] = max(self._seen[event_id], until)
                 return 200, "a repetition", None
             if len(self._seen) >= MAX_REMEMBERED:
                 return 503, "too many events at once", None
-            self._seen[event_id] = now
+            self._seen[event_id] = until
         return 204, None, event
+
+
+class Deadline(io.RawIOBase):
+    """Reads from a connection until a fixed moment, and not after it.
+
+    The timeout of a socket is for one read. A request that arrives a byte
+    at a time never runs into it, and would keep its connection for as long
+    as the sender likes. Here every read gets what is left of the time of
+    the whole request, and none when nothing is left."""
+
+    def __init__(self, connection, deadline):
+        super().__init__()
+        self._connection = connection
+        self._deadline = deadline
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("the request took too long")
+        self._connection.settimeout(min(SOCKET_TIMEOUT_SECONDS, remaining))
+        return self._connection.recv_into(buffer)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -116,10 +155,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def setup(self):
         # The TLS handshake runs here, in the thread of this connection,
-        # under the timeout, and not in the loop that accepts.
+        # under the timeout, and not in the loop that accepts. The time of
+        # the request runs from here, the handshake included.
+        deadline = time.monotonic() + REQUEST_TIMEOUT_SECONDS
         self.request.settimeout(SOCKET_TIMEOUT_SECONDS)
         self.request.do_handshake()
         super().setup()
+        self.rfile.close()
+        self.rfile = io.BufferedReader(Deadline(self.connection, deadline))
 
     def log_message(self, *args):
         pass

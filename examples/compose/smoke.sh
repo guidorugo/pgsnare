@@ -11,7 +11,7 @@
 #   - pgsnare becomes healthy through the health check of its image;
 #   - the receiver refuses a request without a signature, with the
 #     signature of another key and with an old timestamp, and accepts a
-#     signed one (so its checks can fail);
+#     signed one (so its checks can fail), and passes its own tests;
 #   - a query that reads no token reaches the database and raises nothing;
 #   - a query that reads a token is answered, and the receiver holds a
 #     token_hit for it whose signature it verified, less than 2 seconds
@@ -84,6 +84,13 @@ for _ in $(seq 1 30); do
 done
 [[ "$checked" == 1 ]] || die "the receiver did not refuse and accept what it must"
 say "ok: the receiver refuses unsigned, forged and old requests and accepts a signed one"
+
+# Its own tests, on a second server inside the same container: an event is
+# accepted once, and a request that arrives slowly gets no more than the
+# time of a request. What that server prints is not an event of the example.
+docker compose exec -T receiver python3 /app/test_receiver.py > /dev/null \
+    || die "the tests of the receiver failed"
+say "ok: the receiver accepts an event once and gives a slow request no more than its time"
 
 received() {
     docker compose logs --no-log-prefix receiver 2>/dev/null | grep -F '"kind":"token_hit"' || true

@@ -537,7 +537,7 @@ Nothing has to be parsed to check a signature. A receiver must do four things:
 1. Reject a request without both headers, with a timestamp that is not a decimal number, or with a signature that is not `v1=` and 64 hexadecimal digits.
 2. Reject a request whose timestamp is further from its own clock than it tolerates, five minutes for example. A recorded request cannot be sent again later.
 3. Compute the HMAC over the timestamp, the full stop and the body as received, and compare it with the signature in constant time. Whoever does not hold the key cannot make a signature that matches.
-4. Remember the `event_id` of the body of every request it accepted, for as long as it tolerates old requests, and reject a repetition. Without this, a recorded request passes the first three checks until its timestamp is too old.
+4. Remember the `event_id` of the body of every request it accepted, for as long as a request with that timestamp passes the second check, and reject a repetition. The sender's clock may be ahead of the receiver's, so this can be up to twice the tolerance after the request arrived. Without this, a recorded request passes the first three checks until its timestamp is too old.
 
 A retry carries the same event and `event_id` under a new timestamp and signature. A receiver whose answer was lost sees the event twice, and the fourth check also makes that harmless.
 
