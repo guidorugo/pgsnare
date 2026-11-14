@@ -7,6 +7,8 @@ use core::net::IpAddr;
 use std::sync::Arc;
 
 use crate::detect::Matcher;
+#[cfg(feature = "rules")]
+use crate::rules::RuleSet;
 
 use super::{ActionSettings, Exemption, Inspection, QueryRedaction, TokenId, TokenPolicy};
 
@@ -35,6 +37,10 @@ pub struct PolicySnapshot {
     query_redaction: QueryRedaction,
     /// Shared, so that cloning a snapshot never copies compiled patterns.
     matcher: Arc<Matcher>,
+    /// The SQL rules, when the configuration has any. They are part of the
+    /// snapshot so that a reload swaps them with everything else.
+    #[cfg(feature = "rules")]
+    rules: Option<Arc<RuleSet>>,
 }
 
 impl PolicySnapshot {
@@ -110,6 +116,15 @@ impl PolicySnapshot {
     pub fn matcher(&self) -> &Matcher {
         &self.matcher
     }
+
+    /// The SQL rules, or `None` when the configuration has no `rules`
+    /// section. Shared, so that a statement waiting for its analysis can
+    /// keep the rules it is judged by without keeping the whole snapshot.
+    #[cfg(feature = "rules")]
+    #[must_use]
+    pub const fn rules(&self) -> Option<&Arc<RuleSet>> {
+        self.rules.as_ref()
+    }
 }
 
 /// Why a snapshot could not be built.
@@ -170,6 +185,8 @@ pub struct PolicySnapshotBuilder {
     actions: ActionSettings,
     query_redaction: QueryRedaction,
     matcher: Option<Matcher>,
+    #[cfg(feature = "rules")]
+    rules: Option<RuleSet>,
 }
 
 impl PolicySnapshotBuilder {
@@ -238,6 +255,14 @@ impl PolicySnapshotBuilder {
         self
     }
 
+    /// Sets the SQL rules. Without this call the snapshot has none.
+    #[cfg(feature = "rules")]
+    #[must_use]
+    pub fn rules(mut self, rules: RuleSet) -> Self {
+        self.rules = Some(rules);
+        self
+    }
+
     /// Checks everything and freezes it.
     ///
     /// # Errors
@@ -254,6 +279,8 @@ impl PolicySnapshotBuilder {
             actions,
             query_redaction,
             matcher,
+            #[cfg(feature = "rules")]
+            rules,
         } = self;
 
         let setting = |section, result: Result<(), &'static str>| {
@@ -307,6 +334,8 @@ impl PolicySnapshotBuilder {
             actions,
             query_redaction,
             matcher: Arc::new(matcher),
+            #[cfg(feature = "rules")]
+            rules: rules.map(Arc::new),
         })
     }
 }
