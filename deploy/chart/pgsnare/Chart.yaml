@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: v2
+name: pgsnare
+description: >-
+  A PostgreSQL proxy that detects data theft with honeytokens, installed as a
+  central proxy in front of one database.
+type: application
+# The version of the chart and of pgsnare are the version of the workspace.
+# A release writes them.
+version: 0.0.1
+appVersion: "0.0.1"
+kubeVersion: ">=1.30.0-0"
+home: https://github.com/guidorugo/pgsnare
+sources:
+  - https://github.com/guidorugo/pgsnare
+keywords:
+  - postgresql
+  - security
+  - honeytoken

@@ -1,0 +1,14 @@
+{{/* SPDX-License-Identifier: Apache-2.0 */}}
+{{- include "pgsnare.validate" . -}}
+# The configuration file. It holds no secret: it names the files of the
+# mounted Secrets.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pgsnare.fullname" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "pgsnare.labels" . | nindent 4 }}
+data:
+  pgsnare.yaml: |
+    {{- include "pgsnare.config" . | nindent 4 }}

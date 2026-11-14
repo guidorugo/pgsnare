@@ -1,0 +1,116 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The pgsnare image in front of one PostgreSQL, for deploy/tests/image/test.sh.
+#
+# Nothing here publishes a host port, and the network has no route to the
+# outside. The password and the token value are generated for each run by
+# test.sh and are never stored. Images are pinned by tag and by digest, and the image under test
+# is named by digest by whoever runs the test.
+#
+# The services, in the order test.sh uses them:
+#
+#   claim     the image under test, run once so that the volume `state`
+#             belongs to the user of that image
+#   setup     writes the configuration and a token file to that volume, as
+#             that user and readable by nobody else: setup.sh
+#   postgres  the database
+#   pgsnare   the image under test, as it comes: its own user, entry point,
+#             command and health check. Read-only root filesystem, no
+#             capabilities, no new privileges.
+#   client    runs psql
+
+name: pgsnare-image-test
+
+x-postgres-image: &postgres-image
+  image: postgres:18.6-trixie@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
+
+x-confined: &confined
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  read_only: true
+
+services:
+  claim:
+    <<: *confined
+    image: ${PGSNARE_IMAGE:?run the test with deploy/tests/image/test.sh}
+    profiles:
+      - setup
+    network_mode: none
+    command: ["--version"]
+    healthcheck:
+      disable: true
+    volumes:
+      # A new volume takes the owner of the directory it is first mounted
+      # on. This one is the home directory of the image's user in the base
+      # image, so the volume is writable for that user without a container
+      # that runs as root.
+      - state:/home/nonroot
+
+  setup:
+    <<: [*postgres-image, *confined]
+    profiles:
+      - setup
+    # The user of the image under test. test.sh has checked that the image
+    # names this one.
+    user: "65532:65532"
+    network_mode: none
+    entrypoint: ["/image/setup.sh"]
+    environment:
+      PGSNARE_IMAGE_TEST_TOKEN: ${PGSNARE_IMAGE_TEST_TOKEN:?run the test with deploy/tests/image/test.sh}
+    volumes:
+      - state:/state
+      - ./setup.sh:/image/setup.sh:ro
+
+  postgres:
+    <<: *postgres-image
+    user: postgres
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      POSTGRES_PASSWORD: ${PGSNARE_IMAGE_TEST_PASSWORD:?run the test with deploy/tests/image/test.sh}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=scram-sha-256
+    healthcheck:
+      # Over TCP, so the check passes only once the server accepts clients
+      # and not while it is still being initialised.
+      test: ["CMD", "pg_isready", "--host", "127.0.0.1", "--username", "postgres", "--dbname", "postgres"]
+      interval: 1s
+      timeout: 3s
+      retries: 120
+    networks:
+      - image-test
+
+  pgsnare:
+    <<: *confined
+    image: ${PGSNARE_IMAGE:?run the test with deploy/tests/image/test.sh}
+    # pgsnare is process 1 of its container: nothing starts it and nothing
+    # passes signals on to it.
+    init: false
+    mem_limit: 64m
+    memswap_limit: 64m
+    volumes:
+      - state:/etc/pgsnare:ro
+    networks:
+      - image-test
+
+  client:
+    <<: [*postgres-image, *confined]
+    profiles:
+      - client
+    user: postgres
+    entrypoint: ["psql"]
+    environment:
+      PGPASSWORD: ${PGSNARE_IMAGE_TEST_PASSWORD:?run the test with deploy/tests/image/test.sh}
+      PGCONNECT_TIMEOUT: "10"
+    networks:
+      - image-test
+
+volumes:
+  state:
+
+networks:
+  image-test:
+    internal: true

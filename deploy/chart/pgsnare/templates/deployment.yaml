@@ -1,0 +1,230 @@
+{{/* SPDX-License-Identifier: Apache-2.0 */}}
+{{- $secrets := include "pgsnare.secretsDirectory" . -}}
+{{- $binary := "/usr/local/bin/pgsnare" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pgsnare.fullname" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "pgsnare.labels" . | nindent 4 }}
+spec:
+  replicas: {{ int .Values.replicaCount }}
+  revisionHistoryLimit: 3
+  # A new pod is ready before an old one is told to stop.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "pgsnare.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- range $key, $value := .Values.podLabels }}
+        {{- if not (has $key (list "app.kubernetes.io/name" "app.kubernetes.io/instance" "app.kubernetes.io/version" "app.kubernetes.io/managed-by" "helm.sh/chart")) }}
+        {{ $key | quote }}: {{ $value | toString | quote }}
+        {{- end }}
+        {{- end }}
+        {{- include "pgsnare.labels" . | nindent 8 }}
+      annotations:
+        {{- range $key, $value := .Values.podAnnotations }}
+        {{- if ne $key "checksum/config" }}
+        {{ $key | quote }}: {{ $value | toString | quote }}
+        {{- end }}
+        {{- end }}
+        # Only the tokens are read again while pgsnare runs. Any other
+        # change of the configuration starts new pods.
+        checksum/config: {{ include "pgsnare.config" . | sha256sum | quote }}
+    spec:
+      serviceAccountName: {{ include "pgsnare.fullname" . }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # The wait before the stop, the time open sessions get, the 2 seconds
+      # the sinks get to deliver what waits, and 3 seconds to spare.
+      terminationGracePeriodSeconds: {{ include "pgsnare.terminationGracePeriodSeconds" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        # The mounted files belong to root and to this group, which may
+        # read them. pgsnare refuses a file that anybody else can read.
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . | quote }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- range $key, $value := . }}
+        {{ $key | quote }}: {{ $value | toString | quote }}
+        {{- end }}
+      {{- end }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "pgsnare.selectorLabels" . | nindent 14 }}
+      containers:
+        - name: pgsnare
+          image: {{ include "pgsnare.image" . | quote }}
+          imagePullPolicy: {{ default "IfNotPresent" .Values.image.pullPolicy }}
+          command:
+            - {{ $binary }}
+          args:
+            - run
+            - --config
+            - /etc/pgsnare/pgsnare.yaml
+          env:
+            # Added to every event, so that an event names its pod.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- if .Values.sinks.webhookCA.secretName }}
+            # The name of a file, not a secret.
+            - name: SSL_CERT_FILE
+              value: {{ printf "%s/webhook-ca/ca.crt" $secrets | quote }}
+            {{- end }}
+          ports:
+            - name: postgres
+              containerPort: {{ int .Values.proxy.port }}
+              protocol: TCP
+            {{- if .Values.metrics.scrapers }}
+            - name: metrics
+              containerPort: {{ int .Values.metrics.port }}
+              protocol: TCP
+            {{- end }}
+          # The probes run the binary inside the container. It asks the
+          # admin listener over loopback, reads no file, and no health
+          # port is opened to the cluster.
+          startupProbe:
+            exec:
+              command:
+                - {{ $binary }}
+                - healthcheck
+            periodSeconds: 1
+            timeoutSeconds: 3
+            failureThreshold: 30
+          livenessProbe:
+            exec:
+              command:
+                - {{ $binary }}
+                - healthcheck
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - {{ $binary }}
+                - healthcheck
+                - --ready
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          {{- if gt (int .Values.shutdown.preStopSleepSeconds) 0 }}
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: {{ int .Values.shutdown.preStopSleepSeconds }}
+          {{- end }}
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: {{ .Values.resources.requests.cpu | toString | quote }}
+              memory: {{ .Values.resources.requests.memory | toString | quote }}
+            limits:
+              cpu: {{ .Values.resources.limits.cpu | toString | quote }}
+              memory: {{ .Values.resources.limits.memory | toString | quote }}
+          # Every Secret is mounted as a whole volume, so that a change of
+          # the Secret reaches the pod.
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pgsnare
+              readOnly: true
+            {{- range $index, $name := .Values.tokens.secretNames }}
+            - name: tokens-{{ $index }}
+              mountPath: {{ printf "%s/tokens-%d" $secrets $index | quote }}
+              readOnly: true
+            {{- end }}
+            {{- if ne .Values.proxy.clientTLS.mode "disable" }}
+            - name: client-tls
+              mountPath: {{ printf "%s/client-tls" $secrets | quote }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.database.tls.caSecretName }}
+            - name: database-ca
+              mountPath: {{ printf "%s/database-ca" $secrets | quote }}
+              readOnly: true
+            {{- end }}
+            {{- range $index, $webhook := .Values.sinks.webhooks }}
+            - name: webhook-{{ $index }}
+              mountPath: {{ printf "%s/webhook-%d" $secrets $index | quote }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.sinks.webhookCA.secretName }}
+            - name: webhook-ca
+              mountPath: {{ printf "%s/webhook-ca" $secrets | quote }}
+              readOnly: true
+            {{- end }}
+      # Mode 288 is 0440: the owner and the group may read, nobody else
+      # may do anything.
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "pgsnare.fullname" . }}
+            defaultMode: 288
+        {{- range $index, $name := .Values.tokens.secretNames }}
+        - name: tokens-{{ $index }}
+          secret:
+            secretName: {{ $name | quote }}
+            defaultMode: 288
+        {{- end }}
+        {{- if ne .Values.proxy.clientTLS.mode "disable" }}
+        - name: client-tls
+          secret:
+            secretName: {{ .Values.proxy.clientTLS.secretName | quote }}
+            defaultMode: 288
+        {{- end }}
+        {{- if .Values.database.tls.caSecretName }}
+        - name: database-ca
+          secret:
+            secretName: {{ .Values.database.tls.caSecretName | quote }}
+            defaultMode: 288
+        {{- end }}
+        {{- range $index, $webhook := .Values.sinks.webhooks }}
+        - name: webhook-{{ $index }}
+          secret:
+            secretName: {{ $webhook.secretName | quote }}
+            defaultMode: 288
+        {{- end }}
+        {{- if .Values.sinks.webhookCA.secretName }}
+        - name: webhook-ca
+          secret:
+            secretName: {{ .Values.sinks.webhookCA.secretName | quote }}
+            defaultMode: 288
+        {{- end }}

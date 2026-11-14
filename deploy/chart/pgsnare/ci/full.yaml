@@ -1,0 +1,124 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Every value set. The names and addresses are reserved for documentation,
+# the Secrets are only named, and the digest is a placeholder: no image
+# has it.
+image:
+  repository: registry.example.com/security/pgsnare
+  digest: sha256:1111111111111111111111111111111111111111111111111111111111111111
+  pullPolicy: Always
+imagePullSecrets:
+  - registry-login
+nameOverride: snare
+fullnameOverride: shop-snare
+replicaCount: 3
+proxy:
+  port: 6432
+  maxConnections: 500
+  loginTimeout: 30s
+  clientTLS:
+    mode: require
+    secretName: shop-db-server-tls
+    minVersion: tls1.3
+clients:
+  - podLabels:
+      app.kubernetes.io/name: api
+  - namespace: batch
+    podLabels:
+      app.kubernetes.io/name: reports
+      tier: backend
+database:
+  host: db.example.com
+  port: 5432
+  tls:
+    mode: verify-full
+    caSecretName: shop-db-ca
+    serverName: db.example.com
+    minVersion: tls1.2
+  peers:
+    - namespace: data
+      podLabels:
+        app.kubernetes.io/name: postgresql
+    - cidr: 192.0.2.10/32
+    - cidr: 2001:db8:0:1::/64
+  peerPort: 5433
+dns:
+  port: 53
+  peers:
+    - namespace: kube-system
+      podLabels:
+        k8s-app: kube-dns
+tokens:
+  secretNames:
+    - shop-tokens
+    - shop-tokens-finance
+sinks:
+  stdout: true
+  webhooks:
+    - secretName: alerts-webhook
+      port: 8443
+      peers:
+        - namespace: alerting
+          podLabels:
+            app.kubernetes.io/name: receiver
+      config:
+        timeout: 3s
+        max_retries: 3
+        queue_size: 256
+        max_events_per_second: 20
+    - secretName: pager-webhook
+      peers:
+        - cidr: 192.0.2.20/32
+    - secretName: unreachable-webhook
+  webhookCA:
+    secretName: alerts-ca
+metrics:
+  port: 9100
+  scrapers:
+    - namespace: monitoring
+      podLabels:
+        app.kubernetes.io/name: prometheus
+config:
+  inspection:
+    on_error: fail_closed
+    max_buffered_frame: 2MiB
+  exemptions:
+    - db_user: backup
+      client_cidr: 192.0.2.5/32
+    - db_user: replicator
+  actions:
+    kill:
+      sqlstate: "57014"
+      message: canceling statement due to user request
+    tarpit:
+      delay: 2s-30s
+      max_duration: 10m
+      max_sessions: 1000000
+      max_bytes_per_second: 1KiB
+    fake_data:
+      rows: 100
+  events:
+    query_redaction: none
+    dedup_window: 0s
+    queue_size: 2048
+    labels:
+      environment: "true"
+      cluster: "01"
+shutdown:
+  gracePeriodSeconds: 40
+  preStopSleepSeconds: 5
+resources:
+  requests:
+    cpu: 250m
+    memory: 128Mi
+  limits:
+    cpu: 2
+    memory: 512Mi
+podLabels:
+  team: security
+  app.kubernetes.io/name: not-this
+podAnnotations:
+  example.com/owner: security
+nodeSelector:
+  kubernetes.io/os: linux
+priorityClassName: important

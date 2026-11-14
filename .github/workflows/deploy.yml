@@ -1,0 +1,310 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The container image: built for x86_64 and aarch64, tested as a registry
+# hands it out, and scanned for known vulnerabilities.
+#
+# Nothing here is published. An image goes from the job that builds it to
+# the jobs that use it as an archive, and those jobs push it to a registry
+# that runs inside the runner and is gone with the job. From there it is
+# pulled and named by digest.
+#
+# The workflow uses no secret and its token can only read, so it runs the
+# same way for a pull request from a fork. No expression is written into a
+# script: a value reaches a script through `env`.
+#
+# The jobs:
+#
+#   rules        the repository rules for images and jobs refuse what they
+#                must, the tool installer installs nothing whose checksum is
+#                wrong, and the release workflow keeps to its rules
+#   image-build  deploy/Dockerfile, natively on each architecture
+#   image-test   deploy/tests/image/test.sh
+#   image-scan   deploy/tests/scan/scan.sh, on every build and every night
+#   chart        deploy/tests/render.sh: the chart is linted, rendered and
+#                validated, it refuses what it must, and the binary of the
+#                image accepts the configuration it renders
+#   kubernetes   the chart in a cluster inside the runner, in a namespace
+#                that enforces the restricted Pod Security Standard: first
+#                alert to a webhook, a token added through the Secret, a
+#                rolling update, both sidecar definitions, and isolation by
+#                the NetworkPolicy: deploy/tests/kubernetes/
+#   example      the Compose example from `up` to a verified alert:
+#                examples/compose/smoke.sh
+#   release-rehearsal
+#                the scripts of a release against the registry of the
+#                runner, signing with a key made in the job, and then what
+#                the verification must refuse: deploy/tests/release/
+
+name: deploy
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Every night, on the default branch: a vulnerability that became known
+    # after the last change is found without one.
+    - cron: "23 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  rules:
+    name: rules
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The rules for images and jobs refuse what they must
+        run: deploy/tests/rules/repo.sh
+      - name: The tool installer refuses a faulty list and a wrong checksum
+        run: deploy/tests/rules/tools.sh --online
+      - name: The release workflow and the check of a release tag keep to their rules
+        run: deploy/tests/rules/release.sh
+
+  image-build:
+    name: image-build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      ARCH: ${{ matrix.arch }}
+    outputs:
+      sums_amd64: ${{ steps.sums.outputs.sums_amd64 }}
+      sums_arm64: ${{ steps.sums.outputs.sums_arm64 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the image and export the binary
+        run: deploy/tests/image/build.sh "$RUNNER_TEMP/image" "$ARCH"
+      - name: Report the sum of the sums to the rehearsal of a release
+        id: sums
+        working-directory: ${{ runner.temp }}/image
+        run: echo "sums_$ARCH=$(sha256sum "SHA256SUMS-$ARCH" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - name: Hand the image to the other jobs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-${{ matrix.arch }}
+          path: ${{ runner.temp }}/image/
+          if-no-files-found: error
+          retention-days: 7
+
+  image-test:
+    name: image-test (${{ matrix.arch }})
+    needs: image-build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Take the image from the build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-${{ matrix.arch }}
+          path: ${{ runner.temp }}/image
+      - name: Check the archive against its sums
+        working-directory: ${{ runner.temp }}/image
+        run: sha256sum --check --strict "SHA256SUMS-$ARCH"
+      - name: Test the image as the registry hands it out
+        run: |
+          deploy/tests/registry/start.sh
+          image="$(deploy/tests/registry/load.sh "$RUNNER_TEMP/image/pgsnare-image-$ARCH.tar")"
+          deploy/tests/image/test.sh "$image" "$RUNNER_TEMP/image/pgsnare-$ARCH"
+
+  image-scan:
+    name: image-scan (${{ matrix.arch }})
+    needs: image-build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Take the image from the build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-${{ matrix.arch }}
+          path: ${{ runner.temp }}/image
+      - name: Check the archive against its sums
+        working-directory: ${{ runner.temp }}/image
+        run: sha256sum --check --strict "SHA256SUMS-$ARCH"
+      - name: Install the scanner from the tool list
+        run: deploy/tools/install.sh "$RUNNER_TEMP/bin" grype
+      - name: Scan the image for known vulnerabilities
+        run: |
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          deploy/tests/registry/start.sh
+          image="$(deploy/tests/registry/load.sh "$RUNNER_TEMP/image/pgsnare-image-$ARCH.tar")"
+          deploy/tests/scan/scan.sh "$image"
+
+  chart:
+    name: chart
+    needs: image-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Take the binary from the build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-amd64
+          path: ${{ runner.temp }}/image
+      - name: Check the binary against its sums
+        working-directory: ${{ runner.temp }}/image
+        run: |
+          sha256sum --check --strict SHA256SUMS-amd64
+          chmod 0755 pgsnare-amd64
+      - name: Install the chart tools from the tool list
+        run: deploy/tools/install.sh "$RUNNER_TEMP/bin" helm kubeconform
+      - name: Lint, render and validate the chart, and try what it must refuse
+        run: |
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          deploy/tests/render.sh "$RUNNER_TEMP/image/pgsnare-amd64"
+
+  kubernetes:
+    name: kubernetes
+    needs: image-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Take the image from the build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-amd64
+          path: ${{ runner.temp }}/image
+      - name: Check the archive against its sums
+        working-directory: ${{ runner.temp }}/image
+        run: sha256sum --check --strict SHA256SUMS-amd64
+      - name: Install the cluster tools from the tool list
+        run: deploy/tools/install.sh "$RUNNER_TEMP/bin" kind kubectl helm
+      - name: Create the cluster
+        run: |
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          deploy/tests/registry/start.sh
+          deploy/tests/kubernetes/cluster.sh
+      - name: Install the chart in a namespace that enforces the restricted standard
+        run: |
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          image="$(deploy/tests/registry/load.sh "$RUNNER_TEMP/image/pgsnare-image-amd64.tar")"
+          deploy/tests/kubernetes/install.sh "$image"
+      - name: Prepare a webhook receiver and upgrade the release
+        run: |
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          deploy/tests/kubernetes/sinks.sh
+      - name: First alert of the central proxy
+        run: |
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          deploy/tests/kubernetes/alert.sh
+      - name: A token added through the Secret, without a restart
+        run: |
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          deploy/tests/kubernetes/token-change.sh
+      - name: A rolling update lets an open session finish
+        run: |
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          deploy/tests/kubernetes/rollout.sh
+      - name: The native sidecar, from install to first alert
+        run: |
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          deploy/tests/kubernetes/sidecar.sh native
+      - name: The sidecar without native support, from install to first alert
+        run: |
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          deploy/tests/kubernetes/sidecar.sh classic
+      - name: Only listed clients and scrapers get through the NetworkPolicy
+        run: |
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          deploy/tests/kubernetes/isolation.sh
+
+  example:
+    name: example
+    needs: image-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Take the image from the build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-amd64
+          path: ${{ runner.temp }}/image
+      - name: Check the archive against its sums
+        working-directory: ${{ runner.temp }}/image
+        run: sha256sum --check --strict SHA256SUMS-amd64
+      - name: The Compose example, from up to a verified alert
+        run: |
+          deploy/tests/registry/start.sh
+          image="$(deploy/tests/registry/load.sh "$RUNNER_TEMP/image/pgsnare-image-amd64.tar")"
+          PGSNARE_IMAGE="$image" examples/compose/smoke.sh
+
+  release-rehearsal:
+    name: release-rehearsal
+    needs: image-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      BUILD_SUMS_AMD64: ${{ needs.image-build.outputs.sums_amd64 }}
+      BUILD_SUMS_ARM64: ${{ needs.image-build.outputs.sums_arm64 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Take the amd64 image from the build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-amd64
+          path: ${{ runner.temp }}/image
+      - name: Take the arm64 image from the build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-arm64
+          path: ${{ runner.temp }}/image
+      - name: Install the release tools from the tool list
+        run: deploy/tools/install.sh "$RUNNER_TEMP/bin" crane cosign syft helm
+      - name: Publish to the registry of this runner, verify, and try what must be refused
+        run: |
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          deploy/tests/registry/start.sh
+          deploy/tests/release/rehearse.sh "$RUNNER_TEMP/image"

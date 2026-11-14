@@ -1,0 +1,20 @@
+{{/* SPDX-License-Identifier: Apache-2.0 */}}
+# The address applications connect to. It is reachable inside the cluster
+# only, and it carries the proxy port and nothing else: neither the metrics
+# nor the health endpoints.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pgsnare.fullname" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "pgsnare.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "pgsnare.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: postgres
+      protocol: TCP
+      port: {{ int .Values.proxy.port }}
+      targetPort: postgres

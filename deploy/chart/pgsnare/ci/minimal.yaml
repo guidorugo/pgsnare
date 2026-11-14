@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The least that renders: the three required values, and TLS towards the
+# clients turned off because no certificate is named. Nobody is listed as a
+# client and nowhere as the database, so the NetworkPolicy lets nobody in
+# and lets the proxy reach the name service only.
+#
+# The digest is a placeholder: no image has it.
+image:
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+proxy:
+  clientTLS:
+    mode: disable
+database:
+  host: db.example.com
+tokens:
+  secretNames:
+    - pgsnare-tokens

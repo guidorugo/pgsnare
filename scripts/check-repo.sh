@@ -8,6 +8,11 @@
 #   3. Every workflow gives its token read-only access at the top level,
 #      never runs on `pull_request_target`, and uses only actions that are
 #      local or pinned to a full commit SHA and written by GitHub.
+#   4. Every image that a file under deploy/ or examples/ names is pinned by
+#      digest, and a Rust image there has the version of rust-toolchain.toml.
+#   5. No job outside the six workflows of the required checks carries the
+#      name of one, and no job outside release.yml is given permissions of
+#      its own.
 
 set -euo pipefail
 
@@ -82,6 +87,224 @@ for file in .github/workflows/*.yml .github/workflows/*.yaml; do
     ' "$file" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
     if [[ "$block" != "contents: read" ]]; then
         fail "$file: the top-level permissions must be exactly 'contents: read'"
+    fi
+done
+
+# --- 4. Images under deploy/ and examples/ ---------------------------------
+# A tag can be moved to another image, and a digest cannot. So every image
+# that these files name is named by digest, and whoever changes one changes
+# a line of this repository.
+digest='@sha256:[0-9a-f]{64}'
+
+# pinned FILE:LINE REFERENCE STAGES: a reference in a Dockerfile is an
+# earlier stage of the same file by its name, the empty image `scratch`, or
+# an image with a digest. A Rust image has the version of rust-toolchain.toml.
+pinned() {
+    local where="$1" reference="$2" stages="$3"
+    if [[ "$reference" == scratch || " $stages " == *" $reference "* ]]; then
+        return 0
+    fi
+    if ! [[ "$reference" =~ ^[a-z0-9][a-z0-9._/:-]*${digest}$ ]]; then
+        fail "$where: the image '$reference' is not pinned by digest"
+        return 0
+    fi
+    if [[ "$reference" =~ ^((docker\.io/)?library/)?rust[:@] ]]; then
+        if ! [[ "$reference" =~ ^((docker\.io/)?library/)?rust:([0-9]+\.[0-9]+\.[0-9]+)[-@] ]]; then
+            fail "$where: the Rust image '$reference' names no full version"
+        elif [[ "${BASH_REMATCH[3]}" != "$toolchain" ]]; then
+            fail "$where: rust-toolchain.toml pins Rust $toolchain but this image is ${BASH_REMATCH[3]}"
+        fi
+    fi
+}
+
+while IFS= read -r -d '' file; do
+    stages=""
+    number=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        number=$((number + 1))
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        if [[ "$line" =~ ^[[:space:]]*[Ff][Rr][Oo][Mm][[:space:]]+(.*)$ ]]; then
+            reference=""
+            stage=""
+            previous=""
+            read -r -a words <<<"${BASH_REMATCH[1]}"
+            for word in "${words[@]}"; do
+                if [[ -z "$reference" ]]; then
+                    [[ "$word" == --* ]] || reference="$word"
+                elif [[ "$previous" == [Aa][Ss] ]]; then
+                    stage="$word"
+                fi
+                previous="$word"
+            done
+            pinned "$file:$number" "$reference" "$stages"
+            stages="$stages $stage"
+        fi
+        # `COPY --from=` and `RUN --mount=...,from=` read from an image too.
+        rest="$line"
+        while [[ "$rest" =~ (^|[[:space:],-])from=([^[:space:],]+)(.*)$ ]]; do
+            rest="${BASH_REMATCH[3]}"
+            pinned "$file:$number" "${BASH_REMATCH[2]}" "$stages"
+        done
+    done < "$file"
+done < <(find deploy examples -type f \
+    \( -name 'Dockerfile' -o -name 'Dockerfile.*' -o -name '*.Dockerfile' \
+       -o -name 'Containerfile' -o -name 'Containerfile.*' \) \
+    ! -name '*.dockerignore' -print0 2>/dev/null)
+
+# A package of the distribution that a Dockerfile adds with `apk` is named
+# with its exact version, on the line of the command: `apk add NAME=VERSION`.
+# A range, or no version, gives another image on another day. The package
+# index of the day decides nothing: a version that is gone stops the build.
+# (This rule reads `apk` only. What a build stage installs with another
+# package manager is not held to it.)
+package='[a-z0-9][a-z0-9+._-]*=[0-9][a-z0-9._]*-r[0-9]+'
+while IFS= read -r -d '' file; do
+    number=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        number=$((number + 1))
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        rest="$line"
+        while [[ "$rest" =~ (^|[^A-Za-z0-9_./-])apk[[:space:]]+(.*)$ ]]; do
+            rest="${BASH_REMATCH[2]}"
+            read -ra words <<<"$rest"
+            verb=""
+            named=0
+            for word in "${words[@]}"; do
+                last=0
+                if [[ "$word" == *';' ]]; then
+                    word="${word%;}"
+                    last=1
+                fi
+                word="${word#[\"\']}"
+                word="${word%[\"\']}"
+                if [[ -z "$verb" ]]; then
+                    # The options of apk itself come before its command.
+                    [[ "$word" == -* ]] || verb="$word"
+                elif [[ "$word" == '&&' || "$word" == '||' || "$word" == '|' ]]; then
+                    break
+                elif [[ "$verb" != add ]]; then
+                    :
+                elif [[ "$word" == '\' ]]; then
+                    named=1
+                    fail "$file:$number: apk $verb names its packages on another line; name them on this one"
+                elif [[ -n "$word" && "$word" != -* ]]; then
+                    named=1
+                    if ! [[ "$word" =~ ^${package}$ ]]; then
+                        fail "$file:$number: the package '$word' is not named with its exact version (NAME=VERSION)"
+                    fi
+                fi
+                [[ "$last" -eq 0 ]] || break
+            done
+            case "$verb" in
+                add)
+                    [[ "$named" -eq 1 ]] || fail "$file:$number: apk add names no package on its line"
+                    ;;
+                upgrade | fix)
+                    fail "$file:$number: apk $verb changes packages without naming their versions; use apk add NAME=VERSION"
+                    ;;
+            esac
+        done
+    done < "$file"
+done < <(find deploy examples -type f \
+    \( -name 'Dockerfile' -o -name 'Dockerfile.*' -o -name '*.Dockerfile' \
+       -o -name 'Containerfile' -o -name 'Containerfile.*' \) \
+    ! -name '*.dockerignore' -print0 2>/dev/null)
+
+# An `image:` in a Compose file, a manifest or the values of a chart has a
+# digest, or is a variable that must be set and has no default:
+# `${NAME:?message}`. Only a template of a chart may compose the name: what
+# it renders is checked where the chart is rendered.
+while IFS= read -r hit; do
+    file="${hit%%:*}"
+    rest="${hit#*:}"
+    number="${rest%%:*}"
+    value="$(sed -E 's/^[[:space:]]*(-[[:space:]]+)?"?image"?:[[:space:]]*//; s/[[:space:]]+#.*$//; s/[[:space:]]+$//; s/,$//' <<<"${rest#*:}")"
+    case "$value" in
+        \"*\") value="${value#\"}"; value="${value%\"}" ;;
+        \'*\') value="${value#\'}"; value="${value%\'}" ;;
+    esac
+    # No value, or the start of a mapping: a group of settings, not a name.
+    if [[ -z "$value" || ( "$value" == \{* && "$value" != \{\{* ) ]]; then
+        continue
+    fi
+    if [[ "$value" =~ ^\$\{[A-Z_][A-Z0-9_]*:\?[^}]*\}$ ]]; then
+        continue
+    fi
+    if [[ "$value" == *'{{'* && "$file" == deploy/chart/*/templates/* ]]; then
+        continue
+    fi
+    if ! [[ "$value" =~ ^[a-z0-9][a-z0-9._/:-]*${digest}$ ]]; then
+        fail "$file:$number: the image '$value' is neither pinned by digest nor a variable that must be set"
+    fi
+done < <(grep -rnE --include='*.yaml' --include='*.yml' --include='*.json' --include='*.tpl' \
+    '^[[:space:]]*(-[[:space:]]+)?"?image"?:' deploy examples 2>/dev/null || true)
+
+# The rule above reads a name that follows `image:` at the start of a line,
+# and no other form. So no other form is accepted: `image` as a key further
+# into a line (a mapping written on one line), with a blank before its
+# colon, or in single quotes; and an image that a script names with
+# `--image`. A key whose value is a mapping is a group of settings, as
+# above. A comment is not read. What a script does with a name it gets from
+# elsewhere is not seen here: this guards against a slip, and a review reads
+# the rest.
+while IFS= read -r hit; do
+    file="${hit%%:*}"
+    rest="${hit#*:}"
+    number="${rest%%:*}"
+    text="${rest#*:}"
+    [[ "$text" =~ ^[[:space:]]*# ]] && continue
+    # The form that the rule above has read: go on behind it.
+    if [[ "$text" =~ ^[[:space:]]*(-[[:space:]]+)?\"?image\"?:(.*)$ ]]; then
+        text="${BASH_REMATCH[2]}"
+    fi
+    while [[ "$text" =~ (^|[[:space:]{,[])[\"\']?image[\"\']?[[:space:]]*:[[:space:]]*(.*)$ ]]; do
+        text="${BASH_REMATCH[2]}"
+        if [[ -z "$text" || ( "$text" == \{* && "$text" != \{\{* ) ]]; then
+            continue
+        fi
+        fail "$file:$number: an image is named in a form that this check does not read; write 'image: NAME' on a line of its own"
+        break
+    done
+done < <(grep -rnE --include='*.yaml' --include='*.yml' --include='*.json' --include='*.tpl' \
+    '(^|[[:space:]{,[])["'"'"']?image["'"'"']?[[:space:]]*:' deploy examples 2>/dev/null || true)
+
+while IFS= read -r hit; do
+    file="${hit%%:*}"
+    rest="${hit#*:}"
+    number="${rest%%:*}"
+    fail "$file:$number: a script names an image with --image; name it in a manifest, where this check reads it"
+done < <(grep -rnE --include='*.sh' -e '(^|[^A-Za-z0-9_-])--image([=[:space:]"'"'"']|$)' deploy examples 2>/dev/null || true)
+
+# --- 5. Jobs ------------------------------------------------------------------
+# `main` accepts a pull request when the checks with these names pass. Each
+# is the one job of the workflow with the same name. A job of that name in
+# another workflow could pass in its place.
+required_checks='lint test deny scan itest fuzz'
+
+for file in .github/workflows/*.yml .github/workflows/*.yaml; do
+    base="$(basename "$file")"
+    base="${base%.*}"
+    # The key of a job, or the name of a job or of a step.
+    while IFS= read -r line; do
+        number="${line%%:*}"
+        name="$(sed -E 's/^[0-9]+:[[:space:]]*(-[[:space:]]+)?//; s/^["'"'"']?name["'"'"']?[[:space:]]*:[[:space:]]*//; s/[[:space:]]+#.*$//; s/[[:space:]]+$//; s/[[:space:]]*:$//; s/^["'"'"']//; s/["'"'"']$//' <<<"$line")"
+        for check in $required_checks; do
+            if [[ "$name" == "$check" && "$check" != "$base" ]]; then
+                fail "$file:$number: '$check' is the name of a required check and belongs to $check.yml alone"
+            fi
+        done
+    done < <(grep -nE '^[[:space:]]+((-[[:space:]]+)?["'"'"']?name["'"'"']?[[:space:]]*:|["'"'"']?[A-Za-z0-9_-]+["'"'"']?[[:space:]]*:[[:space:]]*(#.*)?$)' "$file" || true)
+
+    # The token is read-only for every job: the top-level block says so, and
+    # a job says nothing else. Only the workflow that publishes a release
+    # may give a job more, and it is reviewed for that.
+    if [[ "$base" != release ]]; then
+        while IFS= read -r line; do
+            number="${line%%:*}"
+            if ! [[ "$line" =~ ^[0-9]+:[[:space:]]+permissions:[[:space:]]*\{[[:space:]]*\}[[:space:]]*(#.*)?$ ]]; then
+                fail "$file:$number: only release.yml may give a job permissions of its own"
+            fi
+        done < <(grep -nE '^[[:space:]]+["'"'"']?permissions["'"'"']?[[:space:]]*:' "$file" || true)
     fi
 done
 
