@@ -24,7 +24,8 @@ use pgsnare_core::policy::ActionSet;
 use pgsnare_core::rules::{
     Analysis, CATALOG_ENUMERATION, FUNCTIONS, Limits, MAX_FUNCTIONS, MAX_KINDS,
     MAX_NORMALISE_INPUT_BYTES, MAX_NORMALISED_BYTES, MAX_RELATIONS, ParseFailure, RelationUse,
-    RuleScope, RuleSet, Subject, UNBOUNDED_READ, analyse, precheck, spawn_parser_thread,
+    RuleScope, RuleSet, StatementFlags, Subject, UNBOUNDED_READ, analyse, precheck,
+    spawn_parser_thread,
 };
 
 type Outcome = Result<Analysis, ParseFailure>;
@@ -132,7 +133,12 @@ fn check_rules(analysis: &Analysis) {
         }
     }
     if rules.row_threshold(analysis, &app).is_some() {
-        assert!(!analysis.relations().is_empty());
+        // A listed table is read, or what an earlier statement stored is
+        // run.
+        assert!(
+            !analysis.relations().is_empty()
+                || analysis.flags().contains(StatementFlags::RUNS_STORED)
+        );
     }
     let excluded = Subject {
         listener: "main",

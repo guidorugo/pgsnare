@@ -186,6 +186,16 @@ fn policy(on_error: OnError, max_buffered_frame: usize, rules: bool) -> PolicySn
                 RuleScope::default(),
             )
             .expect("a valid rule")
+            // Answered with `alert`, so it lets every row through. A
+            // statement without an analysis arms it, so most results of
+            // the fuzzed streams are counted.
+            .row_threshold(
+                &["users".to_owned()],
+                2,
+                ActionSet::ALERT,
+                RuleScope::default(),
+            )
+            .expect("a valid rule")
             .build();
         builder = builder.rules(rules);
     }
@@ -197,8 +207,8 @@ fn policy(on_error: OnError, max_buffered_frame: usize, rules: bool) -> PolicySn
 /// The most bytes of a client a session keeps behind a held statement.
 const MAX_BEHIND: usize = 1024 * 1024;
 
-/// A stand-in for the hash function of the runtime. No event is raised
-/// here, so it is never asked.
+/// A stand-in for the hash function of the runtime, for the statements
+/// of the events that are raised.
 fn digest(_: &[u8]) -> [u8; 32] {
     [0; 32]
 }
