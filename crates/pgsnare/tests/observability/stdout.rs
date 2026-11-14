@@ -113,6 +113,66 @@ async fn an_event_of_a_session_is_one_line_of_json_on_standard_output() {
 }
 
 #[tokio::test]
+async fn under_full_query_redaction_a_token_value_in_a_statement_is_still_removed_from_the_event() {
+    const VALUE: &str = "kx9-full-mode-bait-7c41e0b2d5a8";
+    let database = Database::start().await;
+    let dir = TempDir::new();
+    let port = free_port();
+    let config = dir.write(
+        "pgsnare.yaml",
+        format!(
+            "listeners:\n  - name: main\n    listen: 127.0.0.1:{port}\n    upstream: {}\n    \
+             client_tls: {{ mode: disable }}\n    upstream_tls: {{ mode: disable }}\n\
+             tokens:\n  - id: full-mode-bait\n    values: [{VALUE}]\n\
+             events:\n  query_redaction: full\n  sinks:\n    - type: stdout\n\
+             admin:\n  listen: 127.0.0.1:{}\nmetrics:\n  listen: 127.0.0.1:{}\n\
+             shutdown:\n  grace_period: 1s\n",
+            database.address,
+            free_port(),
+            free_port()
+        )
+        .as_bytes(),
+    );
+    let mut pgsnare = Pgsnare::run(&config, &[]);
+    pgsnare.listening(port).await;
+
+    let mut client = log_in(port, "app", "shop", "psql").await;
+    client
+        .write_all(&query(&format!("SELECT '{VALUE}' AS note, 42 AS marker")))
+        .await
+        .unwrap();
+    soon(read_until_ready(&mut client)).await.unwrap();
+    until(|| {
+        pgsnare
+            .stdout
+            .lines()
+            .iter()
+            .any(|line| line.contains("\"kind\":\"token_hit\""))
+    })
+    .await;
+
+    let lines = pgsnare.stdout.lines();
+    let hit = lines
+        .iter()
+        .find(|line| line.contains("\"kind\":\"token_hit\""))
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(hit).unwrap();
+    assert_eq!(json["token_id"], "full-mode-bait");
+    assert_eq!(json["query"]["redaction"], "full");
+    let text = json["query"]["text"].as_str().expect("the statement text");
+    assert!(
+        text.contains("AS marker") && text.contains("[redacted]"),
+        "{text}"
+    );
+    for line in &lines {
+        assert!(!line.contains(VALUE), "a line shows the value");
+    }
+    drop(client);
+    pgsnare.signal(Signal::TERM);
+    assert!(pgsnare.ended().await.success());
+}
+
+#[tokio::test]
 async fn a_sink_that_cannot_be_built_keeps_the_proxy_from_starting() {
     let dir = TempDir::new();
     let missing = dir.path("no-such-directory").join("events.jsonl");

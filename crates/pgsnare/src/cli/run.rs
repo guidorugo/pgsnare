@@ -129,13 +129,6 @@ fn start(args: &Args, redaction: &Redaction) -> Result<(), String> {
     }
     let proxy = builder.build().map_err(|error| error.to_string())?;
 
-    tracing::warn!(
-        tokens = config.tokens.len(),
-        sinks = config.events.sinks.len(),
-        "this build relays traffic and detects nothing: honeytoken detection and responses \
-         are not built yet, so the only events are those of sessions that inspection gave up on"
-    );
-
     let settings = Settings::new(listeners)
         .with_grace_period(config.shutdown.grace_period)
         .with_labels(labels(&config))
