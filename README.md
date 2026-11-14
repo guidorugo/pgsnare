@@ -90,13 +90,52 @@ What each response does, and where it stops:
 Limits to know about:
 
 - Detection is of the value as it travels. A value that is hashed, cut or re-encoded inside the database does not match, and `kill` withholds the message that holds the token, not the messages before it. A message larger than `max_buffered_frame` is scanned as a stream, and bytes before the token inside it can reach the client.
-- Statements are attributed by following the protocol, not by parsing SQL. A statement prepared or deallocated by an SQL command is not followed. When the proxy loses its place, the event says the statement is unknown, and the hit is still raised.
+- Statements are attributed by following the protocol, not by parsing SQL; only the optional [SQL rules](#sql-rules) parse. A statement prepared or deallocated by an SQL command is not followed. When the proxy loses its place, the event says the statement is unknown, and the hit is still raised.
 - `query_redaction: full` puts statements into events as they were sent, so a password written in a statement is shown (token values are still removed). The default is `fingerprint`.
 - If `fake_data` was decided and rows cannot be added at the end of the result, for example after a cursor `FETCH`, the result goes on unchanged, though the event says `fake_data`.
 
 ### Reload
 
 The policy (tokens, exemptions, escalation, response settings, `query_redaction`) is read again on `SIGHUP` and when a file of the configuration, its directory, or the directory of a token-file pattern changes. Changes are looked for each second and acted on once nothing has changed for one more second, which also sees the swap of a mounted volume. The new policy is built in full and swapped in one step. A session sees it at its next message, and a COPY keeps the policy it started with. A policy that does not load is refused: the old one stays, the log names the file and the reason, and `pgsnare_reload_failures_total` counts it. Listeners, TLS, sinks, the admin and metrics listeners and the grace period need a restart, and a reload that changes them says so in the log. A session that is flagged stays flagged after a reload, also if it becomes exempt. The values of tokens that a reload removes are no longer removed from events and logs.
+
+### SQL rules
+
+Rules are optional and are off unless the configuration has a `rules` section. They look at the statement, with the grammar of PostgreSQL 18, before any of it reaches the database. Honeytokens remain the main signal: the rules add checks for the statements an intruder tends to send, and they never decide whether a token is found.
+
+```yaml
+rules:
+  on_parse_failure: alert                   # allow, alert (default) or block
+  max_parse_bytes: 64KiB                    # a longer statement is not parsed
+  catalog_enumeration: { actions: [alert], exclude_users: [migrator] }
+  unbounded_read: { tables: [public.users], actions: [alert], listeners: [main] }
+  row_threshold: { tables: [public.users], max_rows: 1000, actions: [alert, tarpit], users: [app] }
+  functions: { names: [pg_read_file, lo_export, pg_sleep], actions: [alert, kill] }
+```
+
+| Rule | Fires when |
+|---|---|
+| `catalog_enumeration` | A statement names a relation of `pg_catalog` or `information_schema`, or an unqualified relation whose name starts with `pg_` |
+| `unbounded_read` | A listed table is read with no `WHERE` and no `LIMIT` or `FETCH`: also through `TABLE t`, `COPY t TO`, sub-selects, CTEs and `RETURNING`. `LIMIT ALL`, `LIMIT NULL` and a `WHERE` that is one bare constant are no bound |
+| `row_threshold` | A result has more than `max_rows` rows. It fires once for that result |
+| `functions` | A listed function is named, with or without `pg_catalog.`, however the name is written: case, quotes, comments and Unicode escapes do not hide it |
+
+- **Scope.** Each rule takes optional `listeners` and `users` lists, where it is on, and `exclude_users`, for whom it is off. A list that is left out means all; an excluded user wins. A rule set that does not apply to a session costs that session nothing.
+- **Responses.** A hit takes the path of a token hit: an exempt session is counted and nothing else, the session is flagged, and `alert`, `kill` and `tarpit` are carried out by the same code. The event is `rule_hit` and names the rule. `fake_data` has no result to add rows to before a statement runs, so on the three rules that fire before a result it is carried out and reported as `alert`; on `row_threshold` it follows the conditions it has for a token. Rules have no escalation.
+- **The statement is held.** In a session a rule applies to, a `Query` or `Parse` is searched for honeytokens as always and then held, together with what the client sends behind it, until the parser has answered. The database sees nothing of it before that. The client is not read meanwhile, and the server's traffic goes on. The wait is part of `pgsnare_added_latency_seconds`.
+- **The parser is isolated.** It is C code that reads attacker-controlled text. It runs only on its own threads (two, with 16 MiB of stack each), behind a queue of 256 jobs that answers "busy" instead of waiting, with each job guarded against a panic. The text is checked first for its size, valid UTF-8, an embedded NUL byte and nesting. Parsing can take up to about 1,500 times the size of a statement in memory, so the default `max_parse_bytes` is 64 KiB. Analyses are cached by the SHA-256 of the text, up to 4,096 entries and 8 MiB. A statement is parsed once, however many times a prepared statement runs.
+- **Parse failures.** A statement without an analysis follows `on_parse_failure`: `allow` passes it on and counts it, `alert` also raises a `parse_failure` event, and `block` raises the event and ends the session with the error of `kill` before any byte of the statement is passed on. Counted in `pgsnare_parse_failures_total` whatever the setting. The cases are: a statement the parser refuses or that nests too deep, one over `max_parse_bytes`, a malformed message, a message sent in parts, busy parser threads, no answer within five seconds, a panic, a session whose `client_encoding` is not `UTF8` (or not yet reported) or whose `standard_conforming_strings` is off, and a statement that carries code as a string (`DO`, `CREATE FUNCTION`, `CREATE PROCEDURE`). A `FunctionCall` message names its function by number, so it is a parse failure where the `functions` rule applies. A migration tool that sends large statements or function bodies will raise `parse_failure` events: exclude its user from the rules.
+- **The row threshold** counts the `DataRow`s of a result, and each `CopyData` of a `COPY ... TO STDOUT`, through the statement tracker. A result is everything one `Query` returns, or everything one portal returns over all its `Execute`s. Cautiously, a statement that runs a stored one (`EXECUTE`, `FETCH`), a statement without an analysis and a result the tracker cannot place are held to the threshold whatever table they read.
+- **Redaction.** With `query_redaction: fingerprint` (the default, and the setting recommended for production), an event about an analysed statement shows the parser's normalised statement, with its constants left out, and the parser's fingerprint (16 hexadecimal digits). The SHA-256 form (64 digits) is shown instead when the statement has no analysis, when its kind is not one whose constants the parser replaces everywhere (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `SET`, transaction statements, `CALL`, `DECLARE`), when the form still holds a comment or a string, and when it holds a honeytoken of the policy in force. `full` is a mode for debugging: it can show a statement as it was sent, passwords included.
+- **A reload** replaces the rules with the rest of the policy. A held statement is judged by the rules it was held under, and the cache holds analyses, not verdicts.
+
+What the rules cannot see:
+
+- Code in a string: the body of a `DO` block or of a function, dynamic SQL (`EXECUTE format(...)`), `dblink`, `query_to_xml`. Such a statement is a parse failure, and what the code does is not judged.
+- Aggregates, operators and casts defined over a listed function.
+- A statement run by name. `PREPARE x AS ...` is judged when it arrives; `EXECUTE x` and a `FETCH` from a cursor are not tied back to it. A statement prepared before a reload is not judged by the rules loaded since, and an `Execute` of a prepared statement raises nothing again.
+- A change of `client_encoding` or `standard_conforming_strings` is known only when the server reports it, so a statement sent right behind such a change is read under the old setting.
+- The rules are heuristics: `WHERE 1=1` and `LIMIT 1000000000` count as bounds. The row threshold is the real bound.
+- A rule needs the build feature `rules` (see [Building and testing](#building-and-testing)). A build without it refuses a configuration that has a `rules` section.
 
 ## Design goals
 
@@ -139,6 +178,7 @@ pgsnare cannot be used yet: it detects and responds, but no version has been rel
 - **Relay.** `pgsnare run` puts a proxy between clients and a database: TLS on both legs, logins, simple and extended queries, COPY, replication, notifications, function calls and cancellation, for protocol 3.0 and 3.2. Tests compare what a client sees from PostgreSQL 15 to 18 directly and through pgsnare, in every supported TLS setup.
 - **Detection.** Every message, in both directions, is scanned for honeytoken values before it is forwarded, and so are the startup parameters and the user name at login. A value split across reads, across the chunks of a large message or across `CopyData` messages is found. A hit becomes a `token_hit` event that names the token, the session and the statement.
 - **Policy and responses.** Per token: `alert`, `kill`, `tarpit` and `fake_data`, combinations, escalation after repeated hits, exemptions by user and address range, and a `session_activity` event for each statement of a flagged session. Counted in `pgsnare_queries_total`, `pgsnare_hits_total` and `pgsnare_actions_total`. See [Configuring responses](#configuring-responses). The responses are tested with the proxy running in test programs, with a real client socket and a database made for the test. The integration tests also read a honeytoken through the proxy from PostgreSQL, once with `alert` and once with `kill`; `tarpit`, `fake_data` and reload are not yet run against PostgreSQL.
+- **SQL rules.** Optional rules judge a statement with the grammar of PostgreSQL 18 before it is passed on: catalogue enumeration, unbounded reads of listed tables, functions from a list, and a row threshold counted through the statement tracker. They are configured per rule, listener and user, answer like a token hit, and follow a parse-failure policy (`allow`, `alert`, `block`). See [SQL rules](#sql-rules). Tested with the real parser in test programs and fuzzed; the integration tests run one rule (`functions` with `kill`) against PostgreSQL 15 to 18.
 - **Reload.** `SIGHUP` or a change to a configuration or token file replaces the policy without dropping a session. See [Reload](#reload).
 - **Events and observability.** Events reach four sinks through a dispatcher that never makes database traffic wait: a signed webhook over verified HTTPS, standard output, a file and syslog. `pgsnare run` serves `/healthz` and `/readyz` on an admin listener and Prometheus metrics on a listener of their own, both on loopback by default, and `pgsnare healthcheck` asks the admin listener. The log is JSON, one object for each line, on standard error, written by a thread of its own through a queue, so a log nobody reads costs lines and never makes a session wait. One redaction layer stands before every event, log line and metric label.
 - **Wire protocol.** Framing, message views and encoders for protocol 3.0 and 3.2, tested against traffic captured from PostgreSQL 15 to 18.
@@ -154,7 +194,7 @@ The steps to the first release:
 | 1. Relay | A proxy that real clients cannot tell from the database | Done |
 | 2. Detect and alert | Honeytokens, events and sinks. The first usable version | Built: detection, events, sinks, health and metrics. `tarpit`, `fake_data` and reload not yet run against PostgreSQL |
 | 3. Respond | Kill, tarpit, fake data and exemptions | Built, with the same limit |
-| 4. SQL rules | Optional checks on the statements themselves | Not started |
+| 4. SQL rules | Optional checks on the statements themselves | Built, behind the `rules` build feature. Only the `functions` rule with `kill` has run against PostgreSQL |
 | 5. Prove and ship | Detection corpus, fuzzing, benchmarks, container image, Helm chart and documentation | Not started |
 
 Progress is tracked in [the pgsnare epic](https://github.com/guidorugo/pgsnare/issues/2).
@@ -173,6 +213,8 @@ You need Docker with the Compose plugin, and `make`. Every build and test runs i
 | `make deny` | Checks the advisories, licences and sources of every dependency |
 | `make scan` | Scans for secrets and private network addresses |
 
+The SQL rules are a build feature, `rules`, on by default. It brings in PostgreSQL's own parser, which is C code, so the build needs a C compiler (the development image has one); it does not need libclang. `make test` and `make lint` run a second time with `--no-default-features`, a build without the parser, which must pass every test except the rule tests.
+
 CI runs the last six on every pull request, and all of them must pass before it can be merged.
 
 `tests/bench.sh` runs a small benchmark, against PostgreSQL directly and through pgsnare. It gives a baseline for one machine and is not part of CI.
@@ -182,8 +224,9 @@ CI runs the last six on every pull request, and all of them must pass before it 
 | Path | Contents |
 |---|---|
 | `crates/pgsnare-proto` | The PostgreSQL wire format: framing, message views and encoders. No I/O. |
-| `crates/pgsnare-core` | Session logic (scanning, statement tracking, responses), detection, policy, actions (`kill`, `tarpit`, `fake_data`), bait generators and the event format. No I/O. |
-| `crates/pgsnare` | The runtime and the `pgsnare` command: listeners, TLS, configuration, the policy reload, the event dispatcher and its sinks, the health and metrics listeners, the log and the redaction layer. |
+| `crates/pgsnare-core` | Session logic (scanning, statement tracking, responses), detection, policy, actions (`kill`, `tarpit`, `fake_data`), the SQL rules (with the `rules` feature: analysis of a statement and the rule set), bait generators and the event format. No I/O. |
+| `crates/pgsnare` | The runtime and the `pgsnare` command: listeners, TLS, configuration, the policy reload, the event dispatcher and its sinks, the health and metrics listeners, the log and the redaction layer, and the parser threads of the SQL rules. |
+| `crates/bindgen-prebuilt` | A stand-in for the `bindgen` crate, put in its place by `[patch.crates-io]`. The parser's build script asks for `bindgen`, which needs libclang and `libloading`; this crate hands out the declarations of the parser's C interface that were made ahead of time, and refuses to build if the parser's headers or the target differ. |
 | `examples/config` | A complete configuration file, with every setting explained. |
 | `tests` | Integration tests. They compare what a client sees from PostgreSQL directly and through pgsnare, try every row of the login table, check pgsnare as a container, and give PostgreSQL what `pgsnare token generate` prints. |
 | `docs` | The design. |
