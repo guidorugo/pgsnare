@@ -594,6 +594,7 @@ impl Driver {
                     token_id,
                     exempt,
                     actions,
+                    decided: _,
                 } => {
                     self.context.status.token_hit(&token_id, exempt);
                     self.context.status.actions_taken(actions);

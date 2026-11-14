@@ -72,6 +72,7 @@
 
 use std::sync::Arc;
 
+use crate::event::StatementDigest;
 use crate::extension::{LoginStrategy, ProtocolModule, ProtocolSession, TlsRequest};
 use crate::session::SessionOrigin;
 
@@ -82,6 +83,9 @@ mod scan;
 #[cfg(test)]
 mod scan_tests;
 mod session;
+mod track;
+#[cfg(test)]
+mod track_tests;
 
 #[cfg(test)]
 mod tests;
@@ -116,11 +120,12 @@ impl Postgres {
     }
 
     /// A module whose sessions look for the honeytokens of the policy in
-    /// everything they relay: each gets a [`Scanner`].
+    /// everything they relay: each gets a [`Scanner`]. `digest` is the hash
+    /// function behind the fingerprint of a statement in an event.
     #[must_use]
-    pub fn scanning() -> Self {
-        Self::with_inspectors(|_: &SessionOrigin| -> Box<dyn Inspector> {
-            Box::new(Scanner::new())
+    pub fn scanning(digest: Arc<dyn StatementDigest>) -> Self {
+        Self::with_inspectors(move |_: &SessionOrigin| -> Box<dyn Inspector> {
+            Box::new(Scanner::new(Arc::clone(&digest)))
         })
     }
 

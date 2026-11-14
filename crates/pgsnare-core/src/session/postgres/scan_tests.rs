@@ -17,37 +17,37 @@ use crate::session::{Direction, Effect, Output, Report, SessionOrigin};
 
 use super::{Inspector as _, Postgres, PostgresSession, Scanner};
 
-const EMAIL_ID: &str = "users-admin-backup";
-const EMAIL: &str = "svc.backup.8f3k2q@mail.example";
-const CANARY_ID: &str = "billing-canary";
-const CANARY: &str = "CANARY-7Q2M-XK4T-9D1B";
+pub(super) const EMAIL_ID: &str = "users-admin-backup";
+pub(super) const EMAIL: &str = "svc.backup.8f3k2q@mail.example";
+pub(super) const CANARY_ID: &str = "billing-canary";
+pub(super) const CANARY: &str = "CANARY-7Q2M-XK4T-9D1B";
 
 /// The smallest limit a policy accepts.
-const LIMIT: usize = Inspection::MIN_MAX_BUFFERED_FRAME;
+pub(super) const LIMIT: usize = Inspection::MIN_MAX_BUFFERED_FRAME;
 
 // ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
 
-fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
+pub(super) fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
     let mut bytes = vec![tag];
     bytes.extend_from_slice(&u32::try_from(body.len() + 4).unwrap().to_be_bytes());
     bytes.extend_from_slice(body);
     bytes
 }
 
-fn startup(parameters: &[(&[u8], &[u8])]) -> Vec<u8> {
+pub(super) fn startup(parameters: &[(&[u8], &[u8])]) -> Vec<u8> {
     let mut bytes = Vec::new();
     encode::startup_message(ProtocolVersion::V3_0, parameters, &mut bytes).unwrap();
     bytes
 }
 
-fn join(parts: &[&[u8]]) -> Vec<u8> {
+pub(super) fn join(parts: &[&[u8]]) -> Vec<u8> {
     parts.concat()
 }
 
 /// A `DataRow` with one column.
-fn data_row(value: &[u8]) -> Vec<u8> {
+pub(super) fn data_row(value: &[u8]) -> Vec<u8> {
     let length = u32::try_from(value.len()).unwrap().to_be_bytes();
     frame(b'D', &join(&[&[0, 1], &length, value]))
 }
@@ -82,6 +82,17 @@ fn hex(value: &str) -> String {
 // A session
 // ---------------------------------------------------------------------------
 
+/// A stand-in for the hash function of the runtime: different texts give
+/// different bytes, which is all these tests need.
+pub(super) fn digest(statement: &[u8]) -> [u8; 32] {
+    let mut bytes = [0x5a_u8; 32];
+    for (at, byte) in statement.iter().enumerate() {
+        let slot = &mut bytes[at % 32];
+        *slot = slot.rotate_left(3) ^ byte;
+    }
+    bytes
+}
+
 fn policy_of(generation: u64, tokens: &[(&str, &str, bool)], limit: usize) -> PolicySnapshot {
     let specs: Vec<TokenSpec> = tokens
         .iter()
@@ -108,7 +119,7 @@ fn policy(limit: usize) -> PolicySnapshot {
     )
 }
 
-fn origin() -> SessionOrigin {
+pub(super) fn origin() -> SessionOrigin {
     SessionOrigin::new(
         SessionId::from_u128(0x7e),
         "192.0.2.10".parse::<IpAddr>().unwrap(),
@@ -119,7 +130,7 @@ fn origin() -> SessionOrigin {
 
 /// What one hit looked like from outside.
 #[derive(Debug, PartialEq, Eq)]
-struct Hit {
+pub(super) struct Hit {
     token: String,
     direction: Direction,
     message: &'static str,
@@ -133,19 +144,24 @@ fn hit(token: &str, direction: Direction, message: &'static str) -> Hit {
     }
 }
 
-struct Harness {
-    session: PostgresSession,
-    policy: PolicySnapshot,
-    to_client: Vec<u8>,
-    to_server: Vec<u8>,
-    effects: Vec<Effect>,
+pub(super) struct Harness {
+    pub(super) session: PostgresSession,
+    pub(super) policy: PolicySnapshot,
+    pub(super) to_client: Vec<u8>,
+    pub(super) to_server: Vec<u8>,
+    pub(super) effects: Vec<Effect>,
 }
 
 impl Harness {
     fn new(limit: usize) -> Self {
+        Self::with_policy(policy(limit))
+    }
+
+    /// A session that has sent nothing yet.
+    pub(super) fn with_policy(policy: PolicySnapshot) -> Self {
         Self {
-            session: Postgres::scanning().session(origin(), Arc::new(Relay)),
-            policy: policy(limit),
+            session: Postgres::scanning(Arc::new(digest)).session(origin(), Arc::new(Relay)),
+            policy,
             to_client: Vec::new(),
             to_server: Vec::new(),
             effects: Vec::new(),
@@ -153,13 +169,24 @@ impl Harness {
     }
 
     /// A session that has logged in as `app`.
-    fn established(limit: usize) -> Self {
-        let mut harness = Self::new(limit);
-        harness.client(&startup(&[
-            (b"user", b"app"),
-            (b"database", b"shop"),
-            (b"application_name", b"psql"),
-        ]));
+    pub(super) fn established(limit: usize) -> Self {
+        let mut harness = Self::logged_in(
+            policy(limit),
+            &[
+                (b"user", b"app"),
+                (b"database", b"shop"),
+                (b"application_name", b"psql"),
+            ],
+        );
+        assert!(harness.hits().is_empty());
+        harness
+    }
+
+    /// A session the database has accepted, with the startup parameters
+    /// given. What the login raised is still in `effects`.
+    pub(super) fn logged_in(policy: PolicySnapshot, parameters: &[(&[u8], &[u8])]) -> Self {
+        let mut harness = Self::with_policy(policy);
+        harness.client(&startup(parameters));
         let mut out = Output::new();
         harness
             .session
@@ -172,13 +199,12 @@ impl Harness {
         harness.server(&frame(b'R', &0u32.to_be_bytes()));
         harness.server(&frame(b'Z', b"I"));
         assert!(harness.session.is_established());
-        assert!(harness.hits().is_empty());
         harness.to_client.clear();
         harness.to_server.clear();
         harness
     }
 
-    fn bytes(&mut self, from: Direction, input: &[u8]) {
+    pub(super) fn bytes(&mut self, from: Direction, input: &[u8]) {
         let mut out = Output::new();
         self.session
             .on_bytes(from, input, &self.policy, &mut out)
@@ -188,11 +214,11 @@ impl Harness {
         self.effects.append(&mut out.effects);
     }
 
-    fn client(&mut self, input: &[u8]) {
+    pub(super) fn client(&mut self, input: &[u8]) {
         self.bytes(Direction::FromClient, input);
     }
 
-    fn server(&mut self, input: &[u8]) {
+    pub(super) fn server(&mut self, input: &[u8]) {
         self.bytes(Direction::FromServer, input);
     }
 
@@ -202,7 +228,7 @@ impl Harness {
         }
     }
 
-    fn events(&self) -> Vec<&EventBody> {
+    pub(super) fn events(&self) -> Vec<&EventBody> {
         self.effects
             .iter()
             .filter_map(|effect| match effect {
@@ -214,7 +240,7 @@ impl Harness {
 
     /// The hits raised since the last call. Each hit must come as a count
     /// followed by its event, and the two must agree.
-    fn hits(&mut self) -> Vec<Hit> {
+    pub(super) fn hits(&mut self) -> Vec<Hit> {
         let effects = std::mem::take(&mut self.effects);
         let mut hits = Vec::new();
         let mut counted: Option<TokenId> = None;
@@ -224,18 +250,19 @@ impl Harness {
                     token_id,
                     exempt,
                     actions,
+                    decided: _,
                 } => {
                     assert_eq!(counted, None, "a hit was counted and not reported");
                     assert!(!exempt);
                     assert_eq!(actions, ActionSet::ALERT);
                     counted = Some(token_id);
                 }
+                Effect::Emit(body) if body.kind == EventKind::SessionActivity => {}
                 Effect::Emit(body) => {
                     assert_eq!(body.kind, EventKind::TokenHit);
                     assert_eq!(body.token_id, counted.take(), "a hit was not counted");
                     assert_eq!(body.action_taken, ActionSet::ALERT);
                     assert_eq!(body.hit_count, 1);
-                    assert!(!body.session_flagged);
                     hits.push(Hit {
                         token: body.token_id.as_ref().unwrap().as_str().to_owned(),
                         direction: body.direction.unwrap(),
@@ -252,7 +279,7 @@ impl Harness {
         hits
     }
 
-    fn statements(&self) -> usize {
+    pub(super) fn statements(&self) -> usize {
         self.effects
             .iter()
             .filter(|effect| matches!(effect, Effect::QuerySeen))
@@ -723,9 +750,14 @@ fn a_hit_names_the_token_and_the_session_and_holds_no_value() {
     assert_eq!(first.db_user.as_deref(), Some("app"));
     assert_eq!(first.database.as_deref(), Some("shop"));
     assert_eq!(first.application_name.as_deref(), Some("psql"));
+    // The statement is named by its fingerprint, and the text stays out.
     assert_eq!(
         first.query,
-        Some(Query::unknown(QueryRedaction::Fingerprint))
+        Some(Query::from_statement(
+            format!("SELECT '{EMAIL}'").as_bytes(),
+            QueryRedaction::Fingerprint,
+            &digest
+        ))
     );
     assert_eq!(first.rows_so_far, None);
 
@@ -735,7 +767,7 @@ fn a_hit_names_the_token_and_the_session_and_holds_no_value() {
         said.push_str(&serde_json::to_string(body).unwrap());
     }
     let scanner = {
-        let mut scanner = Scanner::new();
+        let mut scanner = Scanner::new(Arc::new(digest));
         scanner.copy_started(FromServer);
         format!("{scanner:?}")
     };
@@ -752,7 +784,7 @@ fn a_hit_names_the_token_and_the_session_and_holds_no_value() {
 }
 
 #[test]
-fn each_query_and_each_execute_is_counted_as_a_statement() {
+fn each_query_execute_and_function_call_is_counted_as_a_statement() {
     let mut harness = Harness::established(LIMIT);
     harness.client(&join(&[
         &frame(b'Q', b"SELECT 1\0"),
@@ -766,8 +798,8 @@ fn each_query_and_each_execute_is_counted_as_a_statement() {
         &frame(b'd', b"1\n"),
         &frame(b'H', b""),
     ]));
-    assert_eq!(harness.statements(), 3);
-    assert_eq!(harness.effects.len(), 3);
+    assert_eq!(harness.statements(), 4);
+    assert_eq!(harness.effects.len(), 4);
 
     // The server sends messages with the same type bytes. They are not
     // statements.

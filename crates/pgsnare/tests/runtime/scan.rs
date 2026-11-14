@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use pgsnare::redact::Sha256;
 use pgsnare_core::detect::{Matcher, TokenSpec};
 use pgsnare_core::event::EventKind;
 use pgsnare_core::policy::{Inspection, OnError, PolicySnapshot, TokenId, TokenPolicy};
@@ -27,7 +28,7 @@ fn options() -> ProxyOptions {
         .build()
         .unwrap();
     ProxyOptions {
-        module: Arc::new(Postgres::scanning()),
+        module: Arc::new(Postgres::scanning(Arc::new(Sha256))),
         policy,
         grace_period: Duration::from_secs(5),
     }

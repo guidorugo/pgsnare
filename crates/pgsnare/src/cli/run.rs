@@ -31,7 +31,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use crate::admin;
 use crate::builder::{Proxy, ProxyBuilder};
 use crate::config::{self, Config, UpstreamTlsMode};
-use crate::redact::{Redaction, Redactor, RedactorBuilder};
+use crate::redact::{Redaction, Redactor, RedactorBuilder, Sha256};
 use crate::runtime::{ListenerSettings, Runtime, Settings, Stopped, Upstream, permissions};
 use crate::sinks;
 use crate::tls::{BackendLeg, ClientLeg};
@@ -97,7 +97,7 @@ fn start(args: &Args, redaction: &Redaction) -> Result<(), String> {
             .map_err(|error| error.to_string())?,
     );
     let policy = config.policy(1).map_err(|error| error.to_string())?;
-    let module = Postgres::scanning();
+    let module = Postgres::scanning(Arc::new(Sha256));
     let listeners = listeners(&config, &module)?;
 
     // The sinks add what they must keep to themselves to what the redactor

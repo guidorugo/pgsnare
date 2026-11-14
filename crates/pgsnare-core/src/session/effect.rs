@@ -75,6 +75,9 @@ pub enum Effect {
         /// Whether the session is exempt, so that the hit triggers
         /// nothing.
         exempt: bool,
+        /// The responses the policy asks for at this hit, with the
+        /// escalation of the token applied. Empty for an exempt hit.
+        decided: ActionSet,
         /// The responses that were carried out. Empty for an exempt hit.
         actions: ActionSet,
     },
