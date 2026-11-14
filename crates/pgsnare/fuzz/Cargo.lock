@@ -416,6 +416,7 @@ dependencies = [
  "aho-corasick",
  "aws-lc-rs",
  "clap",
+ "getrandom 0.4.3",
  "hyper",
  "pgsnare-core",
  "rustix",

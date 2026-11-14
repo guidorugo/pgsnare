@@ -21,6 +21,7 @@ rules = ["pgsnare-core/rules"]
 aho-corasick.workspace = true
 aws-lc-rs.workspace = true
 clap.workspace = true
+getrandom.workspace = true
 hyper.workspace = true
 pgsnare-core.workspace = true
 rustix.workspace = true
@@ -38,5 +39,7 @@ zeroize.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 rcgen.workspace = true
+# A pseudo-terminal, for the test that `token test` refuses a terminal.
+rustix = { workspace = true, features = ["pty"] }
 # Tests stop the clock, so that a window of a minute takes no time.
 tokio = { workspace = true, features = ["test-util"] }

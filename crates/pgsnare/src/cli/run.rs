@@ -282,18 +282,13 @@ fn redactor(config: &Config) -> RedactorBuilder {
 /// Refuses to start when a file that holds secrets is open to other users,
 /// unless the operator said to start all the same.
 fn check_permissions(loaded: &config::Loaded, allow: bool) -> Result<(), String> {
-    let keys = loaded
-        .config
-        .listeners
-        .iter()
-        .filter_map(|listener| listener.client_tls.key.as_deref());
-    let files = loaded
-        .files
-        .iter()
-        .map(PathBuf::as_path)
-        .chain(keys)
-        .chain(sink_secrets(&loaded.config));
-    let refused = permissions::check_all(unique(files));
+    let mut files = loaded.secret_files();
+    for file in sink_secrets(&loaded.config) {
+        if !files.contains(&file) {
+            files.push(file);
+        }
+    }
+    let refused = permissions::check_all(files);
     if refused.is_empty() {
         return Ok(());
     }
@@ -337,17 +332,6 @@ fn sink_secrets(config: &Config) -> Vec<&Path> {
         }
     }
     files
-}
-
-/// The files in the order given, each once.
-fn unique<'a>(files: impl Iterator<Item = &'a Path>) -> Vec<&'a Path> {
-    let mut seen: Vec<&Path> = Vec::new();
-    for file in files {
-        if !seen.contains(&file) {
-            seen.push(file);
-        }
-    }
-    seen
 }
 
 /// A core dump would write keys and traffic to disk.
@@ -472,28 +456,19 @@ mod tests {
         );
         assert_eq!(built.text("CANARY.INVOICE.000417"), "[redacted]");
 
-        // A token list the matcher refuses keeps the proxy from starting,
-        // and the reason names no value.
-        let config = Config::from_yaml(
+        // A token list the matcher refuses is refused when the
+        // configuration is read, so no redactor is ever built from one. The
+        // reason names the place of a value and never the value.
+        let error = Config::from_yaml(
             "listeners:\n  - name: main\n    listen: 127.0.0.1:5432\n    upstream: db.example.com:5432\n    \
              client_tls: { mode: disable }\n    upstream_tls: { mode: disable }\n\
              tokens:\n  - id: inner\n    values: [\"svc.backup.8f3k2q@mail.example\"]\n\
              \x20 - id: outer\n    values: [\"x-svc.backup.8f3k2q@mail.example-x\"]\n\
              events:\n  sinks:\n    - type: stdout\n",
         )
-        .unwrap();
-        let error = redactor(&config).build().unwrap_err().to_string();
+        .unwrap_err()
+        .to_string();
         assert!(!error.contains("svc.backup"), "{error}");
-        assert!(
-            error.contains("outer") || error.contains("inner"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn files_are_listed_once_and_in_order() {
-        let (a, b) = (Path::new("/a"), Path::new("/b"));
-        assert_eq!(unique([a, b, a, b, a].into_iter()), [a, b]);
-        assert!(unique(std::iter::empty()).is_empty());
+        assert!(error.contains("contains another value"), "{error}");
     }
 }

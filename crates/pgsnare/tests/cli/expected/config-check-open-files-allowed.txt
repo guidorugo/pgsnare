@@ -1,0 +1,4 @@
+warning: <dir>/pgsnare.yaml: the file is open to the group or to others; it is owned by the user pgsnare runs as, so its mode must be 0600 or less; pgsnare run starts all the same when it is given --allow-insecure-file-permissions
+warning: <dir>/tokens.yaml: the file is open to the group or to others; it is owned by the user pgsnare runs as, so its mode must be 0600 or less; pgsnare run starts all the same when it is given --allow-insecure-file-permissions
+warning: <dir>/server.key: the file is open to the group or to others; it is owned by the user pgsnare runs as, so its mode must be 0600 or less; pgsnare run starts all the same when it is given --allow-insecure-file-permissions
+ok: <dir>/pgsnare.yaml: pgsnare would start with 2 listeners, 1 honeytoken with 1 value, 1 sink and 3 warnings

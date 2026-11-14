@@ -13,9 +13,6 @@
 //! | `pgsnare token list` | `token_list.rs` |
 //! | `pgsnare token test` | `token_test.rs` |
 //! | `pgsnare healthcheck` | `healthcheck.rs` |
-//!
-//! A command that is not built yet says so and fails. It never reports
-//! success without having done what was asked.
 
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -131,12 +128,6 @@ where
     }
 }
 
-/// Reports that a command is not built yet. It never returns success.
-fn not_implemented(command: &str) -> u8 {
-    eprintln!("pgsnare {command}: not implemented yet");
-    FAILURE
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -194,24 +185,47 @@ mod tests {
             panic!("expected config check");
         };
         assert_eq!(args.config, Path::new("pgsnare.yaml"));
+        assert!(!args.allow_insecure_file_permissions);
         assert!(parse(&["config", "check"]).is_err());
         assert!(parse(&["config"]).is_err());
+
+        // The option of `run` that lets files through means the same here.
+        let Command::Config(ConfigCommand::Check(args)) = parse(&[
+            "config",
+            "check",
+            "--config",
+            "pgsnare.yaml",
+            "--allow-insecure-file-permissions",
+        ])
+        .unwrap() else {
+            panic!("expected config check");
+        };
+        assert!(args.allow_insecure_file_permissions);
     }
 
     #[test]
     fn token_generate_takes_a_kind_a_table_and_a_count() {
-        let Command::Token(TokenCommand::Generate(args)) =
-            parse(&["token", "generate", "--kind", "email"]).unwrap()
-        else {
-            panic!("expected token generate");
+        let generate = |arguments: &[&str]| {
+            let all: Vec<&str> = ["token", "generate"]
+                .into_iter()
+                .chain(arguments.iter().copied())
+                .collect();
+            match parse(&all) {
+                Ok(Command::Token(TokenCommand::Generate(args))) => Ok(args),
+                Ok(other) => panic!("expected token generate, got {other:?}"),
+                Err(error) => Err(error),
+            }
         };
-        assert_eq!(args.kind, "email");
-        assert_eq!(args.table, None);
-        assert_eq!(args.count, 1);
 
-        let Command::Token(TokenCommand::Generate(args)) = parse(&[
-            "token",
-            "generate",
+        let args = generate(&["--kind", "marker", "--table", "notes"]).unwrap();
+        assert_eq!(args.kind, token_generate::Kind::Marker);
+        assert_eq!(args.table, "notes");
+        assert!(args.columns.is_empty());
+        assert_eq!(args.domain, None);
+        assert_eq!(args.count, 1);
+        assert_eq!(args.id, None);
+
+        let args = generate(&[
             "--kind",
             "api-key",
             "--table",
@@ -219,16 +233,61 @@ mod tests {
             "--count",
             "5",
         ])
-        .unwrap() else {
-            panic!("expected token generate");
-        };
-        assert_eq!(args.kind, "api-key");
-        assert_eq!(args.table.as_deref(), Some("public.api_keys"));
+        .unwrap();
+        assert_eq!(args.kind, token_generate::Kind::ApiKey);
+        assert_eq!(args.table, "public.api_keys");
         assert_eq!(args.count, 5);
 
-        assert!(parse(&["token", "generate"]).is_err());
-        assert!(parse(&["token", "generate", "--kind", "email", "--count", "0"]).is_err());
-        assert!(parse(&["token", "generate", "--kind", "email", "--count", "many"]).is_err());
+        let args = generate(&[
+            "--kind",
+            "identity",
+            "--table",
+            "public.users",
+            "--column",
+            "login",
+            "--column",
+            "mail",
+            "--domain",
+            "mail.example",
+            "--id",
+            "users-admin",
+        ])
+        .unwrap();
+        assert_eq!(args.kind, token_generate::Kind::Identity);
+        assert_eq!(args.columns, ["login", "mail"]);
+        assert_eq!(args.domain.as_deref(), Some("mail.example"));
+        assert_eq!(args.id.as_deref(), Some("users-admin"));
+
+        // Every kind is chosen by the name it prints.
+        for kind in <token_generate::Kind as clap::ValueEnum>::value_variants() {
+            let args = generate(&["--kind", kind.name(), "--table", "t"]).unwrap();
+            assert_eq!(args.kind, *kind);
+        }
+        assert_eq!(
+            <token_generate::Kind as clap::ValueEnum>::value_variants().len(),
+            7
+        );
+
+        // The kind and the table are required, and the count has bounds.
+        assert!(generate(&[]).is_err());
+        assert!(generate(&["--kind", "marker"]).is_err());
+        assert!(generate(&["--table", "notes"]).is_err());
+        assert!(generate(&["--kind", "no-such-kind", "--table", "t"]).is_err());
+        for count in ["0", "1001", "-1", "many"] {
+            let arguments = ["--kind", "marker", "--table", "t", "--count", count];
+            assert!(generate(&arguments).is_err(), "{count}");
+        }
+        assert_eq!(
+            generate(&["--kind", "marker", "--table", "t", "--count", "1000"])
+                .unwrap()
+                .count,
+            token_generate::MAX_COUNT
+        );
+        // There is no option that makes the values predictable.
+        for option in ["--seed", "--random-seed", "--deterministic", "--rng"] {
+            let arguments = ["--kind", "marker", "--table", "t", option, "1"];
+            assert!(generate(&arguments).is_err(), "{option}");
+        }
     }
 
     #[test]
@@ -247,10 +306,38 @@ mod tests {
         };
         assert_eq!(args.config, Path::new("pgsnare.yaml"));
 
+        assert!(args.not_taken.is_empty());
+
         // The value to test is read from standard input. It is not an
         // argument, so it cannot end up in the process list or the shell
-        // history.
-        assert!(parse(&["token", "test", "-c", "pgsnare.yaml", "some-value"]).is_err());
+        // history. Something given as one is collected, so that the command
+        // can refuse it without printing it back, and it is refused.
+        for arguments in [
+            &["token", "test", "-c", "pgsnare.yaml", "some-value"][..],
+            &[
+                "token",
+                "test",
+                "-c",
+                "pgsnare.yaml",
+                "--value",
+                "some-value",
+            ],
+            &["token", "test", "-c", "pgsnare.yaml", "--value=some-value"],
+        ] {
+            let Command::Token(TokenCommand::Test(args)) = parse(arguments).unwrap() else {
+                panic!("expected token test");
+            };
+            assert!(!args.not_taken.is_empty(), "{arguments:?}");
+            let all = std::iter::once("pgsnare").chain(arguments.iter().copied());
+            assert_eq!(run_from(all), USAGE, "{arguments:?}");
+        }
+        // With the value in front, everything after it is collected too,
+        // and the parser misses --config. Its complaint does not repeat
+        // the value either.
+        let front = ["token", "test", "some-value", "-c", "pgsnare.yaml"];
+        let error = parse(&front).unwrap_err();
+        assert!(!error.to_string().contains("some-value"), "{error}");
+        assert_eq!(run_from(std::iter::once("pgsnare").chain(front)), USAGE);
         assert!(parse(&["token", "list"]).is_err());
         assert!(parse(&["token"]).is_err());
     }
@@ -283,22 +370,6 @@ mod tests {
         assert!(parse(&["healthcheck", "127.0.0.1:9641"]).is_err());
         assert!(parse(&["healthcheck", "--address", "127.0.0.1:9641"]).is_err());
         assert!(parse(&["healthcheck", "--url", "http://example.com/"]).is_err());
-    }
-
-    #[test]
-    fn a_command_that_is_not_built_yet_fails() {
-        for arguments in [
-            &["pgsnare", "config", "check", "-c", "pgsnare.yaml"][..],
-            &["pgsnare", "token", "generate", "--kind", "email"],
-            &["pgsnare", "token", "list", "-c", "pgsnare.yaml"],
-            &["pgsnare", "token", "test", "-c", "pgsnare.yaml"],
-        ] {
-            assert_eq!(
-                run_from(arguments.iter().copied()),
-                FAILURE,
-                "{arguments:?}"
-            );
-        }
     }
 
     #[test]

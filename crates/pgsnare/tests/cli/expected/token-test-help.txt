@@ -1,0 +1,32 @@
+Check whether a value matches a honeytoken of a configuration
+
+Usage: pgsnare token test --config <FILE>
+
+Options:
+  -c, --config <FILE>
+          The configuration file. Its token files are read as well
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+The value is read from standard input. It is not an argument, because an
+argument ends up in the history of the shell and in the process list, where
+other users of the machine can read it. For the same reason, do not put the
+value into the command line of echo or printf from an interactive shell.
+
+Standard input must be a file or a pipe. A terminal is refused: what is typed
+there is shown on the screen. One line break at the end is not counted as part
+of the value.
+
+The input is scanned as traffic is: a honeytoken is found anywhere in it, as
+it is, in hexadecimal, and in another letter case if the token ignores case.
+
+The exit status is 0 if a honeytoken matches and 1 for anything else. When no
+test could be made, nothing is written to standard output.
+
+Examples:
+  pgsnare token test --config /etc/pgsnare/pgsnare.yaml < value.txt
+  read -rs VALUE && printf '%s' "$VALUE" | pgsnare token test -c /etc/pgsnare/pgsnare.yaml

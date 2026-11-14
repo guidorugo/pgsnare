@@ -1,0 +1,3 @@
+error: <dir>/tokens.yaml: line 3, column 5: unknown field; the fields here are: `id`, `values`, `case_insensitive`, `scope`, `actions`, `escalate`
+note: the configuration could not be loaded, so the files it names and its TLS settings were not checked
+failed: <dir>/pgsnare.yaml: pgsnare would not start: 1 error and no warnings

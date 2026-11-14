@@ -1,0 +1,8 @@
+error: <dir>/pgsnare.yaml: tokens[0].values[0]: a value must be ASCII, so that it matches in every client encoding
+error: <dir>/pgsnare.yaml: tokens[1].values[0]: a value must be at least 12 bytes long
+error: <dir>/pgsnare.yaml: tokens[2].values[1]: this value is already used (see tokens[2].values[0])
+error: <dir>/pgsnare.yaml: tokens[3].id: this id is already used (see tokens[2].id)
+error: <dir>/pgsnare.yaml: tokens[5].values: at least one value is required
+error: <dir>/pgsnare.yaml: tokens[4].values[0]: this value contains another value, so data that matches it would set off both (see tokens[3].values[0])
+note: the configuration could not be loaded, so the files it names and its TLS settings were not checked
+failed: <dir>/pgsnare.yaml: pgsnare would not start: 6 errors and no warnings

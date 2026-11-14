@@ -1,0 +1,3 @@
+error: token_files entry <dir>/tokens/*.yaml: no file matches; a pattern that matches nothing would load no tokens
+note: the configuration could not be loaded, so the files it names and its TLS settings were not checked
+failed: <dir>/pgsnare.yaml: pgsnare would not start: 1 error and no warnings

@@ -1,0 +1,3 @@
+error: listener main: the private key in <dir>/server.key cannot be used with the certificate in <dir>/server.crt
+note: the configuration has no honeytokens, so pgsnare would detect nothing
+failed: <dir>/pgsnare.yaml: pgsnare would not start: 1 error and no warnings

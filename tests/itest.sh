@@ -13,6 +13,12 @@
 #     document is tried with a real client, and a row that must fail is
 #     checked for the failure it must fail with.
 #   - What pgsnare logs when it starts.
+#   - What `pgsnare token generate` prints. PostgreSQL itself runs the
+#     statement, with names that try to get out of their quotes, and is
+#     given the SCRAM-SHA-256 and bcrypt bait: tests/bait/check.sh. The
+#     command is also run without a network and without a place to write.
+#   - `pgsnare config check`. It must pass the configuration pgsnare runs
+#     with, and refuse the ones pgsnare refuses to start with.
 #   - pgsnare as a container: it refuses to start with files that are open
 #     to other users, its worker threads follow the processors it may use,
 #     it stays within a memory limit that is smaller than the largest
@@ -28,6 +34,7 @@
 #   - the runner is shown not to mistake an unreachable endpoint for a match
 #   - the login table is shown to report a login that does not go as
 #     expected
+#   - the checks of the bait are each made on input that must fail them
 #
 # Environment:
 #   DOCKER          the docker command (default: docker)
@@ -72,7 +79,7 @@ compose() {
 cleanup() {
     # The containers that were started under a name of their own.
     "$docker" rm --force "$project-open-files" "$project-watcher" >/dev/null 2>&1 || true
-    compose --profile client --profile setup down --volumes --remove-orphans >/dev/null 2>&1 || true
+    compose --profile client --profile setup --profile offline down --volumes --remove-orphans >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -302,6 +309,51 @@ expect_status 2 "an unreachable endpoint" \
     --proxied "host=pg$first port=1 user=postgres connect_timeout=5" \
     /differential/selfcheck
 
+# --- The commands -------------------------------------------------------------
+
+echo "itest: what token generate prints, checked by PostgreSQL $versions"
+# shellcheck disable=SC2086
+if ! compose --profile client run --rm --no-deps -T \
+    --entrypoint /bait/check.sh client $versions; then
+    failed=1
+fi
+
+# token generate connects to nothing and writes nothing but its output, so
+# it must do its work in a container that has no network and no place to
+# write to.
+echo "itest: token generate must work without a network and without a place to write"
+status=0
+output="$(compose --profile offline run --rm --no-deps -T offline \
+    token generate --kind scram-sha-256 --table auth.roles --count 2 2>&1)" || status=$?
+if [ "$status" -ne 0 ] \
+    || ! echo "$output" | grep -qF 'INSERT INTO "auth"."roles" ("password_hash") VALUES' \
+    || [ "$(echo "$output" | grep -c "^    ('SCRAM-SHA-256\$4096:")" -ne 2 ]; then
+    echo "itest: FAILED: token generate did not work without a network (exit status $status):" >&2
+    echo "$output" | sed 's/^/    /' >&2
+    failed=1
+fi
+
+# config check and run share their code, so they must say the same about a
+# configuration. This one is what pgsnare is running with right now.
+echo "itest: config check must pass the configuration pgsnare runs with"
+status=0
+output="$(compose run --rm --no-deps -T pgsnare config check \
+    --config /state/config/pgsnare.yaml 2>&1)" || status=$?
+unverified="$(echo "$output" | grep -c 'upstream_tls.mode: the certificate of the database is not verified' || true)"
+# One listener for each version does not verify its database: see
+# tests/proxy/setup.sh.
+expected=0
+for version in $versions; do
+    expected=$((expected + 1))
+done
+if [ "$status" -ne 0 ] \
+    || ! echo "$output" | grep -qF "ok: /state/config/pgsnare.yaml: pgsnare would start with" \
+    || [ "$unverified" -ne "$expected" ]; then
+    echo "itest: FAILED: config check did not pass the configuration pgsnare runs with, or did not warn about each of the $expected listeners that do not verify their database (exit status $status, $unverified warnings):" >&2
+    echo "$output" | sed 's/^/    /' >&2
+    failed=1
+fi
+
 # --- pgsnare as a container ---------------------------------------------------
 
 echo "itest: pgsnare must refuse to start with files that are open to other users"
@@ -318,6 +370,29 @@ for config in open-key open-config open-tokens; do
         || ! echo "$output" | grep -qF "refusing to start" \
         || ! echo "$output" | grep -qF "$file: the file is open to the group or to others"; then
         echo "itest: FAILED: pgsnare did not refuse $file (exit status $status):" >&2
+        echo "$output" | sed 's/^/    /' >&2
+        failed=1
+    fi
+
+    # config check refuses what run refuses, and names the same file.
+    status=0
+    output="$(compose run --rm --no-deps -T pgsnare config check \
+        --config "/state/config/$config.yaml" 2>&1)" || status=$?
+    if [ "$status" -ne 1 ] \
+        || ! echo "$output" | grep -qF "error: $file: the file is open to the group or to others" \
+        || ! echo "$output" | grep -qF "failed: /state/config/$config.yaml: pgsnare would not start"; then
+        echo "itest: FAILED: config check did not refuse $file (exit status $status):" >&2
+        echo "$output" | sed 's/^/    /' >&2
+        failed=1
+    fi
+    # With the override that lets run start, it passes and warns.
+    status=0
+    output="$(compose run --rm --no-deps -T pgsnare config check \
+        --config "/state/config/$config.yaml" --allow-insecure-file-permissions 2>&1)" || status=$?
+    if [ "$status" -ne 0 ] \
+        || ! echo "$output" | grep -qF "warning: $file: the file is open to the group or to others" \
+        || ! echo "$output" | grep -qF "ok: /state/config/$config.yaml: pgsnare would start"; then
+        echo "itest: FAILED: config check with --allow-insecure-file-permissions did not pass $file with a warning (exit status $status):" >&2
         echo "$output" | sed 's/^/    /' >&2
         failed=1
     fi

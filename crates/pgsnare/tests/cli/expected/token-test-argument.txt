@@ -1,0 +1,1 @@
+pgsnare token test: the command takes no argument but --config. The value is read from standard input, so that it does not end up in the shell history and the process list.

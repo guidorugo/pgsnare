@@ -1,0 +1,30 @@
+Check a configuration and report every problem
+
+Usage: pgsnare config check [OPTIONS] --config <FILE>
+
+Options:
+  -c, --config <FILE>
+          The configuration file to check
+
+      --allow-insecure-file-permissions
+          Report a file that holds secrets and can be read by other users as a warning and not as an error. `pgsnare run` starts with such files when it is given the same option
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+The check loads the configuration and its token files, looks at the access
+rights of the files that hold secrets, and reads the certificates and keys, with
+the code that `pgsnare run` uses. It reports every problem it finds, and warns
+about settings that are valid and give up some protection.
+
+Nothing is connected to and no listener is opened. Whether an address is free
+and whether a database answers is therefore not checked.
+
+The exit status is 0 if pgsnare would start with this configuration, also when
+there are warnings, and 1 if it would not.
+
+Example:
+  pgsnare config check --config /etc/pgsnare/pgsnare.yaml
