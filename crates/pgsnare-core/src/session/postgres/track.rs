@@ -70,11 +70,16 @@
 
 use core::fmt;
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use pgsnare_proto::frontend::{self, Target};
 use pgsnare_proto::{Frame, backend};
+
+use crate::event::{Query, StatementDigest};
+use crate::policy::QueryRedaction;
+
+use super::scan::single_select;
 
 /// The most messages of a client that can wait for their answer.
 pub(super) const MAX_PENDING: usize = 256;
@@ -89,9 +94,42 @@ pub(super) const MAX_NAME_BYTES: usize = 63;
 
 /// A statement text the tracker holds. Its length is taken off the count
 /// when the last holder lets go.
+///
+/// What is worked out from the text is kept beside it, so that a message
+/// that belongs to the statement costs what the message is long, however
+/// long the statement is. A new text is a new `Kept`.
 pub(super) struct Kept {
     bytes: Box<[u8]>,
     used: Arc<AtomicUsize>,
+    /// Whether the text is one statement that reads rows.
+    single_select: OnceLock<bool>,
+    /// What an event shows of the text under `full`.
+    full: OnceLock<Query>,
+    /// What an event shows of the text under `fingerprint`.
+    fingerprint: OnceLock<Query>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How often a held text was searched for [`single_select`].
+    pub(super) static SINGLE_SELECT_SCANS: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+    /// How often a [`Query`] was made from a held text.
+    pub(super) static QUERIES_MADE: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+impl Kept {
+    fn scan_single_select(&self) -> bool {
+        #[cfg(test)]
+        SINGLE_SELECT_SCANS.with(|count| count.set(count.get().saturating_add(1)));
+        single_select(&self.bytes)
+    }
+
+    fn make_query(&self, redaction: QueryRedaction, digest: &dyn StatementDigest) -> Query {
+        #[cfg(test)]
+        QUERIES_MADE.with(|count| count.set(count.get().saturating_add(1)));
+        Query::from_statement(&self.bytes, redaction, digest)
+    }
 }
 
 impl Drop for Kept {
@@ -114,12 +152,32 @@ pub(super) enum Statement<'a> {
 }
 
 impl Statement<'_> {
-    /// The text, when it is known.
-    pub(super) fn bytes(&self) -> Option<&[u8]> {
+    /// Whether the statement is one that reads rows and reports them as
+    /// `SELECT n`. Worked out once for a text the tracker holds.
+    pub(super) fn single_select(&self) -> bool {
         match self {
-            Self::Unknown => None,
-            Self::Own(bytes) => Some(bytes),
-            Self::Kept(kept) => Some(&kept.bytes),
+            Self::Unknown => false,
+            Self::Own(bytes) => single_select(bytes),
+            Self::Kept(kept) => *kept.single_select.get_or_init(|| kept.scan_single_select()),
+        }
+    }
+
+    /// What an event shows of the statement under `redaction`. Worked out
+    /// once for each mode for a text the tracker holds, so a reload that
+    /// changes the mode is followed.
+    pub(super) fn query(&self, redaction: QueryRedaction, digest: &dyn StatementDigest) -> Query {
+        match self {
+            Self::Unknown => Query::unknown(redaction),
+            Self::Own(bytes) => Query::from_statement(bytes, redaction, digest),
+            Self::Kept(kept) => {
+                let made = match redaction {
+                    QueryRedaction::Full => &kept.full,
+                    QueryRedaction::Fingerprint => &kept.fingerprint,
+                    QueryRedaction::None => return Query::withheld(),
+                };
+                made.get_or_init(|| kept.make_query(redaction, digest))
+                    .clone()
+            }
         }
     }
 }
@@ -485,6 +543,9 @@ impl Tracker {
         Some(Arc::new(Kept {
             bytes: text.into(),
             used: Arc::clone(&self.used),
+            single_select: OnceLock::new(),
+            full: OnceLock::new(),
+            fingerprint: OnceLock::new(),
         }))
     }
 
