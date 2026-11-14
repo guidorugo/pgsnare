@@ -82,6 +82,8 @@ mod backend;
 mod entropy;
 mod events;
 mod listener;
+#[cfg(feature = "rules")]
+pub mod parser;
 pub mod permissions;
 mod session;
 mod status;
