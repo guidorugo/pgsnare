@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Every tool that the deployment tests and the release download, and nothing
+# else. deploy/tools/install.sh reads this list: it downloads a tool over
+# HTTPS, compares the SHA-256 of the download with the one recorded here,
+# and installs the tool only when they are equal.
+#
+# One line for each tool and architecture. The fields are separated by
+# blanks:
+#
+#   name     what the installed file is called
+#   version  the release, as three numbers
+#   arch     amd64 or arm64
+#   sha256   of the downloaded file, as its project publishes it
+#   member   the path of the tool inside a .tar.gz download, or - when the
+#            download is the tool itself
+#   url      where the release is downloaded from, HTTPS only
+#
+# A tool has one version and a line for both architectures. To update one,
+# change the version, both sums and both addresses together, taking the sums
+# from the checksum file of the release. No service proposes these updates:
+# they are made by hand.
+#
+# name  version  arch   sha256                                                            member  url
+
+# Image vulnerability scanner: deploy/tests/scan/scan.sh
+grype   0.121.2  amd64  9c8965ced9df657e5e851c14021bae838802f711edd7a48f9bc3c923a8d28f12  grype   https://github.com/anchore/grype/releases/download/v0.121.2/grype_0.121.2_linux_amd64.tar.gz
+grype   0.121.2  arm64  d7d2e160255b0f087280feabf6f213cf4c45d475690f3f1fe5dc336eb1037bf0  grype   https://github.com/anchore/grype/releases/download/v0.121.2/grype_0.121.2_linux_arm64.tar.gz
