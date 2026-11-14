@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The cluster of the Kubernetes tests: one node, in a container of the CI
+# runner. deploy/tests/kubernetes/cluster.sh creates it.
+#
+# The node image is the one the release of `kind` in deploy/tools/tools.txt
+# names for this Kubernetes version, by digest. deploy/tests/render.sh
+# validates the manifests of the chart against the same version.
+#
+# The network plugin is the one `kind` installs. It enforces NetworkPolicy,
+# and install.sh shows on every run that it does.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5

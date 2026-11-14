@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Values of the chart for the Kubernetes tests. The image is not here:
+# install.sh names it, by the digest the registry of the runner gave it.
+#
+# TLS is off on both legs, because this test is about the cluster and not
+# about certificates. Do not copy that.
+replicaCount: 2
+proxy:
+  clientTLS:
+    mode: disable
+clients:
+  - podLabels:
+      app.kubernetes.io/name: client
+database:
+  host: postgres.pgsnare-db.svc.cluster.local
+  tls:
+    mode: disable
+  peers:
+    - namespace: pgsnare-db
+      podLabels:
+        app.kubernetes.io/name: postgres
+tokens:
+  secretNames:
+    - pgsnare-tokens
