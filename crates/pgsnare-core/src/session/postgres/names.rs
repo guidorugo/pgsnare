@@ -9,6 +9,9 @@ use pgsnare_proto::{backend, frontend};
 
 use crate::session::Direction;
 
+/// The name of the message that opens a session. It has no type byte.
+pub(super) const STARTUP_MESSAGE: &str = "StartupMessage";
+
 /// The name of the message with this type byte, as the protocol
 /// documentation spells it. `None` for a type byte PostgreSQL does not
 /// define.

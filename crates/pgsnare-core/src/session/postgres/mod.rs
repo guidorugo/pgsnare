@@ -63,8 +63,9 @@
 //!
 //! The session shows everything it is about to pass on to an
 //! [`Inspector`], which decides whether it goes through. That is the one
-//! place where detection attaches. The inspector that ships today,
-//! [`PassThrough`], lets everything through.
+//! place where detection attaches. [`Scanner`] is the inspector that looks
+//! for honeytokens, and [`Postgres::scanning`] installs it. [`PassThrough`]
+//! lets everything through.
 //!
 //! [`LoginStrategy`]: crate::extension::LoginStrategy
 //! [`ProtocolModule`]: crate::extension::ProtocolModule
@@ -77,12 +78,16 @@ use crate::session::SessionOrigin;
 mod inspect;
 mod messages;
 mod names;
+mod scan;
+#[cfg(test)]
+mod scan_tests;
 mod session;
 
 #[cfg(test)]
 mod tests;
 
 pub use inspect::{Context, InspectionError, Inspector, InspectorFactory, PassThrough, Verdict};
+pub use scan::Scanner;
 pub use session::PostgresSession;
 
 /// The name PostgreSQL uses for itself in the ALPN extension of a TLS
@@ -108,6 +113,15 @@ impl Postgres {
     #[must_use]
     pub fn new() -> Self {
         Self::with_inspectors(|_: &SessionOrigin| -> Box<dyn Inspector> { Box::new(PassThrough) })
+    }
+
+    /// A module whose sessions look for the honeytokens of the policy in
+    /// everything they relay: each gets a [`Scanner`].
+    #[must_use]
+    pub fn scanning() -> Self {
+        Self::with_inspectors(|_: &SessionOrigin| -> Box<dyn Inspector> {
+            Box::new(Scanner::new())
+        })
     }
 
     /// A module whose sessions show what they relay to the inspectors
