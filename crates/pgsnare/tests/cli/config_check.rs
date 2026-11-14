@@ -441,3 +441,227 @@ fn the_help_says_what_is_checked_and_what_is_not() {
     assert_eq!(run.stderr, "");
     expected::check("config-check-help.txt", &run.stdout);
 }
+
+// --- The sinks ----------------------------------------------------------------
+
+/// A webhook that reads its URL and its signing key from files.
+const WEBHOOK_FROM_FILES: &str =
+    "    - type: webhook\n      url_file: hook-url\n      hmac_secret_file: hook-secret\n";
+
+/// The lines of a report that begin with `prefix`, without it, and with the
+/// directory of the fixture replaced by `<dir>`.
+fn lines(fixture: &Fixture, run: &Run, prefix: &str) -> Vec<String> {
+    fixture
+        .normalise(&run.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix(prefix))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn the_files_a_webhook_reads_its_key_and_its_url_from_must_be_closed_to_others() {
+    for open in ["hook-secret", "hook-url"] {
+        let fixture = Fixture::new();
+        fixture.certificates();
+        fixture.write("hook-url", "https://alerts.example.com/hooks/pgsnare\n");
+        fixture.write("hook-secret", &expected::signing_key());
+        fixture.write("pgsnare.yaml", &fixture::valid(WEBHOOK_FROM_FILES));
+
+        // Closed to others, both are fine.
+        let run = check(&fixture, &[]);
+        assert_eq!(run.status, 0, "{}", run.stdout);
+        assert_eq!(lines(&fixture, &run, "warning: "), [""; 0]);
+
+        // One of them open to the group fails the check, whichever it is.
+        let content = std::fs::read_to_string(fixture.path(open)).unwrap();
+        fixture.write_with_mode(open, &content, 0o640);
+        let run = check(&fixture, &[]);
+        assert_eq!(run.status, 1, "{}", run.stdout);
+        let errors = lines(&fixture, &run, "error: ");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].starts_with(&format!(
+                "<dir>/{open}: the file is open to the group or to others"
+            )),
+            "{errors:?}"
+        );
+        run_refuses_it_too(&fixture);
+    }
+}
+
+#[test]
+fn a_signing_key_that_is_not_there_is_an_error() {
+    // An environment variable that is not set.
+    let fixture = Fixture::new();
+    fixture.certificates();
+    fixture.write(
+        "pgsnare.yaml",
+        &fixture::valid(
+            "    - type: webhook\n      url: https://alerts.example.com/hooks/pgsnare\n      \
+             hmac_secret_env: PGSNARE_TEST_SECRET_THAT_IS_NOT_SET\n",
+        ),
+    );
+    let run = check(&fixture, &[]);
+    assert_eq!(run.status, 1, "{}", run.stdout);
+    assert_eq!(
+        lines(&fixture, &run, "error: "),
+        ["events.sinks[1] (webhook): the environment variable \
+             PGSNARE_TEST_SECRET_THAT_IS_NOT_SET is not set"]
+    );
+    run_refuses_it_too(&fixture);
+
+    // A file that is not there is reported once, and not once more by
+    // every step that would have read it.
+    let fixture = Fixture::new();
+    fixture.certificates();
+    fixture.write("hook-url", "https://alerts.example.com/hooks/pgsnare\n");
+    fixture.write("pgsnare.yaml", &fixture::valid(WEBHOOK_FROM_FILES));
+    let run = check(&fixture, &[]);
+    assert_eq!(run.status, 1, "{}", run.stdout);
+    assert_eq!(
+        lines(&fixture, &run, "error: "),
+        ["<dir>/hook-secret: the file cannot be examined: entity not found"]
+    );
+    run_refuses_it_too(&fixture);
+
+    // A file that holds nothing.
+    fixture.write("hook-secret", "");
+    let run = check(&fixture, &[]);
+    assert_eq!(run.status, 1, "{}", run.stdout);
+    assert_eq!(
+        lines(&fixture, &run, "error: "),
+        ["events.sinks[1] (webhook): <dir>/hook-secret: the file is empty"]
+    );
+    run_refuses_it_too(&fixture);
+}
+
+#[test]
+fn a_url_from_a_file_that_cannot_be_used_is_an_error_and_is_not_shown() {
+    for (url, problem) in [
+        (
+            "ftp://alerts.example.com/hooks/pgsnare",
+            "the URL cannot be used",
+        ),
+        (
+            "http://alerts.example.com/hooks/pgsnare",
+            "the URL is a plain http URL",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fixture.certificates();
+        fixture.write("hook-url", url);
+        fixture.write("hook-secret", &expected::signing_key());
+        fixture.write("pgsnare.yaml", &fixture::valid(WEBHOOK_FROM_FILES));
+        let run = check(&fixture, &[]);
+        assert_eq!(run.status, 1, "{}", run.stdout);
+        let errors = lines(&fixture, &run, "error: ");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].starts_with(&format!("events.sinks[1] (webhook): {problem}")),
+            "{errors:?}"
+        );
+        // The URL of a webhook can be a secret. No part of it is printed.
+        assert!(!run.stdout.contains("alerts.example.com"), "{}", run.stdout);
+        run_refuses_it_too(&fixture);
+    }
+}
+
+#[test]
+fn the_file_of_a_file_sink_is_checked_and_never_created() {
+    let fixture = Fixture::new();
+    fixture.certificates();
+    let with_file = |path: &str| fixture::valid(&format!("    - type: file\n      path: {path}\n"));
+
+    // A file that is not there, in a directory that is: the check passes,
+    // and the file is still not there.
+    fixture.write("pgsnare.yaml", &with_file(&fixture.arg("events.jsonl")));
+    let run = check(&fixture, &[]);
+    assert_eq!(run.status, 0, "{}", run.stdout);
+    assert!(!fixture.path("events.jsonl").exists());
+
+    // A directory that is not there.
+    fixture.write(
+        "pgsnare.yaml",
+        &with_file(&fixture.arg("missing/events.jsonl")),
+    );
+    let run = check(&fixture, &[]);
+    assert_eq!(run.status, 1, "{}", run.stdout);
+    assert_eq!(
+        lines(&fixture, &run, "error: "),
+        [
+            "events.sinks[1] (file): <dir>/missing/events.jsonl: the file cannot be opened: \
+             entity not found"
+        ]
+    );
+    assert!(!fixture.path("missing").exists());
+    run_refuses_it_too(&fixture);
+
+    // A symbolic link, which events are never written through.
+    std::os::unix::fs::symlink(fixture.path("elsewhere"), fixture.path("link.jsonl")).unwrap();
+    fixture.write("pgsnare.yaml", &with_file(&fixture.arg("link.jsonl")));
+    let run = check(&fixture, &[]);
+    assert_eq!(run.status, 1, "{}", run.stdout);
+    assert_eq!(
+        lines(&fixture, &run, "error: "),
+        [
+            "events.sinks[1] (file): <dir>/link.jsonl: the path is a symbolic link, and events \
+             are not written through one"
+        ]
+    );
+    run_refuses_it_too(&fixture);
+    assert!(!fixture.path("elsewhere").exists());
+
+    // A file that is there and that others can read is a warning, and
+    // stays as it is.
+    fixture.write_with_mode("open.jsonl", "{}\n", 0o644);
+    fixture.write("pgsnare.yaml", &with_file(&fixture.arg("open.jsonl")));
+    let run = check(&fixture, &[]);
+    assert_eq!(run.status, 0, "{}", run.stdout);
+    assert_eq!(
+        lines(&fixture, &run, "warning: "),
+        [
+            "events.sinks[1] (file): <dir>/open.jsonl: the file events are written to can be \
+             read or written by others than its owner"
+        ]
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.path("open.jsonl")).unwrap(),
+        "{}\n"
+    );
+}
+
+#[test]
+fn every_sink_is_reported_and_a_short_signing_key_is_a_warning() {
+    let fixture = Fixture::new();
+    fixture.certificates();
+    fixture.write("hook-url", "https://alerts.example.com/hooks/pgsnare\n");
+    fixture.write("hook-secret", "short");
+    let sinks = format!(
+        "    - type: webhook\n      url: https://alerts.example.com/hooks/pgsnare\n      \
+         hmac_secret_env: PGSNARE_TEST_SECRET_THAT_IS_NOT_SET\n\
+         {WEBHOOK_FROM_FILES}    - type: file\n      path: {}\n",
+        fixture.arg("missing/events.jsonl")
+    );
+    fixture.write("pgsnare.yaml", &fixture::valid(&sinks));
+    let run = check(&fixture, &[]);
+    assert_eq!(run.status, 1, "{}", run.stdout);
+    // `pgsnare run` stops at the first of these. The check reports both.
+    assert_eq!(
+        lines(&fixture, &run, "error: "),
+        [
+            "events.sinks[1] (webhook): the environment variable \
+             PGSNARE_TEST_SECRET_THAT_IS_NOT_SET is not set",
+            "events.sinks[3] (file): <dir>/missing/events.jsonl: the file cannot be opened: \
+             entity not found",
+        ]
+    );
+    assert_eq!(
+        lines(&fixture, &run, "warning: "),
+        [
+            "events.sinks[2] (webhook): the signing key of this webhook is shorter than 32 \
+             bytes, which makes its signatures weaker than they could be"
+        ]
+    );
+    run_refuses_it_too(&fixture);
+}

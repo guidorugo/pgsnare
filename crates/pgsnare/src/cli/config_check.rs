@@ -16,11 +16,34 @@
 //! 3. It builds the policy.
 //! 4. It reads the certificates and the keys of every listener, with the
 //!    functions `run` reads them with.
+//! 5. It builds the sinks with the code `run` builds them with, in
+//!    [`sinks::check_config`]: the signing key and the URL of a webhook are
+//!    read from the environment variable or the file the configuration
+//!    names, and the TLS settings of the webhook are put together. One
+//!    thing is left out, because a check must not write: the file of a
+//!    `file` sink is not created. A file that is there is opened as `run`
+//!    opens it, and for one that is not there the check asks whether its
+//!    directory would take it.
+//! 6. It builds the redactor, from the honeytokens and from what the sinks
+//!    must keep to themselves.
 //!
 //! A configuration that passes therefore starts, and one that fails does
-//! not, as far as that can be known without connecting to anything. The
-//! check opens no listener and no connection, so it cannot know whether an
-//! address is free or a database answers.
+//! not, as far as that can be known without connecting to anything,
+//! opening a listener or writing a file. What the check cannot know:
+//!
+//! - Whether the address of a listener is free, and whether it is an
+//!   address of the machine. That holds for the listeners for clients and
+//!   for the admin and metrics listeners alike. `run` finds out when it
+//!   opens them, and does not start when one of them cannot be opened.
+//! - Whether a database, a webhook receiver or a syslog server answers.
+//!   `run` starts without them, and finds out with the first connection
+//!   or the first event.
+//! - Whether the file of a `file` sink can be created where there is none
+//!   yet, beyond what the access rights of its directory say.
+//!
+//! The check reads the files and the environment variables of the machine
+//! it runs on. It says what `run` would do there, as the same user and
+//! with the same environment, and nothing about another machine.
 //!
 //! One difference is deliberate. `run` stops at the first step that fails,
 //! and the check goes on where it can, so that one run reports everything.
@@ -47,6 +70,7 @@ use pgsnare_core::session::postgres::Postgres;
 
 use crate::config::{self, LoadError, Loaded};
 use crate::runtime::permissions;
+use crate::sinks;
 use crate::tls::{BackendLeg, ClientLeg, TlsError};
 
 use super::{FAILURE, SUCCESS};
@@ -55,11 +79,18 @@ use super::{FAILURE, SUCCESS};
 #[derive(Debug, clap::Args)]
 #[command(
     after_long_help = "The check loads the configuration and its token files, looks at the access\n\
-        rights of the files that hold secrets, and reads the certificates and keys, with\n\
-        the code that `pgsnare run` uses. It reports every problem it finds, and warns\n\
-        about settings that are valid and give up some protection.\n\n\
-        Nothing is connected to and no listener is opened. Whether an address is free\n\
-        and whether a database answers is therefore not checked.\n\n\
+        rights of the files that hold secrets, reads the certificates and keys, and\n\
+        builds the event sinks, with the code that `pgsnare run` uses. It reports every\n\
+        problem it finds, and warns about settings that are valid and give up some\n\
+        protection.\n\n\
+        The check reads the files and the environment variables the configuration\n\
+        names, such as the signing key of a webhook. Run it as the user and with the\n\
+        environment pgsnare runs with.\n\n\
+        Nothing is connected to, no listener is opened and no file is created or\n\
+        written. So the check cannot know whether an address is free, whether a\n\
+        database, a webhook receiver or a syslog server answers, or whether the file of\n\
+        a file sink that is not there yet can be created. `pgsnare run` can still fail\n\
+        on these after a check that passed.\n\n\
         The exit status is 0 if pgsnare would start with this configuration, also when\n\
         there are warnings, and 1 if it would not.\n\n\
         Example:\n  pgsnare config check --config /etc/pgsnare/pgsnare.yaml"
@@ -237,9 +268,29 @@ pub fn check(args: &Args) -> Report {
         }
     }
 
+    // 5. The sinks, built as `run` builds them, short of creating a file.
+    let sinks = sinks::check_config(&config.events, super::run::redactor(config));
+    for error in &sinks.errors {
+        // A file that could not even be examined has its error already.
+        let reported = config.events.sinks.get(error.index()).is_some_and(|sink| {
+            sink.secret_files()
+                .iter()
+                .any(|file| unreadable.iter().any(|other| other.as_path() == *file))
+        });
+        if !reported {
+            report.errors.push(error.to_string());
+        }
+    }
+
+    // 6. What must never be written anywhere.
+    if let Err(error) = sinks.redactor.build() {
+        report.errors.push(error.to_string());
+    }
+
     report
         .warnings
         .extend(config.warnings().iter().map(ToString::to_string));
+    report.warnings.extend(sinks.warnings);
     if config.tokens.is_empty() {
         report.notes.push(NO_TOKENS.to_owned());
     }

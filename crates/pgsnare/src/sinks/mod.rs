@@ -192,6 +192,30 @@ impl fmt::Display for SetupError {
 
 impl std::error::Error for SetupError {}
 
+/// What the log of `pgsnare run` and the report of `pgsnare config check`
+/// say about a signing key that is short.
+const SHORT_KEY: &str = "the signing key of this webhook is shorter than 32 bytes, which makes \
+                         its signatures weaker than they could be";
+
+/// What the sinks of a configuration are put together for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    /// To deliver events. The first sink that cannot be built ends the
+    /// work.
+    Deliver,
+    /// To report on them. Every sink is looked at, and nothing is created
+    /// or written.
+    Check,
+}
+
+/// What came of putting the sinks of a configuration together.
+struct Assembled {
+    sinks: Vec<Configured>,
+    redactor: RedactorBuilder,
+    errors: Vec<SetupError>,
+    warnings: Vec<SetupError>,
+}
+
 /// Builds the sinks of a configuration, in its order.
 ///
 /// A sink goes by its type and its place in the configuration, such as
@@ -208,13 +232,70 @@ impl std::error::Error for SetupError {}
 /// contains what was read from it.
 pub fn from_config(
     events: &config::Events,
-    mut redactor: RedactorBuilder,
+    redactor: RedactorBuilder,
 ) -> Result<(Vec<Configured>, RedactorBuilder), SetupError> {
+    let mut assembled = assemble(events, redactor, Purpose::Deliver);
+    match assembled.errors.pop() {
+        Some(error) => Err(error),
+        None => Ok((assembled.sinks, assembled.redactor)),
+    }
+}
+
+/// What [`check_config`] found out about the sinks of a configuration.
+#[non_exhaustive]
+pub struct Checked {
+    /// The sinks that cannot be built, and why. [`from_config`] fails with
+    /// the first of them.
+    pub errors: Vec<SetupError>,
+    /// What is valid and gives up some protection, each with the sink it
+    /// is about, in the words [`from_config`] writes to the log.
+    pub warnings: Vec<String>,
+    /// The redactor, with what the sinks that can be built must keep to
+    /// themselves.
+    pub redactor: RedactorBuilder,
+}
+
+impl fmt::Debug for Checked {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Checked")
+            .field("errors", &self.errors)
+            .field("warnings", &self.warnings)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Looks at the sinks of a configuration the way [`from_config`] builds
+/// them, and reports on every one of them.
+///
+/// The steps are those of `from_config`, in the same code: a secret is
+/// read from where the configuration says it is, the URL of a webhook is
+/// taken apart, and its TLS settings are put together. Two things differ.
+/// The work does not end at the first sink that cannot be built, so that
+/// one check reports all of them. And the file of a `file` sink is not
+/// created: see [`FileSink::check`].
+///
+/// Nothing is connected to. Whether a receiver or a syslog server answers
+/// is found out when the first event is delivered.
+#[must_use]
+pub fn check_config(events: &config::Events, redactor: RedactorBuilder) -> Checked {
+    let assembled = assemble(events, redactor, Purpose::Check);
+    Checked {
+        errors: assembled.errors,
+        warnings: assembled.warnings.iter().map(ToString::to_string).collect(),
+        redactor: assembled.redactor,
+    }
+}
+
+/// Puts the sinks of a configuration together, for one purpose or the
+/// other, so that building them and checking them cannot disagree.
+fn assemble(events: &config::Events, mut redactor: RedactorBuilder, purpose: Purpose) -> Assembled {
     let mut sinks = Vec::with_capacity(events.sinks.len());
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
     for (index, sink) in events.sinks.iter().enumerate() {
         let kind = sink.kind();
         let name = format!("{kind}-{index}");
-        let failed = |problem: String| SetupError {
+        let found = |problem: String| SetupError {
             index,
             kind,
             problem,
@@ -223,41 +304,77 @@ pub fn from_config(
             .with_queue_size(usize::try_from(sink.queue_size()).unwrap_or(usize::MAX))
             .with_max_events_per_second(sink.max_events_per_second());
 
-        let built: Arc<dyn EventSink> = match sink {
-            config::Sink::Webhook(webhook) => {
-                let (sink, url) = webhook_from_config(&name, webhook).map_err(failed)?;
-                redactor = redactor.secret_text(&url).secret_text(sink.path());
-                options = options
-                    .with_max_retries(webhook.max_retries)
-                    .with_attempt_timeout(webhook.timeout.saturating_add(WEBHOOK_TIMEOUT_MARGIN));
-                Arc::new(sink)
+        let built: Result<Option<Arc<dyn EventSink>>, String> = match sink {
+            config::Sink::Webhook(webhook) => match webhook_from_config(&name, webhook) {
+                Ok((sink, url, short_key)) => {
+                    redactor = redactor.secret_text(&url).secret_text(sink.path());
+                    options = options
+                        .with_max_retries(webhook.max_retries)
+                        .with_attempt_timeout(
+                            webhook.timeout.saturating_add(WEBHOOK_TIMEOUT_MARGIN),
+                        );
+                    if short_key {
+                        warnings.push(found(SHORT_KEY.to_owned()));
+                    }
+                    Ok(Some(Arc::new(sink)))
+                }
+                Err(problem) => Err(problem),
+            },
+            config::Sink::Stdout(_) => Ok(Some(Arc::new(StdoutSink::new(name)))),
+            config::Sink::File(file) => {
+                let outcome: Result<Option<Arc<dyn EventSink>>, FileError> = match purpose {
+                    Purpose::Deliver => match FileSink::new(name, &file.path) {
+                        Ok(sink) => Ok(Some(Arc::new(sink))),
+                        Err(error) => Err(error),
+                    },
+                    Purpose::Check => match FileSink::check(&file.path) {
+                        Ok(open_to_others) => {
+                            if open_to_others {
+                                warnings.push(found(format!(
+                                    "{}: {}",
+                                    file.path.display(),
+                                    file::OPEN_TO_OTHERS
+                                )));
+                            }
+                            Ok(None)
+                        }
+                        Err(error) => Err(error),
+                    },
+                };
+                outcome.map_err(|error| format!("{}: {error}", file.path.display()))
             }
-            config::Sink::Stdout(_) => Arc::new(StdoutSink::new(name)),
-            config::Sink::File(file) => Arc::new(
-                FileSink::new(name, &file.path)
-                    .map_err(|error| failed(format!("{}: {error}", file.path.display())))?,
-            ),
-            config::Sink::Syslog(syslog) => Arc::new(SyslogSink::new(
+            config::Sink::Syslog(syslog) => Ok(Some(Arc::new(SyslogSink::new(
                 name,
                 &syslog.address,
                 syslog.transport,
                 syslog.facility,
-            )),
+            )))),
         };
-        sinks.push(Configured {
-            sink: built,
-            options,
-        });
+        match built {
+            Ok(Some(sink)) => sinks.push(Configured { sink, options }),
+            Ok(None) => {}
+            Err(problem) => {
+                errors.push(found(problem));
+                if purpose == Purpose::Deliver {
+                    break;
+                }
+            }
+        }
     }
-    Ok((sinks, redactor))
+    Assembled {
+        sinks,
+        redactor,
+        errors,
+        warnings,
+    }
 }
 
 /// Builds a webhook sink and returns it with its URL, which the caller
-/// hides.
+/// hides, and with whether its signing key is shorter than it should be.
 fn webhook_from_config(
     name: &str,
     webhook: &config::WebhookSink,
-) -> Result<(WebhookSink, String), String> {
+) -> Result<(WebhookSink, String, bool), String> {
     let url = match &webhook.url {
         config::UrlSource::Inline(url) => url.as_str().to_owned(),
         config::UrlSource::Env(variable) => {
@@ -276,12 +393,9 @@ fn webhook_from_config(
         .with_timeout(webhook.timeout);
     let sink = WebhookSink::new(name, &url, &key, settings).map_err(|error| error.to_string())?;
 
-    if key.len() < RECOMMENDED_KEY_BYTES {
-        tracing::warn!(
-            sink = name,
-            "the signing key of this webhook is shorter than 32 bytes, which makes its \
-             signatures weaker than they could be"
-        );
+    let short_key = key.len() < RECOMMENDED_KEY_BYTES;
+    if short_key {
+        tracing::warn!(sink = name, "{SHORT_KEY}");
     }
     if !sink.is_encrypted() {
         tracing::warn!(
@@ -290,7 +404,7 @@ fn webhook_from_config(
              allow_insecure_http is set: whoever is on the way can read them"
         );
     }
-    Ok((sink, url))
+    Ok((sink, url, short_key))
 }
 
 #[cfg(test)]

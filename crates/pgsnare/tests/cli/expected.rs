@@ -62,20 +62,33 @@ impl Run {
     }
 }
 
-/// A command line for the binary under test, with an empty environment.
+/// The environment variable the configurations of these tests name for
+/// the signing key of a webhook.
+pub const SIGNING_KEY_VARIABLE: &str = "PGSNARE_WEBHOOK_SECRET";
+
+/// A signing key that is made for this run of the tests and is long enough
+/// to cause no warning. Nothing is ever signed with it.
+pub fn signing_key() -> String {
+    format!("made-for-this-run-of-the-tests-{:010}", std::process::id())
+}
+
+/// A command line for the binary under test. Its environment holds one
+/// variable and nothing else: [`SIGNING_KEY_VARIABLE`], because a webhook
+/// sink cannot be built without its signing key.
 pub fn pgsnare(arguments: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_pgsnare"));
     command
         .args(arguments)
         .env_clear()
+        .env(SIGNING_KEY_VARIABLE, signing_key())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command
 }
 
-/// Runs the binary with these arguments, nothing on standard input and an
-/// empty environment.
+/// Runs the binary with these arguments, nothing on standard input and the
+/// environment of [`pgsnare`].
 pub fn run(arguments: &[&str]) -> Run {
     Run::from(
         pgsnare(arguments)

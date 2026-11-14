@@ -18,7 +18,7 @@
 //! output carries nothing but the events of a `stdout` sink.
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -267,7 +267,7 @@ fn outcome(stopped: Stopped) -> Result<(), String> {
 
 /// What must never be written anywhere, as far as the configuration says
 /// it: the values of the honeytokens.
-fn redactor(config: &Config) -> RedactorBuilder {
+pub(super) fn redactor(config: &Config) -> RedactorBuilder {
     let mut builder = Redactor::builder();
     for token in &config.tokens {
         builder = builder.token(
@@ -282,13 +282,7 @@ fn redactor(config: &Config) -> RedactorBuilder {
 /// Refuses to start when a file that holds secrets is open to other users,
 /// unless the operator said to start all the same.
 fn check_permissions(loaded: &config::Loaded, allow: bool) -> Result<(), String> {
-    let mut files = loaded.secret_files();
-    for file in sink_secrets(&loaded.config) {
-        if !files.contains(&file) {
-            files.push(file);
-        }
-    }
-    let refused = permissions::check_all(files);
+    let refused = permissions::check_all(loaded.secret_files());
     if refused.is_empty() {
         return Ok(());
     }
@@ -314,24 +308,6 @@ fn check_permissions(loaded: &config::Loaded, allow: bool) -> Result<(), String>
          --allow-insecure-file-permissions to accept the risk.",
     );
     Err(message)
-}
-
-/// The files the sinks of a configuration read a secret from: the signing
-/// key of a webhook, and its URL when that is kept in a file because it is
-/// a secret too.
-fn sink_secrets(config: &Config) -> Vec<&Path> {
-    let mut files = Vec::new();
-    for sink in &config.events.sinks {
-        if let config::Sink::Webhook(webhook) = sink {
-            if let config::SecretRef::File(file) = &webhook.hmac_secret {
-                files.push(file.as_path());
-            }
-            if let config::UrlSource::File(file) = &webhook.url {
-                files.push(file.as_path());
-            }
-        }
-    }
-    files
 }
 
 /// A core dump would write keys and traffic to disk.

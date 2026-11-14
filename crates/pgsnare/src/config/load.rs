@@ -8,7 +8,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use super::error::ConfigError;
-use super::{Config, TokenFile};
+use super::{Config, Sink, TokenFile};
 
 /// The largest configuration or token file that is read: 16 MiB.
 pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -28,8 +28,9 @@ pub struct Loaded {
 
 impl Loaded {
     /// The files that hold secrets, each once: every file that was read,
-    /// which is the configuration file and the token files, and the
-    /// private key of every listener.
+    /// which is the configuration file and the token files, the private
+    /// key of every listener, and the files a webhook sink reads its
+    /// signing key and its URL from.
     ///
     /// These are the files whose access rights must keep other users out.
     /// `pgsnare run` checks them before it starts and `pgsnare config
@@ -42,7 +43,14 @@ impl Loaded {
             .listeners
             .iter()
             .filter_map(|listener| listener.client_tls.key.as_deref());
-        unique(self.files.iter().map(PathBuf::as_path).chain(keys))
+        let sinks = self.config.events.sinks.iter().flat_map(Sink::secret_files);
+        unique(
+            self.files
+                .iter()
+                .map(PathBuf::as_path)
+                .chain(keys)
+                .chain(sinks),
+        )
     }
 }
 

@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 
 use pgsnare_core::event::Event;
 use pgsnare_core::extension::{EventSink, SinkError, SinkFuture};
-use rustix::fs::OFlags;
+use rustix::fs::{Access, OFlags};
 
 use super::lines::{LineOutput, Lines, json_line};
 
@@ -88,6 +88,50 @@ struct Opened {
     inode: u64,
 }
 
+/// What the log of `pgsnare run` and the report of `pgsnare config check`
+/// say about a file that is not closed to other users.
+pub(super) const OPEN_TO_OTHERS: &str =
+    "the file events are written to can be read or written by others than its owner";
+
+/// Opens the file at `path` for appending. With `create`, a file that is
+/// not there is created, closed to other users. Also says whether the file
+/// can be read or written by others than its owner.
+fn open(path: &Path, create: bool) -> Result<(Opened, bool), FileError> {
+    // Not through a link, and without waiting for the other end of a pipe
+    // that may stand where the file should be.
+    let flags = OFlags::NOFOLLOW | OFlags::NONBLOCK;
+    let file = OpenOptions::new()
+        .append(true)
+        .create(create)
+        .mode(0o600)
+        .custom_flags(i32::try_from(flags.bits()).unwrap_or(0))
+        .open(path)
+        .map_err(|error| {
+            // The system says "too many levels of symbolic links" when the
+            // last part of the path is one and may not be followed.
+            if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) {
+                FileError::SymbolicLink
+            } else {
+                FileError::Open(error.kind())
+            }
+        })?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| FileError::Open(error.kind()))?;
+    if !metadata.is_file() {
+        return Err(FileError::NotAFile);
+    }
+    let open_to_others = metadata.mode() & 0o077 != 0;
+    Ok((
+        Opened {
+            file,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        },
+        open_to_others,
+    ))
+}
+
 /// The file of a sink, and what the sink remembers about it.
 struct EventsFile {
     name: String,
@@ -100,43 +144,15 @@ struct EventsFile {
 impl EventsFile {
     /// Opens the file for appending, and creates it when it is not there.
     fn open(&self) -> Result<Opened, FileError> {
-        // Not through a link, and without waiting for the other end of a
-        // pipe that may stand where the file should be.
-        let flags = OFlags::NOFOLLOW | OFlags::NONBLOCK;
-        let file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(i32::try_from(flags.bits()).unwrap_or(0))
-            .open(&self.path)
-            .map_err(|error| {
-                // The system says "too many levels of symbolic links" when
-                // the last part of the path is one and may not be followed.
-                if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) {
-                    FileError::SymbolicLink
-                } else {
-                    FileError::Open(error.kind())
-                }
-            })?;
-        let metadata = file
-            .metadata()
-            .map_err(|error| FileError::Open(error.kind()))?;
-        if !metadata.is_file() {
-            return Err(FileError::NotAFile);
-        }
-        if metadata.mode() & 0o077 != 0 {
+        let (opened, open_to_others) = open(&self.path, true)?;
+        if open_to_others {
             tracing::warn!(
                 sink = %self.name,
                 file = %self.path.display(),
-                "the file events are written to can be read or written by others than its \
-                 owner"
+                "{OPEN_TO_OTHERS}"
             );
         }
-        Ok(Opened {
-            file,
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
+        Ok(opened)
     }
 
     /// Whether the path still leads to the file that is open.
@@ -243,6 +259,42 @@ impl FileSink {
             path: file.path.clone(),
             lines: Lines::new(file),
         })
+    }
+
+    /// Whether a sink could be built for the file at `path`, found out
+    /// without creating the file and without writing to it.
+    ///
+    /// A file that is there is opened the way [`FileSink::new`] opens it,
+    /// and closed again. For a file that is not there, the directory it
+    /// would be created in must be there, and this process must be allowed
+    /// to create a file in it.
+    ///
+    /// Returns whether the file is there and can be read or written by
+    /// others than its owner, which `new` says in the log.
+    ///
+    /// # Errors
+    ///
+    /// Returns why `new` would fail. A file that is not there can still
+    /// fail to be created for a reason that cannot be seen from here, such
+    /// as a disk that is full.
+    pub fn check(path: &Path) -> Result<bool, FileError> {
+        match open(path, false) {
+            Ok((_, open_to_others)) => Ok(open_to_others),
+            Err(FileError::Open(io::ErrorKind::NotFound)) => {
+                let directory = match path.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => parent,
+                    _ => Path::new("."),
+                };
+                let failed = |error: io::Error| FileError::Open(error.kind());
+                if !std::fs::metadata(directory).map_err(failed)?.is_dir() {
+                    return Err(FileError::Open(io::ErrorKind::NotADirectory));
+                }
+                rustix::fs::access(directory, Access::WRITE_OK | Access::EXEC_OK)
+                    .map_err(|error| failed(io::Error::from(error)))?;
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// The file events are appended to.
@@ -510,5 +562,62 @@ mod tests {
             format!("{sink:?}"),
             format!("FileSink {{ name: \"file-2\", path: {path:?} }}")
         );
+    }
+
+    #[test]
+    fn a_check_says_what_building_the_sink_would_say_and_creates_nothing() {
+        let dir = TempDir::new();
+
+        // A file that is not there, in a directory that is: the sink could
+        // be built, and the file is still not there.
+        let path = dir.0.join("events.jsonl");
+        assert_eq!(FileSink::check(&path), Ok(false));
+        assert!(!path.exists());
+
+        // A directory that is not there.
+        let missing = dir.0.join("missing").join("events.jsonl");
+        let not_found = Some(FileError::Open(io::ErrorKind::NotFound));
+        assert_eq!(FileSink::check(&missing).err(), not_found);
+        assert_eq!(FileSink::new("file-0", &missing).err(), not_found);
+
+        // A symbolic link, whether it leads to a file or to nothing.
+        let target = dir.0.join("elsewhere");
+        let link = dir.0.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(FileSink::check(&link), Err(FileError::SymbolicLink));
+        assert!(!target.exists());
+        std::fs::write(&target, b"").unwrap();
+        assert_eq!(FileSink::check(&link), Err(FileError::SymbolicLink));
+        assert_eq!(std::fs::read(&target).unwrap(), b"");
+
+        // What is not a regular file is refused as building the sink
+        // refuses it.
+        assert!(FileSink::check(&dir.0).is_err());
+        assert_eq!(
+            FileSink::check(&dir.0).err(),
+            FileSink::new("file-0", &dir.0).err()
+        );
+
+        // A file that is there keeps its content and its mode, and a mode
+        // that lets others in is reported.
+        let open = dir.0.join("open.jsonl");
+        std::fs::write(&open, b"{}\n").unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(FileSink::check(&open), Ok(true));
+        assert_eq!(std::fs::read(&open).unwrap(), b"{}\n");
+        assert_eq!(mode(&open), 0o644);
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(FileSink::check(&open), Ok(false));
+
+        // A directory in which nothing can be created: the check and the
+        // sink agree, whoever runs the test.
+        let closed = dir.0.join("closed");
+        std::fs::create_dir(&closed).unwrap();
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let inside = closed.join("events.jsonl");
+        let checked = FileSink::check(&inside).err();
+        let built = FileSink::new("file-0", &inside).err();
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(checked, built);
     }
 }
