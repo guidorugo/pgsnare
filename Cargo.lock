@@ -745,6 +745,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hyper",
  "pgsnare-core",
+ "pgsnare-proto",
  "proptest",
  "rcgen",
  "rustix",

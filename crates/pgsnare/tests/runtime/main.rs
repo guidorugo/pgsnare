@@ -8,6 +8,7 @@
 //! every part of it is used.
 
 mod fake;
+mod hostile;
 mod kill;
 mod relay;
 mod reload;
