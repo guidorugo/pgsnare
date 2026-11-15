@@ -72,6 +72,35 @@ pub struct Args {
 /// Runs the command and returns its exit status.
 #[must_use]
 pub fn run(args: &Args) -> u8 {
+    // Before the configuration is read, which a panic message could
+    // repeat.
+    std::panic::set_hook(panic_hook(|line| {
+        use std::io::Write;
+
+        // A line that cannot be written is nothing to panic about again.
+        let _ = writeln!(std::io::stderr(), "{line}");
+    }));
+    answer(args)
+}
+
+/// What a panic leaves behind: the place it happened and nothing else.
+/// The message of a panic could repeat what the configuration file holds,
+/// and that file may hold the values of honeytokens.
+fn panic_hook(
+    write: impl Fn(&str) + Send + Sync + 'static,
+) -> Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static> {
+    Box::new(move |info| {
+        let (file, line) = info.location().map_or(("unknown", 0), |location| {
+            (location.file(), location.line())
+        });
+        write(&format!(
+            "pgsnare healthcheck: a panic occurred at {file}:{line}"
+        ));
+    })
+}
+
+/// Does the work of the command and returns its exit status.
+fn answer(args: &Args) -> u8 {
     let listen = match &args.config {
         Some(file) => admin_listener(file),
         None => Ok(Admin::default().listen.socket_addr()),
@@ -88,13 +117,29 @@ pub fn run(args: &Args) -> u8 {
 /// The address a configuration gives the admin listener.
 fn admin_listener(file: &Path) -> Result<SocketAddr, String> {
     use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
 
     // The file may hold the values of honeytokens, and this process holds
     // them for a moment while it reads the file.
     disable_core_dumps();
     let failed = |problem: String| format!("{}: {problem}", file.display());
-    let opened = std::fs::File::open(file)
+    // Without waiting for the other end of a pipe that may stand where the
+    // file should be: the check answers within its time whatever it is
+    // pointed at.
+    let flags = i32::try_from(rustix::fs::OFlags::NONBLOCK.bits())
+        .map_err(|_| failed("cannot read the file: unsupported".to_owned()))?;
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(file)
         .map_err(|error| failed(format!("cannot read the file: {}", error.kind())))?;
+    let is_file = opened
+        .metadata()
+        .map_err(|error| failed(format!("cannot read the file: {}", error.kind())))?
+        .is_file();
+    if !is_file {
+        return Err(failed("this is not a regular file".to_owned()));
+    }
     let mut text = String::new();
     opened
         .take(MAX_CONFIG_BYTES.saturating_add(1))
@@ -288,15 +333,15 @@ mod tests {
             config: Some(config.clone()),
             ready,
         };
-        assert_eq!(run(&args(false)), SUCCESS);
-        assert_eq!(run(&args(true)), FAILURE);
+        assert_eq!(answer(&args(false)), SUCCESS);
+        assert_eq!(answer(&args(true)), FAILURE);
         proxy.status.set_ready(true);
-        assert_eq!(run(&args(true)), SUCCESS);
+        assert_eq!(answer(&args(true)), SUCCESS);
 
         // Once the proxy is gone, nothing answers.
         drop(proxy);
-        assert_eq!(run(&args(false)), FAILURE);
-        assert_eq!(run(&args(true)), FAILURE);
+        assert_eq!(answer(&args(false)), FAILURE);
+        assert_eq!(answer(&args(true)), FAILURE);
     }
 
     #[test]
@@ -456,7 +501,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            run(&Args {
+            answer(&Args {
                 config: Some(missing),
                 ready: false
             }),
@@ -472,5 +517,73 @@ mod tests {
         let error = admin_listener(&broken).unwrap_err();
         assert!(error.starts_with(&broken.display().to_string()), "{error}");
         assert!(!error.contains("Zq7honeytokenValue9xK"), "{error}");
+    }
+
+    #[test]
+    fn what_is_not_a_regular_file_is_not_waited_for() {
+        // A pipe nobody writes to: opening it the plain way never returns.
+        let dir = TempDir::new();
+        let pipe = dir.0.join("pipe.yaml");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &pipe,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        let (done, answered) = std::sync::mpsc::channel();
+        let asked = pipe.clone();
+        std::thread::spawn(move || {
+            let _ = done.send(admin_listener(&asked));
+        });
+        let answer = answered
+            .recv_timeout(TIME_LIMIT)
+            .expect("the check does not wait for a pipe");
+        assert_eq!(
+            answer,
+            Err(format!("{}: this is not a regular file", pipe.display()))
+        );
+        assert_eq!(
+            admin_listener(&dir.0),
+            Err(format!("{}: this is not a regular file", dir.0.display()))
+        );
+    }
+
+    #[test]
+    fn a_panic_leaves_its_place_and_not_its_message() {
+        use std::sync::{Arc, Mutex};
+
+        let written = Arc::new(Mutex::new(Vec::<String>::new()));
+        let lines = Arc::clone(&written);
+        let hook = panic_hook(move |line| lines.lock().unwrap().push(line.to_owned()));
+
+        // The hook of the process is this one only for the moment of one
+        // panic, in a thread of its own.
+        let before = std::panic::take_hook();
+        std::panic::set_hook(hook);
+        let panicked = std::thread::spawn(|| {
+            let value = String::from("Zq7honeytokenValue9xK");
+            assert!(value.is_empty(), "the file holds {value}");
+        })
+        .join();
+        std::panic::set_hook(before);
+        assert!(panicked.is_err());
+
+        let written = written.lock().unwrap();
+        let ours: Vec<&String> = written
+            .iter()
+            .filter(|line| line.contains("healthcheck.rs"))
+            .collect();
+        assert_eq!(ours.len(), 1, "{written:?}");
+        assert!(
+            ours[0].starts_with("pgsnare healthcheck: a panic occurred at "),
+            "{}",
+            ours[0]
+        );
+        assert!(
+            written.iter().all(|line| !line.contains("Zq7")),
+            "{written:?}"
+        );
     }
 }
