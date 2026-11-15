@@ -106,15 +106,39 @@ impl Sequence {
 
 #[test]
 fn seeds_that_are_changed_at_random_pass_the_checks() {
-    // Not a fuzzer: some fifteen hundred inputs near the seeds, so that a check
-    // of the target that is wrong shows here and not only in a fuzz run.
+    // Not a fuzzer: some fifteen hundred inputs near the seeds, so that a
+    // check of the target that is wrong shows here and not only in a fuzz
+    // run. PGSNARE_SCANNING_ROUNDS asks for another number of inputs.
+    let rounds = std::env::var("PGSNARE_SCANNING_ROUNDS")
+        .ok()
+        .and_then(|rounds| rounds.parse().ok())
+        .unwrap_or(1_500u64);
     let seeds: Vec<Vec<u8>> = seeds().into_values().collect();
     let mut sequence = Sequence(0x2545_f491_4f6c_dd1d);
-    for _ in 0..1_500 {
+    for _ in 0..rounds {
         let mut data = seeds[sequence.below(seeds.len())].clone();
         for _ in 0..=sequence.below(4) {
             let other = &seeds[sequence.below(seeds.len())];
-            match sequence.below(4) {
+            match sequence.below(6) {
+                4 | 5 => {
+                    // Bytes as they are, from either side: a piece of a
+                    // seed, which may hold a value, behind a length that
+                    // need not be its own.
+                    let from = sequence.below(other.len());
+                    let length = sequence.below(other.len() - from + 1);
+                    let piece = &other[from..from + length];
+                    let claimed = if sequence.below(2) == 0 {
+                        u16::try_from(piece.len()).unwrap()
+                    } else {
+                        sequence.next().to_le_bytes()[0].into()
+                    };
+                    let side = sequence.next().to_le_bytes()[0] % 2;
+                    let mut step = vec![side];
+                    step.extend_from_slice(&claimed.to_be_bytes());
+                    step.extend_from_slice(piece);
+                    let at = (1 + 3 * sequence.below(data.len() / 3 + 1)).min(data.len());
+                    data.splice(at..at, step);
+                }
                 0 if !data.is_empty() => {
                     let at = sequence.below(data.len());
                     data[at] = sequence.next().to_le_bytes()[0];

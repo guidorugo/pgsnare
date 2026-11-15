@@ -20,9 +20,9 @@
 //! - **What the client is sent is a run of whole messages**, for as long
 //!   as the session inspects it, whatever the server sent.
 //! - **A value that is answered with `kill` reaches nobody.** The token
-//!   whose only response is `kill` is never in what was passed on to
-//!   either side: not as written, not in another case, not in
-//!   hexadecimal.
+//!   whose only response is `kill` is never in the body of a message that
+//!   was passed on to either side, whole or in part: not as written, not
+//!   in another case, not in hexadecimal.
 //! - **A `kill` ends the session** in the same call.
 //! - **A hit is reported as it is counted**: every count is followed by
 //!   its event, and both name the same token and the same responses.
@@ -384,6 +384,25 @@ fn steps(mut input: &[u8], limit: usize) -> Vec<Step> {
     steps
 }
 
+/// Fails if `body`, the body of a message that was passed on or the part
+/// of it that was, holds the value that is answered with `kill`.
+fn must_not_hold_the_killed_value(body: &[u8]) {
+    let value = TOKENS[KILL].1.as_bytes();
+    let lowercase = value.to_ascii_lowercase();
+    let folded = body.to_ascii_lowercase();
+    assert!(
+        !folded
+            .windows(lowercase.len())
+            .any(|window| window == lowercase),
+        "a value that is answered with kill was passed on"
+    );
+    let in_hex = hex(value);
+    assert!(
+        !body.windows(in_hex.len()).any(|window| window == in_hex),
+        "a value that is answered with kill was passed on in hexadecimal"
+    );
+}
+
 /// Reads a stream of messages as it arrives, piece by piece.
 #[derive(Default)]
 struct Messages {
@@ -401,7 +420,7 @@ impl Messages {
             let length = usize::try_from(u32::from_be_bytes([a, b, c, d])).expect("32 bits fit");
             assert!(
                 length >= 4,
-                "the client was sent a message with an impossible length"
+                "a message with an impossible length was passed on"
             );
             let total = 1 + length;
             if self.partial.len() < total {
@@ -459,13 +478,11 @@ struct Run {
     policy: PolicySnapshot,
     generation: u64,
     largest_limit: usize,
-    to_client: Vec<u8>,
-    to_server: Vec<u8>,
-    /// How much of each stream was passed on while the session inspected
-    /// what it passed on.
-    inspected: Option<(usize, usize)>,
-    /// What the client was sent, read as messages.
+    /// Set once the session goes on without inspection.
+    bypassed: bool,
+    /// What the client and the server were sent, read as messages.
     client: Messages,
+    server: Messages,
     client_results: Results,
     /// The messages of the server, when all of them were whole messages
     /// of the harness.
@@ -498,10 +515,9 @@ impl Run {
             policy: policy(on_error, limit, 0),
             generation: 0,
             largest_limit: limit,
-            to_client: Vec::new(),
-            to_server: Vec::new(),
-            inspected: None,
+            bypassed: false,
             client: Messages::default(),
+            server: Messages::default(),
             client_results: Results::default(),
             server_results: Some(Results::default()),
             fake_reports: 0,
@@ -555,7 +571,6 @@ impl Run {
         call: impl FnOnce(&mut PostgresSession, &PolicySnapshot, &mut Output) -> Result<(), ()>,
     ) {
         let ended_before = self.session.is_closed();
-        let inspecting_before = !self.session.is_tunnel() && self.inspected.is_none();
         let mut out = Output::new();
         let result = call(&mut self.session, &self.policy, &mut out);
 
@@ -593,22 +608,21 @@ impl Run {
         let bypassed = out.effects.iter().any(|effect| {
             matches!(effect, Effect::Emit(body) if body.kind == EventKind::InspectionBypassed)
         });
-        if inspecting_before && (bypassed || self.session.is_tunnel()) {
-            self.inspected = Some((self.to_client.len(), self.to_server.len()));
-        }
-        let inspecting = self.inspected.is_none();
+        self.bypassed |= bypassed || self.session.is_tunnel();
+        let inspecting = !self.bypassed;
 
         let complete = if inspecting {
-            self.client.feed(&out.to_client)
+            let complete = self.client.feed(&out.to_client);
+            for (_, body) in complete.iter().chain(&self.server.feed(&out.to_server)) {
+                must_not_hold_the_killed_value(body);
+            }
+            complete
         } else {
             Vec::new()
         };
         self.client_results.note(&complete);
 
         self.effects(&out.effects, &complete, ended_before);
-
-        self.to_client.append(&mut out.to_client);
-        self.to_server.append(&mut out.to_server);
     }
 
     /// Checks the effects of one call. `complete` is what the call
@@ -685,7 +699,7 @@ impl Run {
                 pair[0].0 == b'D' && pair[1].0 == b'C' && selected(&pair[1].1).is_some()
             });
             assert!(
-                added || self.inspected.is_some(),
+                added || self.bypassed,
                 "a report says fake_data and no rows were added"
             );
         }
@@ -755,28 +769,10 @@ impl Run {
         );
         self.reached.kept_back_in_vain = self.kept_back > self.fake_reports;
 
-        // The token that is answered with `kill` reached nobody, in any
-        // form it is looked for in.
-        let (client, server) = self
-            .inspected
-            .unwrap_or((self.to_client.len(), self.to_server.len()));
-        let value = TOKENS[KILL].1.as_bytes();
-        let lowercase = value.to_ascii_lowercase();
-        let in_hex = hex(value);
-        for passed_on in [&self.to_client[..client], &self.to_server[..server]] {
-            let folded = passed_on.to_ascii_lowercase();
-            assert!(
-                !folded
-                    .windows(lowercase.len())
-                    .any(|window| window == lowercase),
-                "a value that is answered with kill was passed on"
-            );
-            assert!(
-                !passed_on
-                    .windows(in_hex.len())
-                    .any(|window| window == in_hex),
-                "a value that is answered with kill was passed on in hexadecimal"
-            );
+        // Nor is the value in the part that was passed on of a message
+        // that never became whole.
+        for partial in [&self.client.partial, &self.server.partial] {
+            must_not_hold_the_killed_value(partial.get(5..).unwrap_or_default());
         }
 
         // A session that inspected everything, never ended, and whose
@@ -784,7 +780,7 @@ impl Run {
         // of the server, and beyond them exactly the rows that reports
         // say were added, counted in its command tags.
         if let Some(server) = &self.server_results
-            && self.inspected.is_none()
+            && !self.bypassed
             && !self.ever_closed
         {
             assert!(
