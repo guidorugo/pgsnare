@@ -26,6 +26,20 @@
 //! the loopback interface, and an operator who gives them another one is
 //! told so in the log when the proxy starts.
 //!
+//! # The name a request asks under
+//!
+//! A listener on a loopback address answers only a request whose `Host`
+//! header names `localhost` or a loopback address, and whose target, if it
+//! names a host at all, does the same. Anything else gets `403`, also a
+//! request without the header or with more than one. Programs on the
+//! machine ask under such a name; a page of another site that makes a
+//! browser on the machine ask does so under the name of that site, and
+//! gets nothing.
+//!
+//! A listener on any other address was opened to other machines by the
+//! operator, who is told so when the proxy starts. Whoever reaches it may
+//! ask under any name.
+//!
 //! # Limits
 //!
 //! Whoever connects is not trusted to behave.
@@ -49,16 +63,21 @@
 //! in the loop that accepts connections ends the loop, and the loop is
 //! started again after a moment. Both are counted and logged. Database
 //! traffic does not depend on either listener and goes on throughout.
+//!
+//! A connection that cannot be accepted, as when the process has run out
+//! of file descriptors, is counted for its listener and logged with that
+//! count, at most once in [`REFUSAL_LOG_INTERVAL`].
 
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use hyper::body::Incoming;
-use hyper::header::{ALLOW, CACHE_CONTROL, CONTENT_TYPE, HeaderValue};
+use hyper::header::{ALLOW, CACHE_CONTROL, CONTENT_TYPE, HOST, HeaderValue};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -120,6 +139,66 @@ impl Which {
 struct State {
     status: Arc<Status>,
     redaction: Redaction,
+    /// How many connections the admin listener and the metrics listener
+    /// could not accept.
+    accept_errors: [AtomicU64; 2],
+}
+
+impl State {
+    /// Counts a connection that could not be accepted, and returns how
+    /// many there have been on that listener.
+    fn accept_failed(&self, which: Which) -> u64 {
+        let counter = match which {
+            Which::Admin => &self.accept_errors[0],
+            Which::Metrics => &self.accept_errors[1],
+        };
+        counter.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+    }
+}
+
+/// Whether `text` is a port as a `Host` header writes it.
+fn is_port(text: &str) -> bool {
+    !text.is_empty() && text.len() <= 5 && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Whether `host`, the value of a `Host` header or the authority of a
+/// request target, names this machine as only a program on it can reach
+/// it: `localhost` or a loopback address, with or without a port.
+fn is_loopback_name(host: &str) -> bool {
+    if let Some(rest) = host.strip_prefix('[') {
+        let Some((address, port)) = rest.split_once(']') else {
+            return false;
+        };
+        let port_is_fine = port.is_empty() || port.strip_prefix(':').is_some_and(is_port);
+        return port_is_fine
+            && address
+                .parse::<Ipv6Addr>()
+                .is_ok_and(|address| address.is_loopback());
+    }
+    let name = match host.rsplit_once(':') {
+        Some((name, port)) if is_port(port) => name,
+        Some(_) => return false,
+        None => host,
+    };
+    name.eq_ignore_ascii_case("localhost")
+        || name
+            .parse::<Ipv4Addr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+/// Whether a request is asked under a name that a listener on a loopback
+/// address answers.
+fn asks_this_machine(request: &Request<Incoming>) -> bool {
+    let mut hosts = request.headers().get_all(HOST).iter();
+    let (Some(host), None) = (hosts.next(), hosts.next()) else {
+        return false;
+    };
+    let named_in_header = host.to_str().is_ok_and(is_loopback_name);
+    let named_in_target = request
+        .uri()
+        .authority()
+        .is_none_or(|authority| is_loopback_name(authority.as_str()));
+    named_in_header && named_in_target
 }
 
 /// The two listeners, open and not served yet.
@@ -158,7 +237,11 @@ pub fn bind(
     Ok(Listeners {
         admin: open(admin)?,
         metrics: open(metrics)?,
-        state: Arc::new(State { status, redaction }),
+        state: Arc::new(State {
+            status,
+            redaction,
+            accept_errors: [AtomicU64::new(0), AtomicU64::new(0)],
+        }),
     })
 }
 
@@ -251,6 +334,12 @@ async fn accept(which: Which, listener: Arc<TcpListener>, state: Arc<State>) {
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut connections = JoinSet::new();
     let mut refusals_logged: Option<Instant> = None;
+    let mut failures_logged: Option<Instant> = None;
+    // A listener whose address cannot be told is treated as one on a
+    // loopback address, which answers the fewest.
+    let local_only = listener
+        .local_addr()
+        .map_or(true, |address| address.ip().to_canonical().is_loopback());
 
     loop {
         tokio::select! {
@@ -264,9 +353,23 @@ async fn accept(which: Which, listener: Arc<TcpListener>, state: Arc<State>) {
                 }
             }
             accepted = listener.accept() => {
-                let Ok((stream, _)) = accepted else {
-                    tokio::time::sleep(PAUSE).await;
-                    continue;
+                let stream = match accepted {
+                    Ok((stream, _)) => stream,
+                    Err(error) => {
+                        let failed = state.accept_failed(which);
+                        let now = Instant::now();
+                        if failures_logged.is_none_or(|last| now.duration_since(last) >= REFUSAL_LOG_INTERVAL) {
+                            failures_logged = Some(now);
+                            tracing::warn!(
+                                listener = which.name(),
+                                reason = %error.kind(),
+                                failed,
+                                "a connection for health or metrics could not be accepted"
+                            );
+                        }
+                        tokio::time::sleep(PAUSE).await;
+                        continue;
+                    }
                 };
                 let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
                     drop(stream);
@@ -286,7 +389,11 @@ async fn accept(which: Which, listener: Arc<TcpListener>, state: Arc<State>) {
                 connections.spawn(async move {
                     let _slot = slot;
                     // Whatever the client does, the connection ends in time.
-                    let _ = tokio::time::timeout(CONNECTION_TIMEOUT, serve(which, stream, state)).await;
+                    let _ = tokio::time::timeout(
+                        CONNECTION_TIMEOUT,
+                        serve(which, local_only, stream, state),
+                    )
+                    .await;
                 });
             }
         }
@@ -294,9 +401,16 @@ async fn accept(which: Which, listener: Arc<TcpListener>, state: Arc<State>) {
 }
 
 /// Answers the one request of a connection.
-async fn serve(which: Which, stream: TcpStream, state: Arc<State>) {
+async fn serve(which: Which, local_only: bool, stream: TcpStream, state: Arc<State>) {
     let service = service_fn(move |request: Request<Incoming>| {
-        let response = answer(which, &request, &state);
+        let response = if local_only && !asks_this_machine(&request) {
+            plain(
+                StatusCode::FORBIDDEN,
+                "requests under this name are not answered\n",
+            )
+        } else {
+            answer(which, &request, &state)
+        };
         async move { Ok::<_, Infallible>(response) }
     });
     let mut http = http1::Builder::new();

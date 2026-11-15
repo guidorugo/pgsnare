@@ -433,3 +433,161 @@ async fn a_loop_that_panics_is_counted_and_started_again() {
     supervised.abort();
     let _ = supervised.await;
 }
+
+#[tokio::test]
+async fn a_listener_on_loopback_answers_only_under_a_name_of_this_machine() {
+    let serving = Serving::start();
+    let ask = |address: SocketAddr, target: &str, hosts: &[&str]| {
+        let mut request = format!("GET {target} HTTP/1.1\r\n");
+        for host in hosts {
+            request.push_str(&format!("host: {host}\r\n"));
+        }
+        request.push_str("\r\n");
+        async move { read(&send(address, request.as_bytes()).await) }
+    };
+    let port = serving.metrics.port();
+
+    // Programs on this machine ask under one of these names.
+    for host in [
+        "localhost".to_owned(),
+        "LocalHost".to_owned(),
+        format!("localhost:{port}"),
+        "127.0.0.1".to_owned(),
+        format!("127.0.0.1:{port}"),
+        "127.8.9.10:1".to_owned(),
+        "[::1]".to_owned(),
+        format!("[::1]:{port}"),
+    ] {
+        let answer = ask(serving.metrics, "/metrics", &[&host]).await;
+        assert_eq!(answer.status, 200, "{host}");
+        let answer = ask(serving.admin, "/healthz", &[&host]).await;
+        assert_eq!(
+            (answer.status, answer.body.as_str()),
+            (200, "ok\n"),
+            "{host}"
+        );
+    }
+
+    // Under any other name nothing is said, on either listener: not the
+    // metrics, and not whether a path exists.
+    for host in [
+        "pgsnare.example.com",
+        "pgsnare.example.com:9642",
+        "localhost.example.com",
+        "localhost.",
+        "example.com:localhost",
+        "192.0.2.7",
+        "192.0.2.7:9642",
+        "[2001:db8::1]:9642",
+        "[::1",
+        "[::1]9642",
+        "[::1]:",
+        "::1",
+        "localhost:",
+        "localhost:port",
+        "localhost:123456",
+        "127.0.0.1.example.com",
+        "",
+    ] {
+        for (address, path) in [
+            (serving.metrics, "/metrics"),
+            (serving.admin, "/healthz"),
+            (serving.admin, "/no-such-path"),
+        ] {
+            let answer = ask(address, path, &[host]).await;
+            assert_eq!(
+                (answer.status, answer.body.as_str()),
+                (403, "requests under this name are not answered\n"),
+                "{host} {path}"
+            );
+            assert!(!answer.body.contains("pgsnare_"), "{host}");
+        }
+    }
+
+    // Nor without the header, with two of them, or with a target that
+    // names another host.
+    let answer = ask(serving.metrics, "/metrics", &[]).await;
+    assert!(
+        answer.status == 403 || answer.status == 400,
+        "{}",
+        answer.status
+    );
+    let answer = ask(
+        serving.metrics,
+        "/metrics",
+        &["localhost", "pgsnare.example.com"],
+    )
+    .await;
+    assert!(
+        answer.status == 403 || answer.status == 400,
+        "{}",
+        answer.status
+    );
+    let answer = ask(
+        serving.metrics,
+        "http://pgsnare.example.com/metrics",
+        &["localhost"],
+    )
+    .await;
+    assert!(
+        answer.status == 403 || answer.status == 400,
+        "{}",
+        answer.status
+    );
+    let answer = ask(serving.metrics, "http://localhost/metrics", &["localhost"]).await;
+    assert_eq!(answer.status, 200);
+    let old = send(serving.metrics, b"GET /metrics HTTP/1.0\r\n\r\n").await;
+    assert!(!String::from_utf8_lossy(&old).contains("pgsnare_"));
+}
+
+#[test]
+fn a_name_of_this_machine_is_localhost_or_a_loopback_address() {
+    for name in [
+        "localhost",
+        "LOCALHOST:80",
+        "127.0.0.1",
+        "127.255.255.254:65535",
+        "[::1]",
+        "[::1]:9641",
+    ] {
+        assert!(is_loopback_name(name), "{name}");
+    }
+    for name in [
+        "",
+        ":",
+        "localhost:",
+        ":80",
+        "localhost:0x50",
+        "localhost:-1",
+        "local host",
+        "localhost\t",
+        " localhost",
+        "0.0.0.0",
+        "128.0.0.1",
+        "[::]",
+        "[::ffff:127.0.0.1]",
+        "[127.0.0.1]",
+        "::1",
+        "[::1]x",
+        "[::1]:x",
+        "user@localhost",
+        "localhost/",
+        "127.1",
+    ] {
+        assert!(!is_loopback_name(name), "{name:?}");
+    }
+}
+
+#[test]
+fn a_connection_that_cannot_be_accepted_is_counted_for_its_listener() {
+    let state = State {
+        status: Arc::new(Status::new()),
+        redaction: Redaction::default(),
+        accept_errors: [AtomicU64::new(0), AtomicU64::new(0)],
+    };
+    assert_eq!(state.accept_failed(Which::Admin), 1);
+    assert_eq!(state.accept_failed(Which::Admin), 2);
+    assert_eq!(state.accept_failed(Which::Metrics), 1);
+    assert_eq!(state.accept_errors[0].load(Ordering::Relaxed), 2);
+    assert_eq!(state.accept_errors[1].load(Ordering::Relaxed), 1);
+}
