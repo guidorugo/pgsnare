@@ -66,7 +66,7 @@
 //!
 //! A connection that cannot be accepted, as when the process has run out
 //! of file descriptors, is counted for its listener and logged with that
-//! count, at most once in [`REFUSAL_LOG_INTERVAL`].
+//! count, at most once in ten seconds.
 
 use std::convert::Infallible;
 use std::future::Future;
