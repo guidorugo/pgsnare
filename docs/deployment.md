@@ -44,6 +44,17 @@ docker run --detach --name pgsnare \
     "$PGSNARE_IMAGE"
 ```
 
+**With SQL rules, give it more memory.** The 256 MiB above are for a configuration without a `rules` section. The parser of the rules can take about 1,500 times the size of a statement while it reads it, on two threads at once, and a client that is logged in chooses the statements. Add 3,000 times `rules.max_parse_bytes` to the limit:
+
+| `rules.max_parse_bytes` | Worst case of the parser | Memory limit |
+|---|---|---|
+| no `rules` section | none | 256 MiB |
+| `64KiB`, the default | about 188 MiB | 512 MiB (`--memory 512m`) |
+| `128KiB` | about 375 MiB | 640 MiB |
+| `1MiB`, the largest accepted | about 3 GiB | 3.3 GiB |
+
+With less, such statements can get the process ended for lack of memory, and every session with it. `pgsnare config check` warns when the worst case of the parser is above 256 MiB, which is what a limit of 512 MiB leaves for it. The factor was measured once, with statements made to be expensive, in a build for glibc; it was not measured in the image, which uses the allocator of musl. The same holds for the sidecar manifests, whose limit of `256Mi` is for a configuration without rules. The Helm chart cannot set rules yet.
+
 - Publish the client port on one address of the machine, the one the applications reach, and nothing else. The admin (`9641`) and metrics (`9642`) listeners stay on loopback inside the container and are not published.
 - `--read-only` is enough with the `stdout` sink. A `file` sink needs a volume that only pgsnare can write.
 - The volume `pgsnare-config` must hold the configuration, the token files, the certificate and key, and the signing keys, each owned by `65532` and closed to others. The [Compose example](../examples/compose/README.md) shows one way to make such a volume without a root container at run time.
