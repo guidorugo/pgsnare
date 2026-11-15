@@ -127,10 +127,7 @@ async fn a_running_proxy_answers_its_health_check_and_serves_its_metrics() {
         number("pgsnare_parse_failures_total{reason=\"rejected\"}"),
         0.0
     );
-    assert_eq!(
-        number("pgsnare_parse_failures_total{reason=\"busy\"}"),
-        0.0
-    );
+    assert_eq!(number("pgsnare_parse_failures_total{reason=\"busy\"}"), 0.0);
     assert_eq!(number("pgsnare_parser_busy_total"), 0.0);
     assert_eq!(number("pgsnare_reload_failures_total"), 0.0);
     // What the endpoint does not show: who connected.
