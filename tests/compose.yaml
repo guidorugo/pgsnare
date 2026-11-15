@@ -279,6 +279,7 @@ services:
       # tests/bait/check.sh.
       - ${ITEST_BINARY:?run the tests with make itest}:/usr/local/bin/pgsnare:ro
       - ./bait:/bait:ro
+      - ./corpus:/corpus:ro
       - ./differential:/differential:ro
       - ./login:/login:ro
       - state:/state:ro

@@ -27,6 +27,13 @@
 #     no rows and its event says alert), a reload under the running process
 #     by SIGHUP, by a change of the file and with a broken file, and a hit
 #     that reaches a webhook within 2 seconds.
+#   - The detection corpus, against each database: every way of reading a
+#     honeytoken in tests/corpus/cases, over the simple protocol and over
+#     the extended protocol with text and with binary results, with a token
+#     that alerts and with one that kills. A case labelled as a hit must
+#     raise its event, and with kill no form of the value may reach the
+#     client; a case labelled as a known gap must raise none. See
+#     tests/corpus/run.sh.
 #   - A statement that calls a function from the list of the SQL rules
 #     (`pg_sleep`, with `kill`) is ended before it reaches the database,
 #     also when its text hides the name, and a rule_hit event names the rule.
@@ -946,6 +953,14 @@ for version in $versions; do
     echo "DROP TABLE IF EXISTS itest_kill_ext, itest_tarpit, itest_fake, itest_hook;" \
         | psql_live "$(direct "$version")" >/dev/null 2>&1 || true
 done
+
+# --- The detection corpus -------------------------------------------------------
+
+echo "itest: the detection corpus, against PostgreSQL $versions"
+# shellcheck disable=SC2086
+if ! DOCKER="$docker" ITEST_PROJECT="$project" tests/corpus/run.sh "$live" $versions; then
+    failed=1
+fi
 "$docker" rm --force "$live" >/dev/null 2>&1 || true
 
 # --- A statement that sets off a rule ------------------------------------------

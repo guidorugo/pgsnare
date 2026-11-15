@@ -1,0 +1,5 @@
+-- label: hit
+-- describe: A full dump with pg_dump that writes rows as INSERT statements, which reads tables through a cursor.
+-- needs: pg_dump
+-- arguments: --inserts
+-- modes: simple

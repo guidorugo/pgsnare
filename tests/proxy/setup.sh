@@ -152,9 +152,13 @@ verified="{ mode: verify-full, ca: /state/certs/ca.crt }"
     done
     echo "rules:"
     echo "  functions: { names: [pg_sleep], actions: [alert, kill], listeners: [$scoped] }"
+    # The rule cases of the detection corpus (tests/corpus) use this one too.
+    echo "  catalog_enumeration: { actions: [alert], listeners: [$scoped] }"
     # The tokens from itest-kill-ext on are those of the responses read
     # against real databases; tests/itest.sh names them. The tarpit is
-    # short, so that its limits are reached within the run.
+    # short, so that its limits are reached within the run. The tokens
+    # corpus-* are those of the detection corpus: tests/corpus/client.sh has
+    # the same values. Two of them are written as a UUID.
     cat <<'REST'
 tokens:
   - id: itest-alert
@@ -173,6 +177,16 @@ tokens:
     actions: [fake_data]
   - id: itest-hook
     values: ["itest-bait-hook-90e5c3"]
+  - id: corpus-alert
+    values: ["corpus-bait-alert-c41f07e9"]
+  - id: corpus-kill
+    values: ["corpus-bait-kill-8d2b56a3"]
+    actions: [kill]
+  - id: corpus-typed-alert
+    values: ["7c1e4b02-93a5-4d6f-8e17-5ab0c3d2f619"]
+  - id: corpus-typed-kill
+    values: ["e85d0a34-1f7b-4c29-b6e0-92d4718a3c5f"]
+    actions: [kill]
 token_files:
   - reload/tokens.yaml
 actions:
