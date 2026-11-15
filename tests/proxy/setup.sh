@@ -152,6 +152,9 @@ verified="{ mode: verify-full, ca: /state/certs/ca.crt }"
     done
     echo "rules:"
     echo "  functions: { names: [pg_sleep], actions: [alert, kill], listeners: [$scoped] }"
+    # The tokens from itest-kill-ext on are those of the responses read
+    # against real databases; tests/itest.sh names them. The tarpit is
+    # short, so that its limits are reached within the run.
     cat <<'REST'
 tokens:
   - id: itest-alert
@@ -159,13 +162,41 @@ tokens:
   - id: itest-kill
     values: ["itest-bait-kill-7e20a9"]
     actions: [kill]
+  - id: itest-kill-ext
+    values: ["itest-bait-killext-3f6b91"]
+    actions: [kill]
+  - id: itest-tarpit
+    values: ["itest-bait-tarpit-a4d702"]
+    actions: [tarpit]
+  - id: itest-fake
+    values: ["itest-bait-fake-41ac0e"]
+    actions: [fake_data]
+  - id: itest-hook
+    values: ["itest-bait-hook-90e5c3"]
+token_files:
+  - reload/tokens.yaml
+actions:
+  tarpit: { delay: 2s-3s, max_duration: 10s, max_sessions: 1 }
+  fake_data: { rows: 3 }
 events:
   sinks:
     - type: stdout
+    # The receiver is a container on the internal network of the run, so
+    # plain HTTP is accepted here: see tests/hook/receiver.pl.
+    - type: webhook
+      url: http://receiver:8080/pgsnare
+      hmac_secret_file: /state/config/hook.key
+      allow_insecure_http: true
 shutdown:
   grace_period: 10s
 REST
 } > "$config"
+
+# The signing key of the webhook, for this run only.
+od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$state/config/hook.key"
+
+# The token file the reload checks change while pgsnare runs.
+"$(dirname "$0")/reload.sh" initial
 
 # --- Files that are open to other users --------------------------------------
 #

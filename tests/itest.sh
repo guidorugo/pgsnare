@@ -19,6 +19,14 @@
 #     command is also run without a network and without a place to write.
 #   - `pgsnare config check`. It must pass the configuration pgsnare runs
 #     with, and refuse the ones pgsnare refuses to start with.
+#   - The responses against each database: kill over the extended protocol
+#     in text and in binary format (no byte of the value reaches the client
+#     and the backend is gone), tarpit (each answer is held back at least
+#     the shortest delay, and both of its limits end a session), fake_data
+#     (the rows parse and the command tag counts them; a binary result gets
+#     no rows and its event says alert), a reload under the running process
+#     by SIGHUP, by a change of the file and with a broken file, and a hit
+#     that reaches a webhook within 2 seconds.
 #   - A statement that calls a function from the list of the SQL rules
 #     (`pg_sleep`, with `kill`) is ended before it reaches the database,
 #     also when its text hides the name, and a rule_hit event names the rule.
@@ -81,7 +89,7 @@ compose() {
 
 cleanup() {
     # The containers that were started under a name of their own.
-    "$docker" rm --force "$project-open-files" "$project-watcher" >/dev/null 2>&1 || true
+    "$docker" rm --force "$project-open-files" "$project-watcher" "$project-live" >/dev/null 2>&1 || true
     compose --profile client --profile setup --profile offline down --volumes --remove-orphans >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -201,7 +209,7 @@ compose --profile setup run --rm --no-deps -T setup
 # starts, and the volumes with their sockets must be theirs.
 echo "itest: starting PostgreSQL $versions"
 # shellcheck disable=SC2086
-if ! compose up --detach --wait --wait-timeout 180 $services pglegacy; then
+if ! compose up --detach --wait --wait-timeout 180 $services pglegacy receiver; then
     echo "itest: FAILED: the databases did not start" >&2
     exit 1
 fi
@@ -508,6 +516,435 @@ until logged "$(field kind token_hit)" "$(field token_id itest-kill)"; do
     sleep 0.2
 done
 psql_as "$(direct "$first")" --command "DROP TABLE itest_bait, itest_bait_kill" >/dev/null 2>&1 || true
+
+# --- The responses against real databases --------------------------------------
+#
+# kill over the extended protocol, tarpit, fake_data, a reload under the
+# running process, and a hit delivered to a webhook. Everything that
+# measures time runs in one client container that stays up, so that the
+# start of a container is never part of what is measured. The tokens are
+# those of tests/proxy/setup.sh.
+
+echo "itest: the responses, against PostgreSQL $versions"
+live="$project-live"
+compose --profile client run --detach --no-deps --name "$live" \
+    --entrypoint sleep client 1800 >/dev/null
+receiver="$(compose ps --quiet receiver)"
+killed_text="terminating connection due to administrator command"
+
+# in_live COMMAND ARGUMENTS...: runs a command in that client.
+in_live() {
+    "$docker" exec "$live" "$@"
+}
+
+# psql_live CONNINFO: runs the statements on standard input with psql in
+# that client.
+psql_live() {
+    "$docker" exec -i "$live" psql --no-psqlrc --no-password --quiet \
+        --tuples-only --no-align --dbname "$1 dbname=postgres"
+}
+
+# backends VERSION CONDITION: how many backends of PostgreSQL VERSION that
+# meet CONDITION pg_stat_activity shows.
+backends() {
+    echo "SELECT count(*) FROM pg_stat_activity WHERE $2;" \
+        | psql_live "$(direct "$1")" 2>/dev/null
+}
+
+# await_backends VERSION CONDITION COUNT: waits up to 10 seconds until
+# COUNT backends meet CONDITION.
+await_backends() {
+    tries=0
+    until [ "$(backends "$1" "$2")" = "$3" ]; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 50 ]; then
+            return 1
+        fi
+        sleep 0.2
+    done
+}
+
+# hits TOKEN_ID: how many token_hit events for TOKEN_ID pgsnare has logged.
+hits() {
+    compose logs --no-log-prefix pgsnare 2>&1 | grep -F "$(field kind token_hit)" \
+        | grep -cF "$(field token_id "$1")" || true
+}
+
+# await_hits TOKEN_ID COUNT: waits up to 10 seconds until there are COUNT.
+await_hits() {
+    tries=0
+    until [ "$(hits "$1")" -ge "$2" ]; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 50 ]; then
+            return 1
+        fi
+        sleep 0.2
+    done
+}
+
+# taken TOKEN_ID: the action_taken of the last token_hit event for TOKEN_ID.
+taken() {
+    compose logs --no-log-prefix pgsnare 2>&1 | grep -F "$(field kind token_hit)" \
+        | grep -F "$(field token_id "$1")" | tail -n 1 \
+        | sed -n 's/.*"action_taken":\(\[[^]]*\]\).*/\1/p'
+}
+
+# hex TEXT: TEXT in lowercase hexadecimal, as wire.pl prints a message.
+hex() {
+    printf '%s' "$1" | od -An -tx1 | tr -d ' \n'
+}
+
+# leaks OUTPUT VALUE: whether OUTPUT holds VALUE as it is written, in
+# hexadecimal of either case, or in base64.
+leaks() {
+    lower="$(hex "$2")"
+    upper="$(echo "$lower" | tr 'a-f' 'A-F')"
+    encoded="$(printf '%s' "$2" | base64 | tr -d '\n')"
+    for form in "$2" "$lower" "$upper" "$encoded"; do
+        if printf '%s' "$1" | grep -qF -- "$form"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ext_text CONNINFO / ext_binary CONNINFO: read the kill token over the
+# extended protocol, with a text result (psql's \bind) and with a binary
+# one (wire.pl). Each prints the process id of its backend first.
+ext_text() {
+    printf '%s\n' 'SELECT pg_backend_pid();' \
+        'SELECT v FROM itest_kill_ext WHERE v <> $1 \bind itest-none \g' \
+        | psql_live "$1"
+}
+ext_binary() {
+    in_live perl /differential/wire.pl "$1 dbname=postgres" extended \
+        "SELECT v FROM itest_kill_ext" binary
+}
+
+killext_value="itest-bait-killext-3f6b91"
+expected_hits=0
+for version in $versions; do
+    if ! printf '%s\n' \
+        "CREATE TABLE itest_kill_ext (v text);" \
+        "INSERT INTO itest_kill_ext VALUES ('$killext_value');" \
+        "CREATE TABLE itest_tarpit (v text);" \
+        "INSERT INTO itest_tarpit VALUES ('itest-bait-tarpit-a4d702');" \
+        "CREATE TABLE itest_fake (id int4, name text, code varchar(12), ref uuid);" \
+        "INSERT INTO itest_fake VALUES (1, 'itest-bait-fake-41ac0e', 'alpha', gen_random_uuid()), (2, 'second', 'bravo-two', gen_random_uuid()), (3, 'third', 'charlie', gen_random_uuid());" \
+        "CREATE TABLE itest_hook (v text);" \
+        "INSERT INTO itest_hook VALUES ('itest-bait-hook-90e5c3');" \
+        | psql_live "$(direct "$version")" >/dev/null; then
+        echo "itest: FAILED: the tables of the responses could not be made in PostgreSQL $version" >&2
+        failed=1
+    fi
+done
+
+# The search for the value must find it where it is: PostgreSQL itself
+# sends it in both forms.
+for form in text binary; do
+    output="$("ext_$form" "$(direct "$first")" 2>&1)" || true
+    if ! leaks "$output" "$killext_value"; then
+        echo "itest: FAILED: the search for a value does not find it in the $form result of PostgreSQL itself:" >&2
+        echo "$output" | sed 's/^/    /' >&2
+        failed=1
+    fi
+done
+
+echo "itest: kill over the extended protocol, in text and in binary format"
+for version in $versions; do
+    for form in text binary; do
+        status=0
+        output="$("ext_$form" "$(proxied "$version")" 2>&1)" || status=$?
+        backend="$(echo "$output" | sed -n 's/^\(backend \)\{0,1\}\([0-9][0-9]*\)$/\2/p' | head -n 1)"
+        said="$killed_text"
+        if [ "$form" = binary ]; then
+            said="$(hex "$killed_text")"
+        fi
+        if [ "$status" -eq 0 ] || [ -z "$backend" ] \
+            || ! echo "$output" | grep -qF "$said" \
+            || leaks "$output" "$killext_value"; then
+            echo "itest: FAILED: a session that read a kill token over the extended protocol ($form, PostgreSQL $version) was not ended with the error, or got a form of the value (exit status $status):" >&2
+            echo "$output" | sed 's/^/    /' >&2
+            failed=1
+        elif ! await_backends "$version" "pid = $backend" 0; then
+            echo "itest: FAILED: the backend of a killed session ($form, PostgreSQL $version) was still there 10 seconds later" >&2
+            failed=1
+        fi
+        expected_hits=$((expected_hits + 1))
+    done
+done
+if ! await_hits itest-kill-ext "$expected_hits"; then
+    echo "itest: FAILED: $(hits itest-kill-ext) token_hit events for the kill token over the extended protocol, expected $expected_hits" >&2
+    failed=1
+fi
+
+echo "itest: tarpit: each answer is held back, and both limits end a session"
+for version in $versions; do
+    name="itest-tarpit-$version"
+    before="$(hits itest-tarpit)"
+    timed="$(mktemp)"
+    # The first session holds the only place in the tarpit until its
+    # longest time (10 seconds) is over; its last statement would take a
+    # minute.
+    (
+        printf '%s\n' '\timing on' 'SELECT pg_backend_pid();' \
+            'SELECT v FROM itest_tarpit;' "SELECT 'itest-tarpit-after';" \
+            'SELECT pg_sleep(60) AS itest_tarpit_wait;' \
+            | "$docker" exec -i "$live" sh -c '
+                started=$(date +%s%N)
+                status=0
+                psql --no-psqlrc --no-password --quiet --tuples-only --no-align \
+                    --dbname "$1" 2>&1 || status=$?
+                echo "itest-ended $(( ($(date +%s%N) - started) / 1000000 )) $status"' \
+                sh "$(proxied "$version") dbname=postgres application_name=$name"
+    ) >"$timed" 2>&1 &
+    held=$!
+    if ! await_backends "$version" "application_name = '$name'" 1 \
+        || ! await_hits itest-tarpit "$((before + 1))"; then
+        echo "itest: FAILED: the session to be tarpitted (PostgreSQL $version) did not start, or its hit was not reported" >&2
+        failed=1
+    else
+        # A second session while the place is taken is killed at once.
+        status=0
+        output="$(echo 'SELECT v FROM itest_tarpit;' | psql_live "$(proxied "$version")" 2>&1)" || status=$?
+        if [ "$status" -eq 0 ] || ! echo "$output" | grep -qF "$killed_text" \
+            || leaks "$output" itest-bait-tarpit-a4d702; then
+            echo "itest: FAILED: a session to be tarpitted while the tarpit was full (PostgreSQL $version) was not killed (exit status $status):" >&2
+            echo "$output" | sed 's/^/    /' >&2
+            failed=1
+        fi
+    fi
+    wait "$held" || true
+    # psql's own times, in whole milliseconds: before the hit, the hit,
+    # and the statement after it.
+    times="$(sed -n 's/^Time: \([0-9][0-9]*\).*/\1/p' "$timed" | tr '\n' ' ')"
+    ended="$(sed -n 's/^itest-ended \([0-9][0-9]*\) \([0-9][0-9]*\)$/\1 \2/p' "$timed")"
+    set -- $times 0 0 0
+    took="${ended% *}"
+    if [ -z "$ended" ] || [ "$1" -ge 2000 ] || [ "$2" -lt 2000 ] || [ "$3" -lt 2000 ] \
+        || [ "$took" -lt 9000 ] || [ "$took" -ge 40000 ] || [ "${ended#* }" -eq 0 ] \
+        || ! grep -qF "$killed_text" "$timed"; then
+        echo "itest: FAILED: the tarpitted session (PostgreSQL $version) was not held back at least 2 s per answer, or was not killed after 10 s (times in ms: $times; ended after ms, status: $ended):" >&2
+        sed 's/^/    /' "$timed" >&2
+        failed=1
+    else
+        echo "itest: PostgreSQL $version: answers in the tarpit took $2 and $3 ms, the session ended after $took ms"
+    fi
+    rm -f "$timed"
+    if ! await_backends "$version" "application_name = '$name'" 0; then
+        echo "itest: FAILED: the backend of the tarpitted session (PostgreSQL $version) was not released" >&2
+        failed=1
+    fi
+done
+
+echo "itest: fake_data: the rows parse and the tag counts them; a binary result falls back"
+fake_row='^-?[0-9]{1,10}\|[^|]*\|[^|]{0,12}\|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
+for version in $versions; do
+    before="$(hits itest-fake)"
+    status=0
+    output="$(printf '%s\n' 'SELECT id, name, code, ref FROM itest_fake;' \
+        '\echo itest-tag :ROW_COUNT' | psql_live "$(proxied "$version")" 2>&1)" || status=$?
+    rows="$(echo "$output" | grep -v '^itest-tag ' || true)"
+    tag="$(echo "$output" | sed -n 's/^itest-tag \([0-9][0-9]*\)$/\1/p')"
+    total="$(echo "$rows" | grep -c . || true)"
+    good="$(echo "$rows" | grep -cE "$fake_row" || true)"
+    ids="$(echo "$rows" | cut -d '|' -f 1 | sort -u | grep -c . || true)"
+    # Three rows of the table and the three the settings add.
+    if [ "$status" -ne 0 ] || [ "$total" -ne 6 ] || [ "$tag" != "$total" ] \
+        || [ "$good" -ne 6 ] || [ "$ids" -ne 6 ]; then
+        echo "itest: FAILED: fake_data in a text result (PostgreSQL $version): expected 6 well-formed rows with distinct ids and a tag that counts them (exit status $status, $total rows, $good well-formed, $ids ids, tag ${tag:-none}):" >&2
+        echo "$output" | sed 's/^/    /' >&2
+        failed=1
+    fi
+    if ! await_hits itest-fake "$((before + 1))" || [ "$(taken itest-fake)" != '["fake_data"]' ]; then
+        echo "itest: FAILED: the event of fake_data in a text result (PostgreSQL $version) does not say fake_data: $(taken itest-fake)" >&2
+        failed=1
+    fi
+
+    before="$(hits itest-fake)"
+    status=0
+    output="$(in_live perl /differential/wire.pl "$(proxied "$version") dbname=postgres" \
+        extended 'SELECT id, name, code, ref FROM itest_fake' binary 2>&1)" || status=$?
+    if [ "$status" -ne 0 ] || [ "$(echo "$output" | grep -c '^D ')" -ne 3 ] \
+        || ! echo "$output" | grep -qxF "C $(hex 'SELECT 3')00"; then
+        echo "itest: FAILED: a binary result with a fake_data token (PostgreSQL $version) did not pass unchanged (exit status $status):" >&2
+        echo "$output" | sed 's/^/    /' >&2
+        failed=1
+    fi
+    if ! await_hits itest-fake "$((before + 1))" || [ "$(taken itest-fake)" != '["alert"]' ]; then
+        echo "itest: FAILED: the event of a binary result with a fake_data token (PostgreSQL $version) does not say alert: $(taken itest-fake)" >&2
+        failed=1
+    fi
+done
+
+echo "itest: a hit must reach the webhook within 2 seconds"
+# deliveries: how many token_hit events for itest-hook the receiver got.
+deliveries() {
+    "$docker" logs "$receiver" 2>&1 | grep -c ' token_hit itest-hook ' || true
+}
+for version in $versions; do
+    before="$(deliveries)"
+    status=0
+    # The time is taken in the client just before psql starts, so the
+    # delay measured includes the login and the whole statement.
+    output="$(echo 'SELECT v FROM itest_hook;' | "$docker" exec -i "$live" sh -c '
+        date +%s.%N
+        exec psql --no-psqlrc --no-password --quiet --tuples-only --no-align --dbname "$1"' \
+        sh "$(proxied "$version") dbname=postgres" 2>&1)" || status=$?
+    started="$(echo "$output" | sed -n 1p)"
+    if [ "$status" -ne 0 ] || ! echo "$output" | grep -qxF itest-bait-hook-90e5c3; then
+        echo "itest: FAILED: the read for the webhook (PostgreSQL $version) did not get its row (exit status $status)" >&2
+        failed=1
+        continue
+    fi
+    tries=0
+    until [ "$(deliveries)" -gt "$before" ]; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 50 ]; then
+            break
+        fi
+        sleep 0.2
+    done
+    arrived="$("$docker" logs "$receiver" 2>&1 | grep ' token_hit itest-hook ' | sed -n "$((before + 1))p")"
+    at="$(echo "$arrived" | cut -d ' ' -f 2)"
+    delay="$(awk -v from="$started" -v to="${at:-0}" 'BEGIN { printf "%.3f", to - from }')"
+    if [ -z "$arrived" ] || [ "$(echo "$arrived" | cut -d ' ' -f 5)" != signed ] \
+        || ! awk -v delay="$delay" 'BEGIN { exit !(delay >= 0 && delay <= 2) }'; then
+        echo "itest: FAILED: the hit (PostgreSQL $version) did not reach the webhook signed within 2 seconds (${arrived:-nothing arrived}; $delay s)" >&2
+        failed=1
+    else
+        echo "itest: PostgreSQL $version: the hit reached the webhook $delay s after the client started"
+    fi
+done
+
+echo "itest: a reload under the running process: by SIGHUP, by a change of the file, and a broken file"
+# reload STAGE: changes the token file: tests/proxy/reload.sh.
+reload() {
+    compose --profile setup run --rm --no-deps -T --entrypoint /proxy/reload.sh setup "$1"
+}
+# to_session STATEMENT: sends a line to the session that stays open.
+to_session() {
+    "$docker" exec "$live" sh -c 'printf "%s\n" "$1" > /tmp/reload.in' sh "$1"
+}
+# probe TOKEN_ID VALUE: sends VALUE on the open session four times a
+# second, for 6 seconds at most, until a token_hit names TOKEN_ID.
+probe() {
+    tries=0
+    while [ "$tries" -lt 24 ]; do
+        to_session "SELECT '$2' AS itest_probe;"
+        sleep 0.25
+        tries=$((tries + 1))
+        if [ "$((tries % 4))" -eq 0 ] && [ "$(hits "$1")" -gt 0 ]; then
+            return 0
+        fi
+    done
+    [ "$(hits "$1")" -gt 0 ]
+}
+# first_hit TOKEN_ID: when the first token_hit for TOKEN_ID reached the log,
+# in seconds since the epoch, by the clock of the containers.
+first_hit() {
+    stamp="$("$docker" logs --timestamps "$proxy" 2>&1 | grep -F "$(field kind token_hit)" \
+        | grep -F "$(field token_id "$1")" | head -n 1 | cut -d ' ' -f 1)"
+    if [ -n "$stamp" ]; then
+        in_live date -d "$stamp" +%s.%N
+    fi
+}
+# within FROM TO: whether TO is at most 3 seconds after FROM.
+within() {
+    awk -v from="${1:-0}" -v to="${2:-0}" 'BEGIN { d = to - from; exit !(from > 0 && d >= 0 && d <= 3) }'
+}
+reload_failures() {
+    compose logs --no-log-prefix pgsnare 2>&1 \
+        | grep -F "the configuration could not be reloaded" \
+        | grep -cF "$(field file /state/config/reload/tokens.yaml)" || true
+}
+
+in_live mkfifo /tmp/reload.in
+"$docker" exec -d "$live" sh -c 'exec sleep 900 > /tmp/reload.in'
+"$docker" exec -d "$live" sh -c 'exec psql --no-psqlrc --no-password --quiet --tuples-only --no-align --dbname "$1" < /tmp/reload.in > /tmp/reload.out 2>&1' \
+    sh "$(proxied "$first") dbname=postgres application_name=itest-reload"
+if ! await_backends "$first" "application_name = 'itest-reload'" 1; then
+    echo "itest: FAILED: the session that is to stay open across the reloads did not start" >&2
+    failed=1
+else
+    to_session "SELECT 'itest-reload-' || pg_backend_pid();"
+
+    # SIGHUP. The change is one the watch cannot see, which the first
+    # probe proves: it must not be detected before the signal.
+    if ! reload signal; then
+        echo "itest: FAILED: the token file could not be changed" >&2
+        failed=1
+    fi
+    sleep 3
+    to_session "SELECT 'itest-bait-reload-signal-d81f4a' AS itest_probe;"
+    sleep 1
+    if [ "$(hits itest-reload-signal)" -ne 0 ]; then
+        echo "itest: FAILED: a change the watch of the files cannot see was in force before SIGHUP, so the check of SIGHUP proves nothing" >&2
+        failed=1
+    fi
+    sent="$(in_live date +%s.%N)"
+    "$docker" kill --signal HUP "$proxy" >/dev/null
+    if ! probe itest-reload-signal itest-bait-reload-signal-d81f4a \
+        || ! within "$sent" "$(first_hit itest-reload-signal)" \
+        || ! logged "received SIGHUP"; then
+        echo "itest: FAILED: a token added before SIGHUP was not detected on the open session within 3 seconds (signal at $sent, hit at $(first_hit itest-reload-signal))" >&2
+        failed=1
+    fi
+
+    # A change of the file, without a signal.
+    to_session "SELECT 'itest-bait-reload-watch-37b09e' AS itest_probe;"
+    sleep 1
+    if [ "$(hits itest-reload-watch)" -ne 0 ]; then
+        echo "itest: FAILED: a token was detected before it was added to the file" >&2
+        failed=1
+    fi
+    changed="$(reload watch)" || changed=""
+    if ! probe itest-reload-watch itest-bait-reload-watch-37b09e \
+        || ! within "$changed" "$(first_hit itest-reload-watch)"; then
+        echo "itest: FAILED: a token added to the file was not detected on the open session within 3 seconds (changed at ${changed:-unknown}, hit at $(first_hit itest-reload-watch))" >&2
+        failed=1
+    fi
+
+    # A broken file: logged, and the policy in force stays.
+    before="$(reload_failures)"
+    reload broken || true
+    tries=0
+    until [ "$(reload_failures)" -gt "$before" ]; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 50 ]; then
+            echo "itest: FAILED: pgsnare did not log that the broken token file could not be reloaded" >&2
+            failed=1
+            break
+        fi
+        sleep 0.2
+    done
+    output="$(echo "SELECT 'itest-bait-reload-base-6c2e17' AS itest_probe;" | psql_live "$(proxied "$first")" 2>&1)" || true
+    if ! await_hits itest-reload-base 1; then
+        echo "itest: FAILED: after a broken token file the tokens in force were no longer detected" >&2
+        failed=1
+    fi
+
+    # The session was the same one all along.
+    to_session "SELECT 'itest-reload-' || pg_backend_pid();"
+    to_session '\q'
+    if ! await_backends "$first" "application_name = 'itest-reload'" 0; then
+        echo "itest: FAILED: the open session did not end when it was told to" >&2
+        failed=1
+    fi
+    output="$(in_live cat /tmp/reload.out 2>&1)" || true
+    if [ "$(echo "$output" | grep -c '^itest-reload-[0-9][0-9]*$')" -ne 2 ] \
+        || [ "$(echo "$output" | grep '^itest-reload-[0-9][0-9]*$' | sort -u | grep -c .)" -ne 1 ]; then
+        echo "itest: FAILED: the session that was open across the reloads was dropped or replaced:" >&2
+        echo "$output" | sed 's/^/    /' >&2
+        failed=1
+    fi
+fi
+
+for version in $versions; do
+    echo "DROP TABLE IF EXISTS itest_kill_ext, itest_tarpit, itest_fake, itest_hook;" \
+        | psql_live "$(direct "$version")" >/dev/null 2>&1 || true
+done
+"$docker" rm --force "$live" >/dev/null 2>&1 || true
 
 # --- A statement that sets off a rule ------------------------------------------
 
