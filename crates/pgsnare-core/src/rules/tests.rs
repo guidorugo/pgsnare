@@ -763,8 +763,35 @@ fn the_normalised_text_holds_no_constant() {
     assert!(wide.fingerprint().is_some() && wide.covers(&limits));
     let long = padded(MAX_NORMALISE_INPUT_BYTES + 1);
     let long = read(&long);
-    assert_eq!(long.normalised(), None);
+    assert_eq!((long.normalised(), long.fingerprint()), (None, None));
     assert!(long.covers(&limits));
+}
+
+#[test]
+fn the_deepest_statement_that_is_read_gets_its_fingerprint() {
+    // The fingerprint walks the tree outside the error handling of the C
+    // library, so it must only see a tree the parse and the decoder
+    // accepted. Around the deepest nesting they accept, a statement either
+    // has no analysis or has one with its fingerprint, and the thread
+    // survives both.
+    let limits = Limits::default().normalised(true);
+    let (mut fine, mut refused) = (0, 0);
+    for depth in 20..=120 {
+        let text = format!("SELECT 1{}", "+1".repeat(depth));
+        match try_read(text.as_bytes(), limits) {
+            Ok(analysis) => {
+                assert_eq!(refused, 0, "{depth}");
+                assert!(analysis.fingerprint().is_some(), "{depth}");
+                fine += 1;
+            }
+            Err(reason) => {
+                assert_eq!(reason, ParseFailure::TooDeep, "{depth}");
+                refused += 1;
+            }
+        }
+    }
+    assert!(fine > 0 && refused > 0, "{fine} read, {refused} refused");
+    assert!(try_read(b"SELECT 1", limits).is_ok());
 }
 
 #[test]

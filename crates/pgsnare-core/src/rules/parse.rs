@@ -66,9 +66,20 @@ pub fn analyse(
         } else {
             None
         };
-        let fingerprint = pg_query::fingerprint(text, 0, 0)
-            .ok()
-            .map(|fingerprint| fingerprint.value);
+        // The fingerprint is taken only here, after `parse` has read the
+        // same text and its tree went through the decoder, which stops at a
+        // nesting the fingerprint's walk of the tree is safe at: unlike
+        // the parse and the normalising, that walk runs outside the error
+        // handling of the C library and checks no stack depth, and an
+        // error raised there would end the process. It is taken only for
+        // a text that is also normalised: an event shows the two together.
+        let fingerprint = if text.len() <= MAX_NORMALISE_INPUT_BYTES {
+            pg_query::fingerprint(text, 0, 0)
+                .ok()
+                .map(|fingerprint| fingerprint.value)
+        } else {
+            None
+        };
         analysis.set_normalised(normalised, fingerprint);
     }
     analysis.shrink();
