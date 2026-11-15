@@ -82,6 +82,8 @@ mod backend;
 mod entropy;
 mod events;
 mod listener;
+#[cfg(feature = "rules")]
+pub mod parser;
 pub mod permissions;
 mod session;
 mod status;
@@ -89,7 +91,9 @@ mod stream;
 
 pub use backend::Upstream;
 pub use entropy::OsEntropy;
-pub use status::{Counters, DropReason, Histogram, HitCounters, SinkCounters, SinkStatus, Status};
+pub use status::{
+    Counters, DropReason, Histogram, HitCounters, ParserCounters, SinkCounters, SinkStatus, Status,
+};
 
 use backend::Connector;
 use events::{EventSettings, Events};
@@ -198,6 +202,15 @@ pub struct Settings {
     /// What removes from events what must not be shown: honeytoken values
     /// above all. The default knows nothing to remove.
     pub redaction: Redaction,
+    /// The threads that analyse statements for the SQL rules. Without
+    /// them every statement the rules apply to counts as one the parser
+    /// was too busy for.
+    #[cfg(feature = "rules")]
+    pub parser: Option<Arc<parser::ParserPool>>,
+    /// How long a session waits for the analysis of a statement before the
+    /// statement counts as one without an analysis.
+    #[cfg(feature = "rules")]
+    pub analysis_deadline: Duration,
 }
 
 impl Settings {
@@ -211,7 +224,27 @@ impl Settings {
             event_capacity: DEFAULT_EVENT_CAPACITY,
             dedup_window: crate::config::DEFAULT_DEDUP_WINDOW,
             redaction: Redaction::default(),
+            #[cfg(feature = "rules")]
+            parser: None,
+            #[cfg(feature = "rules")]
+            analysis_deadline: parser::DEFAULT_ANALYSIS_DEADLINE,
         }
+    }
+
+    /// Sets the threads that analyse statements for the SQL rules.
+    #[cfg(feature = "rules")]
+    #[must_use]
+    pub fn with_parser(mut self, parser: Arc<parser::ParserPool>) -> Self {
+        self.parser = Some(parser);
+        self
+    }
+
+    /// Sets how long a session waits for the analysis of a statement.
+    #[cfg(feature = "rules")]
+    #[must_use]
+    pub const fn with_analysis_deadline(mut self, deadline: Duration) -> Self {
+        self.analysis_deadline = deadline;
+        self
     }
 
     /// Sets how long open sessions get to finish.
@@ -310,6 +343,11 @@ impl Runtime {
                 ),
             ));
         }
+        // The counters of the parser threads are shown with the others.
+        #[cfg(feature = "rules")]
+        if let Some(parser) = &settings.parser {
+            status.parser_started(Arc::clone(parser));
+        }
         let sinks = proxy
             .event_sinks()
             .iter()
@@ -349,6 +387,10 @@ impl Runtime {
                 login_timeout: listener.login_timeout,
                 status: Arc::clone(&status),
                 events: Arc::clone(&events),
+                #[cfg(feature = "rules")]
+                parser: settings.parser.clone(),
+                #[cfg(feature = "rules")]
+                analysis_deadline: settings.analysis_deadline,
             });
             listeners.push(BoundListener {
                 socket,

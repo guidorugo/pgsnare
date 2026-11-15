@@ -1,0 +1,1 @@
+DO $body$ BEGIN PERFORM pg_sleep(1); END $body$

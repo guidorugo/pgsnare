@@ -1,0 +1,1 @@
+SELECT "pg_read_file"($1), U&"\0070g_sleep"(1), PG_CATALOG.pg_sleep(2)

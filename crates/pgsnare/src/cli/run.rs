@@ -37,6 +37,8 @@ use crate::builder::{Proxy, ProxyBuilder};
 use crate::config::{self, Config, UpstreamTlsMode};
 use crate::redact::{Redaction, Redactor, RedactorBuilder, Sha256};
 use crate::reload::{self, Reloader, SharedPolicy, Started};
+#[cfg(feature = "rules")]
+use crate::runtime::parser::{ParserPool, ParserSettings};
 use crate::runtime::{
     ListenerSettings, OsEntropy, Runtime, Settings, Stopped, Upstream, permissions,
 };
@@ -135,6 +137,13 @@ fn start(args: &Args, redaction: &Redaction) -> Result<(), String> {
         .with_event_capacity(usize::try_from(config.events.queue_size).unwrap_or(usize::MAX))
         .with_dedup_window(config.events.dedup_window)
         .with_redaction(redaction.clone());
+    // The parser threads are started whether or not the configuration has
+    // rules now: a reload can bring them.
+    #[cfg(feature = "rules")]
+    let settings = settings.with_parser(Arc::new(
+        ParserPool::start(ParserSettings::default())
+            .map_err(|error| format!("cannot start the parser threads: {}", error.kind()))?,
+    ));
     let observed = Observed {
         admin: config.admin.listen.socket_addr(),
         metrics: config.metrics.listen.socket_addr(),

@@ -19,6 +19,9 @@
 #     command is also run without a network and without a place to write.
 #   - `pgsnare config check`. It must pass the configuration pgsnare runs
 #     with, and refuse the ones pgsnare refuses to start with.
+#   - A statement that calls a function from the list of the SQL rules
+#     (`pg_sleep`, with `kill`) is ended before it reaches the database,
+#     also when its text hides the name, and a rule_hit event names the rule.
 #   - pgsnare as a container: it refuses to start with files that are open
 #     to other users, its worker threads follow the processors it may use,
 #     it stays within a memory limit that is smaller than the largest
@@ -505,6 +508,46 @@ until logged "$(field kind token_hit)" "$(field token_id itest-kill)"; do
     sleep 0.2
 done
 psql_as "$(direct "$first")" --command "DROP TABLE itest_bait, itest_bait_kill" >/dev/null 2>&1 || true
+
+# --- A statement that sets off a rule ------------------------------------------
+
+echo "itest: a statement that calls a listed function must be ended before it reaches the database"
+# The listeners of setup 71 are the only ones the rule applies to. The
+# client asks for UTF8 because the rules read a statement only when the
+# database has been told how the client encodes it.
+for version in $versions; do
+    ruled="host=pgsnare port=71$version user=postgres sslmode=disable client_encoding=UTF8"
+    if ! psql_as "$ruled" --command "SELECT 1 AS itest_ruled" 2>&1 | grep -qxF "1"; then
+        echo "itest: FAILED: a statement that no rule concerns did not get its answer on a listener with rules (PostgreSQL $version)" >&2
+        failed=1
+    fi
+    # Written so that a search of the text would not see the function:
+    # a comment, a schema, other case, quotes ("pg_sleep" is the same name).
+    for statement in \
+        "SELECT pg_sleep(300)" \
+        "SELECT /* x */ Pg_Catalog.\"pg_sleep\"(300)"; do
+        status=0
+        started="$(date +%s)"
+        output="$(psql_as "$ruled" --command "$statement" 2>&1)" || status=$?
+        if [ "$status" -eq 0 ] \
+            || ! echo "$output" | grep -qF "terminating connection due to administrator command" \
+            || [ "$(($(date +%s) - started))" -ge 60 ]; then
+            echo "itest: FAILED: a session that called a listed function was not ended at once with the error (PostgreSQL $version, exit status $status):" >&2
+            echo "$output" | sed 's/^/    /' >&2
+            failed=1
+        fi
+    done
+done
+tries=0
+until logged "$(field kind rule_hit)" "$(field rule_id functions)"; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 50 ]; then
+        echo "itest: FAILED: no rule_hit event for the rule that fired" >&2
+        failed=1
+        break
+    fi
+    sleep 0.2
+done
 
 # The last check, because it ends pgsnare: it stops on SIGTERM.
 #

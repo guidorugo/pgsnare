@@ -23,6 +23,11 @@ updates:
         update-types:
           - minor
           - patch
+        # The SQL parser is pinned to one exact version: its update is a
+        # change of its own, which checks the declarations of its C
+        # interface, the field names and the messages the rules read.
+        exclude-patterns:
+          - pg_query
 
   # Workflows and the local composite actions. Actions stay pinned to a
   # commit SHA; Dependabot updates the SHA and the version comment together.

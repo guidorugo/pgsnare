@@ -89,7 +89,7 @@ tokens:
 | `nameOverride`, `fullnameOverride` | empty | Replace the names the chart gives its objects |
 | `replicaCount` | `2` | Replicas are independent of each other. With one, a node drain interrupts the service |
 | `resources.requests` | `cpu: 100m`, `memory: 64Mi` | Both are required |
-| `resources.limits` | `cpu: "1"`, `memory: 256Mi` | Both are required. pgsnare starts as many worker threads as the CPU limit allows |
+| `resources.limits` | `cpu: "1"`, `memory: 256Mi` | Both are required. pgsnare starts as many worker threads as the CPU limit allows. The memory is for a configuration without SQL rules, which is all the chart can set; with rules pgsnare needs more (see the deployment guide) |
 | `podLabels`, `podAnnotations` | `{}` | Added to the pods. The labels of the chart cannot be replaced |
 | `nodeSelector` | `{}` | Labels of the nodes the pods may run on |
 | `priorityClassName` | empty | An existing priority class |

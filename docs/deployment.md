@@ -13,7 +13,7 @@ pgsnare sits between your applications and one PostgreSQL server. This guide cov
 
 ## What the image holds
 
-- One static binary, `/usr/local/bin/pgsnare`, owned by root and not writable.
+- One static binary, `/usr/local/bin/pgsnare`, owned by root and not writable. It is built with the default features, so it contains the SQL rules and accepts a configuration with a `rules` section. The Helm chart cannot set rules yet (see its limits below).
 - An Alpine base, pinned by digest, with the CA certificates and the files that name users. **The base has a shell (busybox) and a package manager.** That is the owner's choice of base. Nothing installs a package at run time: the process is not root, has no capability and has a read-only root filesystem when started as below.
 - User and group `65532`, named by number so that Kubernetes can check it is not root.
 - The entry point `pgsnare`, and the default command `run --config /etc/pgsnare/pgsnare.yaml`.
@@ -43,6 +43,17 @@ docker run --detach --name pgsnare \
     --stop-timeout 40 \
     "$PGSNARE_IMAGE"
 ```
+
+**With SQL rules, give it more memory.** The 256 MiB above are for a configuration without a `rules` section. The parser of the rules can take about 1,500 times the size of a statement while it reads it, on two threads at once, and a client that is logged in chooses the statements. Add 3,000 times `rules.max_parse_bytes` to the limit:
+
+| `rules.max_parse_bytes` | Worst case of the parser | Memory limit |
+|---|---|---|
+| no `rules` section | none | 256 MiB |
+| `64KiB`, the default | about 188 MiB | 512 MiB (`--memory 512m`) |
+| `128KiB` | about 375 MiB | 640 MiB |
+| `1MiB`, the largest accepted | about 3 GiB | 3.3 GiB |
+
+With less, such statements can get the process ended for lack of memory, and every session with it. `pgsnare config check` warns when the worst case of the parser is above 256 MiB, which is what a limit of 512 MiB leaves for it. The factor was measured once, with statements made to be expensive, in a build for glibc; it was not measured in the image, which uses the allocator of musl. The same holds for the sidecar manifests, whose limit of `256Mi` is for a configuration without rules. The Helm chart cannot set rules yet.
 
 - Publish the client port on one address of the machine, the one the applications reach, and nothing else. The admin (`9641`) and metrics (`9642`) listeners stay on loopback inside the container and are not published.
 - `--read-only` is enough with the `stdout` sink. A `file` sink needs a volume that only pgsnare can write.

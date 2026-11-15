@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Stands in for the `bindgen` crate in the build of the SQL parser. See
+# src/lib.rs for why. The name and the version are those of the crate it
+# replaces, which is what `[patch.crates-io]` needs; it is never published.
+
+[package]
+name = "bindgen"
+description = "A stand-in for bindgen that hands out the declarations of libpg_query, made ahead of time."
+version = "0.66.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

@@ -51,7 +51,7 @@ fn session(actions: ActionSet) -> Harness {
 }
 
 /// A `RowDescription` of columns given as name, type, modifier and format.
-fn description(columns: &[(&str, u32, i32, i16)]) -> Vec<u8> {
+pub(super) fn description(columns: &[(&str, u32, i32, i16)]) -> Vec<u8> {
     let mut body = i16::try_from(columns.len()).unwrap().to_be_bytes().to_vec();
     for (name, oid, modifier, format) in columns {
         body.extend_from_slice(name.as_bytes());

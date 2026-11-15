@@ -1,0 +1,1 @@
+WITH u AS (SELECT * FROM users WHERE id > 1) SELECT count(*) FROM u

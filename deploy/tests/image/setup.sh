@@ -21,7 +21,9 @@ esac
 umask 077
 mkdir -p /state/tokens
 
-# The database is found by its name on the network of the test.
+# The database is found by its name on the network of the test. The `rules`
+# section is there to show that the image holds the SQL rules: a build
+# without them refuses this configuration.
 cat > /state/pgsnare.yaml <<'CONFIG'
 listeners:
   - name: image-test
@@ -31,6 +33,8 @@ listeners:
     upstream_tls: { mode: disable }
 token_files:
   - tokens/*.yaml
+rules:
+  functions: { names: [pg_sleep], actions: [alert, kill] }
 events:
   sinks:
     - type: stdout

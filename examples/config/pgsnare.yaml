@@ -81,13 +81,48 @@ exemptions:
 
 # Optional SQL rules. Leave the section out to use none. A rule that is left
 # out is off. This needs a build with the rules feature.
+#
+# Every rule takes three optional lists that say where it applies:
+# `listeners` and `users` (database users) name where it is on, and
+# `exclude_users` names who it is off for. A list that is left out means all.
 rules:
+  # What happens to a statement that cannot be analysed. Under allow and
+  # alert it is passed on without being judged, so a rule that answers with
+  # kill or tarpit is only certain under block. `pgsnare config check` warns
+  # about that pairing.
   on_parse_failure: alert                   # allow, alert (default) or block
-  max_parse_bytes: 1MiB                     # default 1MiB
+  # A longer statement is not parsed and follows on_parse_failure. Parsing
+  # can take about 1,500 times the size of a statement in memory, on every
+  # parser thread at once, so raise this with care. At most 1MiB. Give the
+  # process a memory limit of at least 256MiB plus 3,000 times this value
+  # (512MiB with the default); `pgsnare config check` warns when the parser
+  # could take more than 256MiB.
+  max_parse_bytes: 64KiB                    # default 64KiB
   catalog_enumeration: { actions: [alert], exclude_users: [migrator] }
-  unbounded_read: { tables: [public.users], actions: [alert] }
-  row_threshold: { tables: [public.users], max_rows: 1000, actions: [alert, tarpit] }
-  functions: { names: [pg_read_file, pg_read_binary_file, lo_export, pg_sleep], actions: [alert] }
+  unbounded_read: { tables: [public.users], actions: [alert], listeners: [main] }
+  row_threshold: { tables: [public.users], max_rows: 1000, actions: [alert, tarpit], users: [app] }
+  # Functions that read files, list directories, stall the session, or run
+  # or read what a string names. A statement is not searched for names
+  # inside strings, so these are how such a string gets run.
+  functions:
+    names:
+      - pg_read_file
+      - pg_read_binary_file
+      - pg_ls_dir
+      - pg_stat_file
+      - lo_import
+      - lo_export
+      - pg_sleep
+      - pg_sleep_for
+      - pg_sleep_until
+      - query_to_xml
+      - table_to_xml
+      - cursor_to_xml
+      - schema_to_xml
+      - database_to_xml
+      - dblink
+      - dblink_exec
+    actions: [alert]
 
 actions:
   kill:

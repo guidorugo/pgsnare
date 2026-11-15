@@ -2,6 +2,12 @@
 
 //! What the runtime tells the session logic, apart from the bytes it read.
 
+#[cfg(feature = "rules")]
+use std::sync::Arc;
+
+#[cfg(feature = "rules")]
+use crate::rules::{Analysis, ParseFailure};
+
 /// Something the runtime did or learned that the session logic must know.
 ///
 /// The session logic asks for work through [`Effect`]s and the runtime
@@ -9,7 +15,7 @@
 /// cannot see for itself, such as the proxy shutting down.
 ///
 /// [`Effect`]: super::Effect
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Report {
     /// The handshake asked for with [`Effect::AcceptTls`] has succeeded.
@@ -38,4 +44,18 @@ pub enum Report {
     ///
     /// [`Effect::Tarpit`]: super::Effect::Tarpit
     TarpitOver,
+    /// The answer to [`Effect::Analyse`]: the analysis of the statement,
+    /// or the reason there is none. An answer the session does not wait
+    /// for, such as one that comes after another answer under the same
+    /// `id`, changes nothing.
+    ///
+    /// [`Effect::Analyse`]: super::Effect::Analyse
+    #[cfg(feature = "rules")]
+    Analysed {
+        /// The `id` of the request.
+        id: u64,
+        /// The analysis, shared with whoever else holds it, or why there
+        /// is none.
+        outcome: Result<Arc<Analysis>, ParseFailure>,
+    },
 }

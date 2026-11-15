@@ -77,6 +77,7 @@ pub(crate) fn render(status: &Status, redaction: &Redaction) -> String {
 
     sessions(&mut text, &counters);
     detection(&mut text, status, &counters);
+    parser(&mut text, &counters);
     events(&mut text, status, &counters);
     faults(&mut text, &counters);
     latency(&mut text, status);
@@ -218,17 +219,71 @@ fn detection(text: &mut Exposition<'_>, status: &Status, counters: &Counters) {
     for (action, taken) in Counters::ACTIONS.iter().zip(counters.actions) {
         text.sample("pgsnare_actions_total", &[("action", action)], taken);
     }
-    text.single(
+    text.family(
         "pgsnare_parse_failures_total",
         "counter",
-        "Statements that could not be parsed, so that no rule could judge them.",
-        counters.parse_failures,
+        "Statements that had no analysis, so that no rule could judge them, by the reason: \
+         one of a fixed list of names, and other for a reason this build does not know.",
     );
+    for (reason, failures) in Counters::PARSE_FAILURE_REASONS
+        .iter()
+        .zip(counters.parse_failure_reasons)
+    {
+        text.sample(
+            "pgsnare_parse_failures_total",
+            &[("reason", reason)],
+            failures,
+        );
+    }
     text.single(
         "pgsnare_reload_failures_total",
         "counter",
         "Reloads that were refused, so that the policy stayed as it was.",
         counters.reload_failures,
+    );
+}
+
+/// The parser threads of the SQL rules: what they did, what they refused
+/// and what their cache holds. A statement that waited too long for them is
+/// in `pgsnare_parse_failures_total` under `timed_out`.
+fn parser(text: &mut Exposition<'_>, counters: &Counters) {
+    let parser = &counters.parser;
+    text.family(
+        "pgsnare_parser_statements_total",
+        "counter",
+        "Statements the parser threads of the SQL rules answered, by where the answer came \
+         from: parsed, when a thread read the statement, or cache.",
+    );
+    for (source, statements) in [("parsed", parser.analysed), ("cache", parser.cache_hits)] {
+        text.sample(
+            "pgsnare_parser_statements_total",
+            &[("source", source)],
+            statements,
+        );
+    }
+    text.single(
+        "pgsnare_parser_busy_total",
+        "counter",
+        "Statements the parser threads did not take because their queue was full.",
+        parser.busy,
+    );
+    text.single(
+        "pgsnare_parser_panics_total",
+        "counter",
+        "Jobs of the parser threads that panicked. The thread goes on.",
+        parser.panicked,
+    );
+    text.single(
+        "pgsnare_parser_cache_entries",
+        "gauge",
+        "Analyses in the cache of the parser threads, right now.",
+        parser.cache_entries,
+    );
+    text.single(
+        "pgsnare_parser_cache_bytes",
+        "gauge",
+        "The size of the cache of the parser threads by its own estimate, right now.",
+        parser.cache_bytes,
     );
 }
 
@@ -610,7 +665,10 @@ pub(crate) mod tests {
             "pgsnare_cancel_requests_forwarded_total",
             "pgsnare_read_buffer_bytes",
             "pgsnare_queries_total",
-            "pgsnare_parse_failures_total",
+            "pgsnare_parser_busy_total",
+            "pgsnare_parser_panics_total",
+            "pgsnare_parser_cache_entries",
+            "pgsnare_parser_cache_bytes",
             "pgsnare_reload_failures_total",
             "pgsnare_events_raised_total",
             "pgsnare_events_deduplicated_total",
@@ -658,6 +716,28 @@ pub(crate) mod tests {
                 Some(0.0)
             );
         }
+        assert_eq!(Counters::PARSE_FAILURE_REASONS.len(), 15);
+        for reason in Counters::PARSE_FAILURE_REASONS {
+            assert_eq!(
+                value(
+                    &samples,
+                    "pgsnare_parse_failures_total",
+                    &[("reason", reason)]
+                ),
+                Some(0.0),
+                "{reason}"
+            );
+        }
+        for source in ["parsed", "cache"] {
+            assert_eq!(
+                value(
+                    &samples,
+                    "pgsnare_parser_statements_total",
+                    &[("source", source)]
+                ),
+                Some(0.0)
+            );
+        }
         for kind in Counters::EVENT_KINDS {
             assert_eq!(
                 value(&samples, "pgsnare_events_total", &[("kind", kind)]),
@@ -700,10 +780,16 @@ pub(crate) mod tests {
         status.token_hit(&TokenId::new("card-test-0002").unwrap(), true);
         status.rule_hit(&RuleId::new("catalog_enumeration").unwrap());
         status.actions_taken(ActionSet::of(&[Action::Alert, Action::Kill]));
-        status.parse_failed();
+        status.parse_failed("busy");
+        status.parse_failed("timed_out");
+        status.parse_failed("timed_out");
+        // A name that is not on the list adds no label of its own.
+        status.parse_failed("SELECT secret");
         status.reload_failed();
 
-        let samples = parse(&render(&status, &Redaction::default()));
+        let text = render(&status, &Redaction::default());
+        assert!(!text.contains("SELECT secret"), "{text}");
+        let samples = parse(&text);
         let number = |name: &str, labels: &[(&str, &str)]| value(&samples, name, labels);
         assert_eq!(number("pgsnare_ready", &[]), Some(1.0));
         assert_eq!(number("pgsnare_connections_accepted_total", &[]), Some(2.0));
@@ -783,7 +869,18 @@ pub(crate) mod tests {
             number("pgsnare_actions_total", &[("action", "tarpit")]),
             Some(0.0)
         );
-        assert_eq!(number("pgsnare_parse_failures_total", &[]), Some(1.0));
+        for (reason, failures) in [
+            ("busy", 1.0),
+            ("timed_out", 2.0),
+            ("other", 1.0),
+            ("rejected", 0.0),
+        ] {
+            assert_eq!(
+                number("pgsnare_parse_failures_total", &[("reason", reason)]),
+                Some(failures),
+                "{reason}"
+            );
+        }
         assert_eq!(number("pgsnare_reload_failures_total", &[]), Some(1.0));
     }
 

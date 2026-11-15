@@ -10,6 +10,8 @@
 mod kill;
 mod relay;
 mod reload;
+#[cfg(feature = "rules")]
+mod rules;
 mod scan;
 mod support;
 mod tarpit;

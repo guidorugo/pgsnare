@@ -2,7 +2,8 @@
 
 //! The shared code of the fuzz targets of `pgsnare-core`.
 //!
-//! There is one target, `session`. It drives the whole logic of a
+//! There are two targets. `rules` feeds bytes to the SQL parser and the
+//! rules, see [`fuzz_rules`]. `session` is described here: it drives the whole logic of a
 //! PostgreSQL session the way a runtime does: with bytes from the client
 //! and from the server in any order and cut anywhere, with reports, and
 //! with a policy that changes on the way.
@@ -19,6 +20,14 @@
 //!   nothing more is produced.
 //! - **How the bytes are cut does not matter.** The same streams, fed byte
 //!   by byte, produce the same bytes and the same effects.
+//!
+//! A setting can turn the SQL rules on. The session then holds every
+//! statement until its analysis is there, and the target answers late: not
+//! before the next thing that is not bytes of the client. So bytes pile up
+//! behind a held statement, as they do when the parser is slow, and all of
+//! the above must still hold. The answer depends on the statement alone:
+//! an analysis, or one of the reasons there is none. The parser itself is
+//! not run here; the `rules` target does that.
 //!
 //! # Inputs
 //!
@@ -43,12 +52,19 @@
 //! make fuzz FUZZ_CRATE=pgsnare-core FUZZ_SECONDS=60
 //! ```
 
+mod rules;
+
+pub use rules::fuzz_rules;
+
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use pgsnare_core::event::SessionId;
 use pgsnare_core::extension::{ProtocolSession, Relay};
-use pgsnare_core::policy::{Inspection, OnError, PolicySnapshot};
+use pgsnare_core::policy::{ActionSet, Inspection, OnError, PolicySnapshot};
+use pgsnare_core::rules::{
+    Analysis, Limits, OnParseFailure, ParseFailure, RuleScope, RuleSet, analyse, on_parser_thread,
+};
 use pgsnare_core::session::postgres::{MAX_LOGIN_FRAME, Postgres, PostgresSession};
 use pgsnare_core::session::{Direction, Effect, Output, Report, SessionOrigin, TlsPolicy};
 
@@ -110,6 +126,8 @@ struct Setting {
     connect: Connect,
     /// The captured session the input cuts. `None` when it holds steps.
     capture: Option<usize>,
+    /// Whether the policy has SQL rules, so that statements are held.
+    rules: bool,
 }
 
 impl Setting {
@@ -140,11 +158,12 @@ impl Setting {
             max_buffered_frame: buffered_limit(second),
             connect,
             capture,
+            rules: second & 0x80 != 0,
         }
     }
 
     fn policy(&self) -> PolicySnapshot {
-        policy(self.on_error, self.max_buffered_frame)
+        policy(self.on_error, self.max_buffered_frame, self.rules)
     }
 }
 
@@ -153,11 +172,65 @@ fn buffered_limit(choice: u8) -> usize {
     1024 << (choice % 11)
 }
 
-fn policy(on_error: OnError, max_buffered_frame: usize) -> PolicySnapshot {
-    PolicySnapshot::builder()
-        .inspection(Inspection::new(on_error, max_buffered_frame))
+fn policy(on_error: OnError, max_buffered_frame: usize, rules: bool) -> PolicySnapshot {
+    let mut builder =
+        PolicySnapshot::builder().inspection(Inspection::new(on_error, max_buffered_frame));
+    if rules {
+        // A statement without an analysis goes on, so that no byte is
+        // held back for good and the balance of bytes can be checked.
+        let rules = RuleSet::builder()
+            .on_parse_failure(OnParseFailure::Allow)
+            .functions(
+                &["pg_sleep".to_owned()],
+                ActionSet::ALERT,
+                RuleScope::default(),
+            )
+            .expect("a valid rule")
+            // Answered with `alert`, so it lets every row through. A
+            // statement without an analysis arms it, so most results of
+            // the fuzzed streams are counted.
+            .row_threshold(
+                &["users".to_owned()],
+                2,
+                ActionSet::ALERT,
+                RuleScope::default(),
+            )
+            .expect("a valid rule")
+            .build();
+        builder = builder.rules(rules);
+    }
+    builder
         .build()
         .expect("the limits are within the accepted range")
+}
+
+/// The most bytes of a client a session keeps behind a held statement.
+const MAX_BEHIND: usize = 1024 * 1024;
+
+/// A stand-in for the hash function of the runtime, for the statements
+/// of the events that are raised.
+fn digest(_: &[u8]) -> [u8; 32] {
+    [0; 32]
+}
+
+/// The answer to a request for the analysis of `text`. It depends on the
+/// text alone, so that two runs over the same streams get the same.
+fn outcome(text: &[u8]) -> Result<Arc<Analysis>, ParseFailure> {
+    static ANALYSIS: OnceLock<Option<Arc<Analysis>>> = OnceLock::new();
+    match text.len() % 5 {
+        0 => Err(ParseFailure::Rejected),
+        1 => Err(ParseFailure::Busy),
+        2 => Err(ParseFailure::TimedOut),
+        _ => ANALYSIS
+            .get_or_init(|| {
+                on_parser_thread(|thread| analyse(b"SELECT 1", &Limits::default(), thread))
+                    .ok()
+                    .and_then(Result::ok)
+                    .map(Arc::new)
+            })
+            .clone()
+            .ok_or(ParseFailure::Unreadable),
+    }
 }
 
 /// One thing a runtime does to a session.
@@ -282,6 +355,9 @@ struct Run {
     /// there on depends on where the runtime stopped reading, so it is not
     /// compared between two ways of cutting the input.
     asked_for_tls: bool,
+    /// The answer the session waits for: the `id` of its request and the
+    /// outcome.
+    asked: Option<(u64, Result<Arc<Analysis>, ParseFailure>)>,
 }
 
 #[derive(Clone, Copy)]
@@ -306,14 +382,20 @@ impl Run {
             false,
         )
         .with_client_tls_policy(setting.tls);
+        let module = if setting.rules {
+            Postgres::scanning(Arc::new(digest))
+        } else {
+            Postgres::new()
+        };
         Self {
-            session: Postgres::new().session(origin, Arc::new(Relay)),
+            session: module.session(origin, Arc::new(Relay)),
             setting,
             policy: setting.policy(),
             record: Record::default(),
             largest_limit: setting.max_buffered_frame,
             balance: None,
             asked_for_tls: false,
+            asked: None,
         }
     }
 
@@ -346,9 +428,21 @@ impl Run {
         }
 
         // Never more held than a startup packet, a message of the login,
-        // and one message within the limit for each direction.
-        let most = MAX_BEFORE_LOGIN + 2 * self.largest_limit.max(MAX_LOGIN_FRAME);
+        // and one message within the limit for each direction. With the
+        // rules, one statement more that waits for its analysis, and what
+        // the client may send behind it.
+        let largest = self.largest_limit.max(MAX_LOGIN_FRAME);
+        let mut most = MAX_BEFORE_LOGIN + 2 * largest;
+        if self.setting.rules {
+            most += largest + MAX_BEHIND;
+        }
         let held = self.session.buffered_bytes();
+        if !self.setting.rules {
+            assert!(
+                !self.session.holds_client(),
+                "a message is held without rules"
+            );
+        }
         assert!(held <= most, "the session holds {held} bytes");
 
         // Once established, and for as long as the session lasts, every
@@ -387,8 +481,26 @@ impl Run {
                     Connect::Unavailable => reports.push(Report::BackendUnavailable),
                     Connect::Silent => {}
                 },
+                Effect::Analyse { id, text, .. } => {
+                    assert!(
+                        self.setting.rules,
+                        "an analysis was asked for without rules"
+                    );
+                    assert!(
+                        self.session.holds_client(),
+                        "an analysis was asked for and nothing is held"
+                    );
+                    assert!(self.asked.is_none(), "two statements are held at once");
+                    self.asked = Some((*id, outcome(text.as_bytes())));
+                }
                 _ => {}
             }
+        }
+        if self.session.holds_client() {
+            assert!(
+                self.asked.is_some(),
+                "a statement is held and nothing was asked"
+            );
         }
         self.record.to_client.append(&mut out.to_client);
         self.record.to_server.append(&mut out.to_server);
@@ -421,7 +533,20 @@ impl Run {
         }
     }
 
+    /// Gives the session the answers it waits for, until it waits for
+    /// none: letting one statement go can hold the next.
+    fn settle(&mut self) {
+        while let Some((id, outcome)) = self.asked.take() {
+            self.report(Report::Analysed { id, outcome });
+        }
+    }
+
     fn step(&mut self, step: &Step, byte_by_byte: bool) {
+        // The answer comes late: bytes of the client pile up before it,
+        // and anything else finds the statement decided.
+        if !matches!(step, Step::Bytes(Direction::FromClient, _)) {
+            self.settle();
+        }
         match step {
             Step::Bytes(from, bytes) if byte_by_byte => {
                 for byte in bytes {
@@ -429,9 +554,9 @@ impl Run {
                 }
             }
             Step::Bytes(from, bytes) => self.bytes(*from, bytes),
-            Step::Report(report) => self.report(*report),
+            Step::Report(report) => self.report(report.clone()),
             Step::Policy(on_error, max_buffered_frame) => {
-                self.policy = policy(*on_error, *max_buffered_frame);
+                self.policy = policy(*on_error, *max_buffered_frame, self.setting.rules);
                 self.largest_limit = self.largest_limit.max(*max_buffered_frame);
             }
         }
@@ -443,6 +568,7 @@ fn play(setting: Setting, steps: &[Step], byte_by_byte: bool) -> Run {
     for step in steps {
         run.step(step, byte_by_byte);
     }
+    run.settle();
     run
 }
 
@@ -477,5 +603,44 @@ pub fn fuzz_session(data: &[u8]) {
             as_given.record.error,
             byte_by_byte.record.error,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn every_session_seed_runs_with_and_without_rules() {
+        let seeds = concat!(env!("CARGO_MANIFEST_DIR"), "/seeds/session");
+        let mut count = 0;
+        for entry in std::fs::read_dir(seeds).unwrap() {
+            let mut data = std::fs::read(entry.unwrap().path()).unwrap();
+            super::fuzz_session(&data);
+            if let Some(second) = data.get_mut(1) {
+                *second ^= 0x80;
+            }
+            super::fuzz_session(&data);
+            count += 1;
+        }
+        assert!(count >= 25, "{count} seeds");
+    }
+
+    #[test]
+    fn a_seed_with_rules_holds_statements() {
+        for name in ["rules-simple", "rules-extended", "rules-copy-in-turns"] {
+            let path = format!("{}/seeds/session/{name}", env!("CARGO_MANIFEST_DIR"));
+            let data = std::fs::read(path).unwrap();
+            let setting = super::Setting::new(data[0], data[1]);
+            assert!(setting.rules, "{name}");
+            let steps = super::cuts(&super::CAPTURES[setting.capture.unwrap()], &data[2..]);
+            let run = super::play(setting, &steps, false);
+            let asked = run
+                .record
+                .effects
+                .iter()
+                .filter(|effect| matches!(effect, super::Effect::Analyse { .. }))
+                .count();
+            assert!(asked > 0, "{name}: no statement was held");
+            assert_eq!(run.record.error, None, "{name}");
+        }
     }
 }

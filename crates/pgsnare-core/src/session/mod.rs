@@ -30,6 +30,8 @@ mod origin;
 pub mod postgres;
 mod report;
 
+#[cfg(feature = "rules")]
+pub use effect::StatementText;
 pub use effect::{Effect, Output};
 pub use origin::{Direction, Leg, SessionOrigin, TlsPolicy};
 pub use report::Report;
