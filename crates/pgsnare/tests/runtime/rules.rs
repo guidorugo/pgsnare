@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use pgsnare::redact::Sha256;
 use pgsnare::runtime::parser::{ParserPool, ParserSettings};
-use pgsnare::runtime::{Runtime, Settings, Status};
+use pgsnare::runtime::{ParserCounters, Runtime, Settings, Status};
 use pgsnare_core::detect::{Matcher, TokenSpec};
 use pgsnare_core::event::EventKind;
 use pgsnare_core::extension::ProtocolModule;
@@ -238,6 +238,15 @@ async fn a_statement_is_analysed_before_it_reaches_the_database() {
 
     let counters = proxy.status.counters();
     assert_eq!(counters.parse_failures, 0);
+    assert_eq!(counters.parse_failure_reasons, [0; 15]);
+    // The counters of the parser threads are shown with the others.
+    let parser = counters.parser;
+    assert_eq!(
+        (parser.analysed, parser.cache_hits, parser.cache_entries),
+        (1, 1, 1)
+    );
+    assert!(parser.cache_bytes > 0);
+    assert_eq!((parser.busy, parser.panicked), (0, 0));
     assert_eq!(counters.actions, [0, 0, 0, 0]);
     assert_eq!(proxy.parse_failure_events(), 0);
 }
@@ -262,6 +271,7 @@ async fn a_statement_the_parser_refuses_meets_the_policy() {
     assert!(seen.messages().is_empty());
     let counters = proxy.status.counters();
     assert_eq!(counters.parse_failures, 1);
+    assert_eq!(counters.parse_failures_for("rejected"), 1);
     assert_eq!(counters.actions, [1, 1, 0, 0]);
     until(|| proxy.parse_failure_events() == 1).await;
 
@@ -372,7 +382,13 @@ async fn a_parser_that_does_not_answer_in_time_fails_the_statement() {
         }
         // Not before the time allowed had passed.
         assert!(asked.elapsed() >= deadline, "{on_failure:?}");
-        assert_eq!(proxy.status.counters().parse_failures, 1, "{on_failure:?}");
+        let counters = proxy.status.counters();
+        assert_eq!(counters.parse_failures, 1, "{on_failure:?}");
+        assert_eq!(
+            counters.parse_failures_for("timed_out"),
+            1,
+            "{on_failure:?}"
+        );
         until(|| proxy.parse_failure_events() == 1).await;
     }
 }
@@ -396,7 +412,10 @@ async fn a_full_queue_fails_the_statement_at_once() {
     assert!(is_fatal(&read_to_end(&mut client).await));
     assert!(seen.messages().is_empty());
     assert_eq!(pool.stats().busy, 1);
-    assert_eq!(proxy.status.counters().parse_failures, 1);
+    let counters = proxy.status.counters();
+    assert_eq!(counters.parse_failures, 1);
+    assert_eq!(counters.parse_failures_for("busy"), 1);
+    assert_eq!(counters.parser.busy, 1);
 }
 
 #[tokio::test]
@@ -409,7 +428,12 @@ async fn without_parser_threads_no_statement_has_an_analysis() {
     client.write_all(&query("SELECT 1")).await.unwrap();
     assert!(is_fatal(&read_to_end(&mut client).await));
     assert!(seen.messages().is_empty());
-    assert_eq!(proxy.status.counters().parse_failures, 1);
+    let counters = proxy.status.counters();
+    assert_eq!(counters.parse_failures, 1);
+    // The reason says that nothing took the statement, and no thread has
+    // anything to show.
+    assert_eq!(counters.parse_failures_for("busy"), 1);
+    assert_eq!(counters.parser, ParserCounters::default());
 }
 
 #[tokio::test]

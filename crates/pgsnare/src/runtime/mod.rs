@@ -91,7 +91,9 @@ mod stream;
 
 pub use backend::Upstream;
 pub use entropy::OsEntropy;
-pub use status::{Counters, DropReason, Histogram, HitCounters, SinkCounters, SinkStatus, Status};
+pub use status::{
+    Counters, DropReason, Histogram, HitCounters, ParserCounters, SinkCounters, SinkStatus, Status,
+};
 
 use backend::Connector;
 use events::{EventSettings, Events};
@@ -340,6 +342,11 @@ impl Runtime {
                     backend::TLS_OVER_UNIX_SOCKET
                 ),
             ));
+        }
+        // The counters of the parser threads are shown with the others.
+        #[cfg(feature = "rules")]
+        if let Some(parser) = &settings.parser {
+            status.parser_started(Arc::clone(parser));
         }
         let sinks = proxy
             .event_sinks()

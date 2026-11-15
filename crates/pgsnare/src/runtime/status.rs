@@ -27,6 +27,8 @@
 //! effects it is handed.
 
 use std::collections::BTreeMap;
+#[cfg(feature = "rules")]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
@@ -93,7 +95,10 @@ pub struct Status {
     rule_hits: AtomicU64,
     actions: [AtomicU64; ACTION_COUNT],
     parse_failures: AtomicU64,
+    parse_failure_reasons: [AtomicU64; PARSE_FAILURE_REASON_COUNT],
     reload_failures: AtomicU64,
+    #[cfg(feature = "rules")]
+    parser: OnceLock<Arc<super::parser::ParserPool>>,
     latency: Latency,
     hits: Mutex<Hits>,
     sinks: RwLock<Vec<Arc<SinkStatus>>>,
@@ -126,6 +131,31 @@ const fn event_kind_index(kind: EventKind) -> usize {
 
 /// The responses that are counted apart.
 const ACTION_COUNT: usize = 4;
+
+/// The reasons a statement had no analysis that are counted apart, and one
+/// more for a reason this build does not know.
+const PARSE_FAILURE_REASON_COUNT: usize = 15;
+
+/// The names of [`Counters::parse_failure_reasons`], in its order: the
+/// names the session logic gives its reasons, and `other`. The list is
+/// fixed, so nothing a client sends can add a name to it.
+const PARSE_FAILURE_REASON_NAMES: [&str; PARSE_FAILURE_REASON_COUNT] = [
+    "too_large",
+    "invalid_utf8",
+    "embedded_nul",
+    "too_deep",
+    "rejected",
+    "unreadable",
+    "incomplete",
+    "busy",
+    "panicked",
+    "streamed",
+    "encoding",
+    "timed_out",
+    "opaque_body",
+    "function_call",
+    "other",
+];
 
 /// The names of [`Counters::actions`], in its order.
 const ACTION_NAMES: [&str; ACTION_COUNT] = ["alert", "kill", "tarpit", "fake_data"];
@@ -222,8 +252,49 @@ pub struct Counters {
     /// Statements that could not be parsed, so that no rule could judge
     /// them.
     pub parse_failures: u64,
+    /// The same statements by the reason there was no analysis, in the
+    /// order of [`Counters::PARSE_FAILURE_REASONS`].
+    pub parse_failure_reasons: [u64; 15],
     /// Reloads that were refused, so that the policy stayed as it was.
     pub reload_failures: u64,
+    /// What the parser threads of the SQL rules have done. All zero in a
+    /// build without the rules, and in a proxy without parser threads.
+    pub parser: ParserCounters,
+}
+
+/// What the parser threads of the SQL rules have done so far, and what
+/// their cache holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ParserCounters {
+    /// Statements a parser thread read, because the cache did not have
+    /// them.
+    pub analysed: u64,
+    /// Statements answered from the cache.
+    pub cache_hits: u64,
+    /// Statements refused because the queue of the threads was full.
+    pub busy: u64,
+    /// Jobs of the threads that panicked.
+    pub panicked: u64,
+    /// Analyses in the cache right now.
+    pub cache_entries: u64,
+    /// The cache's estimate of its size right now, in bytes.
+    pub cache_bytes: u64,
+}
+
+#[cfg(feature = "rules")]
+impl From<super::parser::ParserStats> for ParserCounters {
+    fn from(stats: super::parser::ParserStats) -> Self {
+        let size = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+        Self {
+            analysed: stats.analysed,
+            cache_hits: stats.cache_hits,
+            busy: stats.busy,
+            panicked: stats.panicked,
+            cache_entries: size(stats.cache_entries),
+            cache_bytes: size(stats.cache_bytes),
+        }
+    }
 }
 
 impl Counters {
@@ -233,6 +304,21 @@ impl Counters {
 
     /// The names of the responses in [`Counters::actions`].
     pub const ACTIONS: [&'static str; 4] = ACTION_NAMES;
+
+    /// The names of the reasons in [`Counters::parse_failure_reasons`].
+    /// The last one stands for every reason this build does not know.
+    pub const PARSE_FAILURE_REASONS: [&'static str; 15] = PARSE_FAILURE_REASON_NAMES;
+
+    /// How many statements had no analysis for the reason of this name.
+    /// A name that is not in [`Counters::PARSE_FAILURE_REASONS`] has none.
+    #[must_use]
+    pub fn parse_failures_for(&self, reason: &str) -> u64 {
+        PARSE_FAILURE_REASON_NAMES
+            .iter()
+            .zip(self.parse_failure_reasons)
+            .find_map(|(name, count)| (*name == reason).then_some(count))
+            .unwrap_or(0)
+    }
 }
 
 /// Why a sink did not deliver an event.
@@ -477,6 +563,14 @@ impl Status {
     #[must_use]
     pub fn counters(&self) -> Counters {
         let read = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        #[cfg(feature = "rules")]
+        let parser = self
+            .parser
+            .get()
+            .map(|pool| ParserCounters::from(pool.stats()))
+            .unwrap_or_default();
+        #[cfg(not(feature = "rules"))]
+        let parser = ParserCounters::default();
         Counters {
             sessions_accepted: read(&self.sessions_accepted),
             sessions_refused: read(&self.sessions_refused),
@@ -507,7 +601,9 @@ impl Status {
             rule_hits: read(&self.rule_hits),
             actions: self.actions.each_ref().map(read),
             parse_failures: read(&self.parse_failures),
+            parse_failure_reasons: self.parse_failure_reasons.each_ref().map(read),
             reload_failures: read(&self.reload_failures),
+            parser,
         }
     }
 
@@ -599,9 +695,27 @@ impl Status {
         }
     }
 
-    /// A statement could not be parsed, so that no rule could judge it.
-    pub fn parse_failed(&self) {
+    /// A statement had no analysis, so that no rule could judge it.
+    /// `reason` is the fixed name of why, as the session logic names it.
+    /// A name that is not in [`Counters::PARSE_FAILURE_REASONS`] is counted
+    /// as `other`, so the list of names never grows.
+    pub fn parse_failed(&self, reason: &str) {
         self.parse_failures.fetch_add(1, Ordering::Relaxed);
+        let index = PARSE_FAILURE_REASON_NAMES
+            .iter()
+            .position(|name| *name == reason)
+            .unwrap_or(PARSE_FAILURE_REASON_COUNT - 1);
+        if let Some(counter) = self.parse_failure_reasons.get(index) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Names the parser threads whose counters [`Status::counters`] shows.
+    /// The first threads named stay.
+    #[cfg(feature = "rules")]
+    pub fn parser_started(&self, pool: Arc<super::parser::ParserPool>) {
+        // A second pool is not shown: one proxy has one.
+        let _ = self.parser.set(pool);
     }
 
     /// A reload was refused, and the policy stays as it was.
@@ -938,7 +1052,7 @@ mod tests {
         status.actions_taken(ActionSet::of(&[Action::Alert, Action::Kill]));
         status.actions_taken(ActionSet::ALERT);
         status.actions_taken(ActionSet::EMPTY);
-        status.parse_failed();
+        status.parse_failed("busy");
         status.reload_failed();
 
         let counters = status.counters();
@@ -948,6 +1062,7 @@ mod tests {
         assert_eq!(counters.rule_hits, 1);
         assert_eq!(counters.actions, [2, 1, 0, 0]);
         assert_eq!(counters.parse_failures, 1);
+        assert_eq!(counters.parse_failures_for("busy"), 1);
         assert_eq!(counters.reload_failures, 1);
         assert_eq!(Counters::ACTIONS, ["alert", "kill", "tarpit", "fake_data"]);
         assert_eq!(Counters::EVENT_KINDS[4], "inspection_bypassed");
@@ -963,6 +1078,92 @@ mod tests {
                 rules: vec![("catalog_enumeration".to_owned(), 1)],
             }
         );
+    }
+
+    #[test]
+    fn a_statement_without_an_analysis_is_counted_under_its_reason() {
+        let status = Status::new();
+        status.parse_failed("timed_out");
+        status.parse_failed("timed_out");
+        status.parse_failed("opaque_body");
+        // A name that is not on the list is no reason of its own.
+        status.parse_failed("SELECT 1");
+        status.parse_failed("");
+
+        let counters = status.counters();
+        assert_eq!(counters.parse_failures, 5);
+        assert_eq!(counters.parse_failures_for("timed_out"), 2);
+        assert_eq!(counters.parse_failures_for("opaque_body"), 1);
+        assert_eq!(counters.parse_failures_for("other"), 2);
+        assert_eq!(counters.parse_failures_for("busy"), 0);
+        assert_eq!(counters.parse_failures_for("SELECT 1"), 0);
+        assert_eq!(counters.parse_failure_reasons.iter().sum::<u64>(), 5);
+        assert_eq!(Counters::PARSE_FAILURE_REASONS.last(), Some(&"other"));
+        // Without parser threads there is nothing of theirs to show.
+        assert_eq!(counters.parser, ParserCounters::default());
+    }
+
+    #[cfg(feature = "rules")]
+    #[test]
+    fn every_reason_of_the_session_logic_has_its_own_counter() {
+        use pgsnare_core::rules::ParseFailure;
+
+        let reasons = [
+            ParseFailure::TooLarge,
+            ParseFailure::InvalidUtf8,
+            ParseFailure::EmbeddedNul,
+            ParseFailure::TooDeep,
+            ParseFailure::Rejected,
+            ParseFailure::Unreadable,
+            ParseFailure::Incomplete,
+            ParseFailure::Busy,
+            ParseFailure::Panicked,
+            ParseFailure::Streamed,
+            ParseFailure::Encoding,
+            ParseFailure::TimedOut,
+            ParseFailure::OpaqueBody,
+            ParseFailure::FunctionCall,
+        ];
+        let status = Status::new();
+        for reason in reasons {
+            status.parse_failed(reason.name());
+        }
+        let counters = status.counters();
+        assert_eq!(counters.parse_failures_for("other"), 0);
+        for reason in reasons {
+            assert_eq!(counters.parse_failures_for(reason.name()), 1, "{reason:?}");
+        }
+    }
+
+    #[cfg(feature = "rules")]
+    #[test]
+    fn the_counters_of_the_parser_threads_are_shown_once_they_are_named() {
+        use std::sync::mpsc::channel;
+
+        use pgsnare_core::rules::Limits;
+
+        use crate::runtime::parser::{ParserPool, ParserSettings};
+
+        let pool = Arc::new(ParserPool::start(ParserSettings::default()).unwrap());
+        let status = Status::new();
+        status.parser_started(Arc::clone(&pool));
+        for _ in 0..2 {
+            let (answer, answers) = channel();
+            pool.submit(b"SELECT 1".to_vec(), Limits::default(), move |outcome| {
+                let _ = answer.send(outcome);
+            })
+            .unwrap();
+            answers
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap()
+                .unwrap();
+        }
+
+        let parser = status.counters().parser;
+        assert_eq!((parser.analysed, parser.cache_hits), (1, 1));
+        assert_eq!((parser.busy, parser.panicked), (0, 0));
+        assert_eq!(parser.cache_entries, 1);
+        assert!(parser.cache_bytes > 0);
     }
 
     #[test]

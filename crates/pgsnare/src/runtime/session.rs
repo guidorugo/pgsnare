@@ -767,8 +767,10 @@ impl Driver {
                 #[cfg(feature = "rules")]
                 Effect::Analyse { id, text, limits } => self.analyse(id, text, limits),
                 #[cfg(feature = "rules")]
-                Effect::ParseFailed { reason: _, actions } => {
-                    self.context.status.parse_failed();
+                Effect::ParseFailed { reason, actions } => {
+                    // The name is one of a fixed list, never a text from
+                    // the statement.
+                    self.context.status.parse_failed(reason.name());
                     self.context.status.actions_taken(actions);
                 }
                 #[cfg(feature = "rules")]
