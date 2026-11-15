@@ -110,6 +110,7 @@ async fn an_event_arrives_as_a_signed_request_over_verified_tls() {
 async fn a_receiver_can_tell_a_forged_and_a_repeated_request_from_a_real_one() {
     let (receiver, settings) = trusted_receiver(&[], Answer::Status(204)).await;
     let proxy = proxy_with(&https(&receiver, "/hook"), settings, SinkOptions::default()).await;
+    let before = SystemTime::now();
     raise(&proxy).await;
     raise(&proxy).await;
     until(|| receiver.count() == 2).await;
@@ -118,7 +119,16 @@ async fn a_receiver_can_tell_a_forged_and_a_repeated_request_from_a_real_one() {
     let (first, second) = (&requests[0], &requests[1]);
     let timestamp = first.header("x-pgsnare-timestamp");
     let signature = first.header("x-pgsnare-signature");
-    let now = unix_seconds(first.at);
+
+    // The signed time is the time the request was sent: not before the
+    // event was raised, not after the receiver had the request.
+    let sent: u64 = timestamp.unwrap().parse().unwrap();
+    assert!(sent >= unix_seconds(before) && sent <= unix_seconds(first.at));
+
+    // The receiver's clock, for the checks below, reads exactly the signed
+    // second, so that every limit is tested at the limit itself whenever
+    // the request happened to cross a second on its way.
+    let now = sent;
     let verifier = || Verifier::new(KEY, Duration::from_secs(300));
     let check = |timestamp: Option<&str>, signature: Option<&str>, body: &[u8], now: u64| {
         verifier().check(timestamp, signature, body, now)
