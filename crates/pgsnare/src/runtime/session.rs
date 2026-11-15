@@ -833,19 +833,17 @@ impl Driver {
                 self.context.status.token_hit(&token_id, exempt);
                 self.context.status.actions_taken(actions);
             }
+            // A hit of a rule in an exempt session triggers nothing, and
+            // there is no counter of its own for it.
             #[cfg(feature = "rules")]
             Effect::RuleHit {
                 rule_id,
-                exempt,
+                exempt: false,
                 actions,
                 decided: _,
             } => {
-                // A hit in an exempt session triggers nothing, and
-                // there is no counter of its own for it.
-                if !exempt {
-                    self.context.status.rule_hit(&rule_id);
-                    self.context.status.actions_taken(actions);
-                }
+                self.context.status.rule_hit(&rule_id);
+                self.context.status.actions_taken(actions);
             }
             _ => {}
         }
