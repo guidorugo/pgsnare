@@ -41,6 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pgsnare_core::extension::EventSink;
+use zeroize::Zeroizing;
 
 use crate::config;
 use crate::redact::RedactorBuilder;
@@ -192,6 +193,10 @@ impl fmt::Display for SetupError {
 
 impl std::error::Error for SetupError {}
 
+/// The fewest bytes the signing key of a webhook may have. A sink with a
+/// shorter key is not built.
+pub const MIN_KEY_BYTES: usize = 16;
+
 /// What the log of `pgsnare run` and the report of `pgsnare config check`
 /// say about a signing key that is short.
 const SHORT_KEY: &str = "the signing key of this webhook is shorter than 32 bytes, which makes \
@@ -307,7 +312,7 @@ fn assemble(events: &config::Events, mut redactor: RedactorBuilder, purpose: Pur
         let built: Result<Option<Arc<dyn EventSink>>, String> = match sink {
             config::Sink::Webhook(webhook) => match webhook_from_config(&name, webhook) {
                 Ok((sink, url, short_key)) => {
-                    redactor = redactor.secret_text(&url).secret_text(sink.path());
+                    redactor = redactor.secret_text(url.as_str()).secret_text(sink.path());
                     options = options
                         .with_max_retries(webhook.max_retries)
                         .with_attempt_timeout(
@@ -327,19 +332,7 @@ fn assemble(events: &config::Events, mut redactor: RedactorBuilder, purpose: Pur
                         Ok(sink) => Ok(Some(Arc::new(sink))),
                         Err(error) => Err(error),
                     },
-                    Purpose::Check => match FileSink::check(&file.path) {
-                        Ok(open_to_others) => {
-                            if open_to_others {
-                                warnings.push(found(format!(
-                                    "{}: {}",
-                                    file.path.display(),
-                                    file::OPEN_TO_OTHERS
-                                )));
-                            }
-                            Ok(None)
-                        }
-                        Err(error) => Err(error),
-                    },
+                    Purpose::Check => FileSink::check(&file.path).map(|()| None),
                 };
                 outcome.map_err(|error| format!("{}: {error}", file.path.display()))
             }
@@ -369,25 +362,39 @@ fn assemble(events: &config::Events, mut redactor: RedactorBuilder, purpose: Pur
     }
 }
 
+/// The text of a secret, wiped when it is dropped like the bytes it was
+/// read as. `None` when the bytes are not valid UTF-8.
+fn secret_text(bytes: &[u8]) -> Option<Zeroizing<String>> {
+    core::str::from_utf8(bytes)
+        .ok()
+        .map(|text| Zeroizing::new(text.to_owned()))
+}
+
 /// Builds a webhook sink and returns it with its URL, which the caller
 /// hides, and with whether its signing key is shorter than it should be.
+/// The URL may be a secret: it is wiped when it is dropped.
 fn webhook_from_config(
     name: &str,
     webhook: &config::WebhookSink,
-) -> Result<(WebhookSink, String, bool), String> {
+) -> Result<(WebhookSink, Zeroizing<String>, bool), String> {
     let url = match &webhook.url {
-        config::UrlSource::Inline(url) => url.as_str().to_owned(),
+        config::UrlSource::Inline(url) => Zeroizing::new(url.as_str().to_owned()),
         config::UrlSource::Env(variable) => {
             // Never the bytes themselves: they are the URL, or what was
             // found in its place.
-            String::from_utf8(secret::from_env(variable)?.to_vec()).map_err(|_| {
+            secret_text(&secret::from_env(variable)?).ok_or_else(|| {
                 format!("the value of the environment variable {variable} is not valid UTF-8")
             })?
         }
-        config::UrlSource::File(file) => String::from_utf8(secret::from_file(file)?.to_vec())
-            .map_err(|_| format!("{}: the file is not valid UTF-8", file.display()))?,
+        config::UrlSource::File(file) => secret_text(&secret::from_file(file)?)
+            .ok_or_else(|| format!("{}: the file is not valid UTF-8", file.display()))?,
     };
     let key = secret::read(&webhook.hmac_secret)?;
+    if key.len() < MIN_KEY_BYTES {
+        return Err(format!(
+            "the signing key of this webhook is shorter than {MIN_KEY_BYTES} bytes"
+        ));
+    }
     let settings = WebhookSettings::new()
         .with_allow_insecure_http(webhook.allow_insecure_http)
         .with_timeout(webhook.timeout);
@@ -580,6 +587,25 @@ mod tests {
             )),
             "events.sinks[0] (webhook): the environment variable PGSNARE_TEST_KEY_THAT_IS_NOT_SET is not set"
         );
+
+        // A key that is too short to sign with is refused and not
+        // repeated, and one byte more is enough.
+        let short = dir.file("short", "fifteen-bytes-k\n");
+        let error = build(&format!(
+            "    - type: webhook\n      url: {URL}\n      hmac_secret_file: {short}\n"
+        ));
+        assert_eq!(
+            error,
+            "events.sinks[0] (webhook): the signing key of this webhook is shorter than 16 bytes"
+        );
+        let enough = dir.file("enough", "sixteen-bytes-key\n");
+        assert_eq!("sixteen-bytes-key".len(), MIN_KEY_BYTES + 1);
+        let exact = dir.file("exact", "sixteen-bytes-ke");
+        for key in [&enough, &exact] {
+            let sinks =
+                format!("    - type: webhook\n      url: {URL}\n      hmac_secret_file: {key}\n");
+            assert!(from_config(&events(&sinks), Redactor::builder()).is_ok());
+        }
 
         // The URL: a file whose content is no URL, and one that holds a
         // plain http URL where none is allowed. Neither is repeated.

@@ -5,8 +5,10 @@
 //! # The file
 //!
 //! - **It is created closed to other users**, with mode `0600`. A file
-//!   that is there already keeps the mode it has. When that mode lets
-//!   others than the owner read or write it, the sink says so in the log.
+//!   that is there already is written to only if it is as closed: it
+//!   belongs to the user pgsnare runs as, its mode gives nothing to the
+//!   group or to others, and it has one name, no hard link beside it.
+//!   Any other file is refused, and no event is written to it.
 //! - **A symbolic link is never followed.** If the last part of the path
 //!   is a link, the file is not opened: an event is not written to wherever
 //!   somebody pointed a link. The directories on the way are the
@@ -56,6 +58,12 @@ pub enum FileError {
     NotAFile,
     /// The file could not be opened or created.
     Open(io::ErrorKind),
+    /// The file belongs to another user than the one pgsnare runs as.
+    OtherOwner,
+    /// The mode of the file lets its group or others read or write it.
+    OpenToOthers,
+    /// The file has more than one name.
+    Linked,
 }
 
 impl FileError {
@@ -66,6 +74,14 @@ impl FileError {
             }
             Self::NotAFile => "the path does not lead to a regular file",
             Self::Open(_) => "the file cannot be opened",
+            Self::OtherOwner => {
+                "the file belongs to another user, and events are not written to it"
+            }
+            Self::OpenToOthers => {
+                "the file can be read or written by others than its owner, and events are not \
+                 written to it"
+            }
+            Self::Linked => "the file has more than one name, and events are not written to it",
         }
     }
 }
@@ -88,23 +104,37 @@ struct Opened {
     inode: u64,
 }
 
-/// What the log of `pgsnare run` and the report of `pgsnare config check`
-/// say about a file that is not closed to other users.
-pub(super) const OPEN_TO_OTHERS: &str =
-    "the file events are written to can be read or written by others than its owner";
+/// Why a file with this mode, this owner and this number of names is not
+/// written to by a process of the user `user`, or `None` when it is as
+/// closed as a file the sink creates.
+const fn refusal(mode: u32, owner: u32, names: u64, user: u32) -> Option<FileError> {
+    if owner != user {
+        return Some(FileError::OtherOwner);
+    }
+    if mode & 0o077 != 0 {
+        return Some(FileError::OpenToOthers);
+    }
+    if names != 1 {
+        return Some(FileError::Linked);
+    }
+    None
+}
 
 /// Opens the file at `path` for appending. With `create`, a file that is
-/// not there is created, closed to other users. Also says whether the file
-/// can be read or written by others than its owner.
-fn open(path: &Path, create: bool) -> Result<(Opened, bool), FileError> {
+/// not there is created, closed to other users. A file that is there and
+/// is not as closed is refused.
+fn open(path: &Path, create: bool) -> Result<Opened, FileError> {
     // Not through a link, and without waiting for the other end of a pipe
-    // that may stand where the file should be.
+    // that may stand where the file should be. Without these flags the
+    // file is not opened at all.
     let flags = OFlags::NOFOLLOW | OFlags::NONBLOCK;
+    let flags =
+        i32::try_from(flags.bits()).map_err(|_| FileError::Open(io::ErrorKind::Unsupported))?;
     let file = OpenOptions::new()
         .append(true)
         .create(create)
         .mode(0o600)
-        .custom_flags(i32::try_from(flags.bits()).unwrap_or(0))
+        .custom_flags(flags)
         .open(path)
         .map_err(|error| {
             // The system says "too many levels of symbolic links" when the
@@ -121,20 +151,19 @@ fn open(path: &Path, create: bool) -> Result<(Opened, bool), FileError> {
     if !metadata.is_file() {
         return Err(FileError::NotAFile);
     }
-    let open_to_others = metadata.mode() & 0o077 != 0;
-    Ok((
-        Opened {
-            file,
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        },
-        open_to_others,
-    ))
+    let user = rustix::process::geteuid().as_raw();
+    if let Some(refused) = refusal(metadata.mode(), metadata.uid(), metadata.nlink(), user) {
+        return Err(refused);
+    }
+    Ok(Opened {
+        file,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
 }
 
 /// The file of a sink, and what the sink remembers about it.
 struct EventsFile {
-    name: String,
     path: PathBuf,
     opened: Option<Opened>,
     /// Whether the last write left a part of a line behind.
@@ -144,15 +173,7 @@ struct EventsFile {
 impl EventsFile {
     /// Opens the file for appending, and creates it when it is not there.
     fn open(&self) -> Result<Opened, FileError> {
-        let (opened, open_to_others) = open(&self.path, true)?;
-        if open_to_others {
-            tracing::warn!(
-                sink = %self.name,
-                file = %self.path.display(),
-                "{OPEN_TO_OTHERS}"
-            );
-        }
-        Ok(opened)
+        open(&self.path, true)
     }
 
     /// Whether the path still leads to the file that is open.
@@ -248,7 +269,6 @@ impl FileSink {
     pub fn new(name: impl Into<String>, path: impl Into<PathBuf>) -> Result<Self, FileError> {
         let name = name.into();
         let mut file = EventsFile {
-            name: name.clone(),
             path: path.into(),
             opened: None,
             torn: false,
@@ -269,17 +289,14 @@ impl FileSink {
     /// would be created in must be there, and this process must be allowed
     /// to create a file in it.
     ///
-    /// Returns whether the file is there and can be read or written by
-    /// others than its owner, which `new` says in the log.
-    ///
     /// # Errors
     ///
     /// Returns why `new` would fail. A file that is not there can still
     /// fail to be created for a reason that cannot be seen from here, such
     /// as a disk that is full.
-    pub fn check(path: &Path) -> Result<bool, FileError> {
+    pub fn check(path: &Path) -> Result<(), FileError> {
         match open(path, false) {
-            Ok((_, open_to_others)) => Ok(open_to_others),
+            Ok(_) => Ok(()),
             Err(FileError::Open(io::ErrorKind::NotFound)) => {
                 let directory = match path.parent() {
                     Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -291,7 +308,7 @@ impl FileSink {
                 }
                 rustix::fs::access(directory, Access::WRITE_OK | Access::EXEC_OK)
                     .map_err(|error| failed(io::Error::from(error)))?;
-                Ok(false)
+                Ok(())
             }
             Err(error) => Err(error),
         }
@@ -390,18 +407,104 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_file_that_is_there_is_appended_to_and_keeps_its_mode() {
+    async fn a_file_that_is_there_and_closed_to_others_is_appended_to() {
         let dir = TempDir::new();
         let path = dir.0.join("events.jsonl");
         std::fs::write(&path, "an earlier line\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         let sink = FileSink::new("file-0", &path).unwrap();
         sink.deliver(&event("app")).await.unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.starts_with("an earlier line\n{"), "{content}");
         assert_eq!(content.lines().count(), 2);
-        assert_eq!(mode(&path), 0o640);
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[tokio::test]
+    async fn a_file_that_is_open_to_others_is_not_written_to() {
+        let dir = TempDir::new();
+        let path = dir.0.join("events.jsonl");
+        for open in [0o640, 0o620, 0o604, 0o602, 0o666] {
+            std::fs::write(&path, "an earlier line\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(open)).unwrap();
+            assert_eq!(
+                FileSink::new("file-0", &path).err(),
+                Some(FileError::OpenToOthers),
+                "{open:o}"
+            );
+            assert_eq!(FileSink::check(&path), Err(FileError::OpenToOthers));
+            // Nothing was written, and nothing about the file was changed.
+            assert_eq!(std::fs::read(&path).unwrap(), b"an earlier line\n");
+            assert_eq!(mode(&path), open);
+        }
+
+        // A file that is opened to others while the sink runs: the sink
+        // notices when it opens the file anew, after a rotation.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let sink = FileSink::new("file-0", &path).unwrap();
+        sink.deliver(&event("first")).await.unwrap();
+        std::fs::rename(&path, dir.0.join("events.jsonl.1")).unwrap();
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(sink.deliver(&event("second")).await.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+    }
+
+    #[tokio::test]
+    async fn a_file_with_a_second_name_is_not_written_to() {
+        let dir = TempDir::new();
+        let path = dir.0.join("events.jsonl");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let other_name = dir.0.join("another-name");
+        std::fs::hard_link(&path, &other_name).unwrap();
+        assert_eq!(
+            FileSink::new("file-0", &path).err(),
+            Some(FileError::Linked)
+        );
+        assert_eq!(FileSink::check(&path), Err(FileError::Linked));
+        assert_eq!(std::fs::read(&other_name).unwrap(), b"");
+
+        // With the other name gone, the file is the sink's alone.
+        std::fs::remove_file(&other_name).unwrap();
+        let sink = FileSink::new("file-0", &path).unwrap();
+        sink.deliver(&event("app")).await.unwrap();
+        assert_eq!(users(&path), ["app"]);
+    }
+
+    #[test]
+    fn only_a_file_of_the_user_that_is_closed_and_has_one_name_is_taken() {
+        assert_eq!(refusal(0o100_600, 1000, 1, 1000), None);
+        assert_eq!(refusal(0o100_400, 0, 1, 0), None);
+        // The file of another user, also for a process that may write to
+        // any file.
+        assert_eq!(
+            refusal(0o100_600, 1001, 1, 1000),
+            Some(FileError::OtherOwner)
+        );
+        assert_eq!(refusal(0o100_600, 1000, 1, 0), Some(FileError::OtherOwner));
+        for bit in [0o040, 0o020, 0o010, 0o004, 0o002, 0o001] {
+            assert_eq!(
+                refusal(0o100_600 | bit, 1000, 1, 1000),
+                Some(FileError::OpenToOthers),
+                "{bit:o}"
+            );
+        }
+        assert_eq!(refusal(0o100_600, 1000, 2, 1000), Some(FileError::Linked));
+        assert_eq!(refusal(0o100_600, 1000, 0, 1000), Some(FileError::Linked));
+        for refused in [
+            FileError::OtherOwner,
+            FileError::OpenToOthers,
+            FileError::Linked,
+        ] {
+            assert!(
+                refused
+                    .to_string()
+                    .ends_with("events are not written to it"),
+                "{refused}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -489,14 +592,15 @@ mod tests {
         assert_eq!(users(&path), ["two"]);
         assert_eq!(mode(&path), 0o600);
 
-        // Renamed, with a new file already in its place.
+        // Renamed, with a new file already in its place, closed to others
+        // as the sink would have made it.
         std::fs::rename(&path, &rotated).unwrap();
         std::fs::write(&path, "").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         sink.deliver(&event("three")).await.unwrap();
         assert_eq!(users(&rotated), ["two"]);
         assert_eq!(users(&path), ["three"]);
-        assert_eq!(mode(&path), 0o640);
+        assert_eq!(mode(&path), 0o600);
 
         // Removed.
         std::fs::remove_file(&path).unwrap();
@@ -528,7 +632,6 @@ mod tests {
         let dir = TempDir::new();
         let path = dir.0.join("events.jsonl");
         let mut file = EventsFile {
-            name: "file-0".to_owned(),
             path: path.clone(),
             opened: None,
             torn: false,
@@ -571,7 +674,7 @@ mod tests {
         // A file that is not there, in a directory that is: the sink could
         // be built, and the file is still not there.
         let path = dir.0.join("events.jsonl");
-        assert_eq!(FileSink::check(&path), Ok(false));
+        assert_eq!(FileSink::check(&path), Ok(()));
         assert!(!path.exists());
 
         // A directory that is not there.
@@ -599,15 +702,19 @@ mod tests {
         );
 
         // A file that is there keeps its content and its mode, and a mode
-        // that lets others in is reported.
+        // that lets others in is refused, as the sink refuses it.
         let open = dir.0.join("open.jsonl");
         std::fs::write(&open, b"{}\n").unwrap();
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(FileSink::check(&open), Ok(true));
+        assert_eq!(FileSink::check(&open), Err(FileError::OpenToOthers));
+        assert_eq!(
+            FileSink::new("file-0", &open).err(),
+            Some(FileError::OpenToOthers)
+        );
         assert_eq!(std::fs::read(&open).unwrap(), b"{}\n");
         assert_eq!(mode(&open), 0o644);
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(FileSink::check(&open), Ok(false));
+        assert_eq!(FileSink::check(&open), Ok(()));
 
         // A directory in which nothing can be created: the check and the
         // sink agree, whoever runs the test.
