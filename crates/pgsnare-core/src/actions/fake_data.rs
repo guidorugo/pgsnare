@@ -24,9 +24,9 @@
 //! Rows are not added, and the result goes on as the server sent it, when
 //! a column is in binary format, a column has no sample to draw from, the
 //! command is not a `SELECT`, the random source fails, or the rows built
-//! contain anything the matcher finds. The caller decides before the hit
-//! is reported whether rows can be added at all (see the inspector), so
-//! these cases are rare.
+//! contain anything the matcher finds. The caller reports the hit when the
+//! result has ended, and says `fake_data` only if [`FakeRows::finish`]
+//! added rows (see the inspector).
 
 use core::fmt::Write as _;
 

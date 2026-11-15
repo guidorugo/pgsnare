@@ -61,6 +61,28 @@
 //! A decision for responses none of which is built yet is carried out as
 //! `alert`. The event and [`Effect::TokenHit`] say what was carried out.
 //!
+//! # A hit that asks for made-up rows
+//!
+//! Whether rows can be added to a result is known for certain only when
+//! the result ends. The report of a hit that is answered with `fake_data`,
+//! that is its event and its count, is therefore kept back until then, and
+//! says `fake_data` only if rows were added. In every other case it says
+//! what is left of the response, `alert` when nothing is: the result ended
+//! without a `CommandComplete` that counts rows, a row did not fit the
+//! description or arrived in chunks, no value could be drawn for a column,
+//! the session ended first, or the runtime said that the report must not
+//! wait any longer ([`Report::EventDue`](crate::session::Report::EventDue)).
+//! In that last case rows are no longer added to that result, so the
+//! report stays true.
+//!
+//! One report is kept back at a time. Rows are added to a result once,
+//! however many hits it holds, and of those hits the last one that asked
+//! for rows reports them: a later hit that asks for rows sends the report
+//! before it on its way as `alert`. A hit that ends the session does the
+//! same, so the reports leave in the order of the hits. No report is kept
+//! back for longer than the runtime allows, and none is dropped: what is
+//! kept back when the session ends is handed over then.
+//!
 //! # The statement of an event
 //!
 //! A tracker (the `track` module) tells which statement a message belongs
@@ -150,7 +172,7 @@ use crate::session::{Direction, Effect, Output};
 use super::names::{STARTUP_MESSAGE, message_name};
 #[cfg(feature = "rules")]
 use super::rules::{self, Hook};
-use super::track::{Statement, Tracker};
+use super::track::{Asked, Statement, Tracker};
 use super::{Context, InspectionError, Inspector, Verdict};
 
 /// A stream scanner and the generation of the snapshot whose matcher it
@@ -321,6 +343,61 @@ impl fmt::Debug for Responses {
     }
 }
 
+/// Whose rows a `RowDescription` describes.
+#[derive(PartialEq, Eq)]
+enum Described {
+    /// Nobody's that the session can tell.
+    Nothing,
+    /// Those of the `Query` being answered.
+    Query,
+    /// Those of the portal of this name.
+    Portal(Box<[u8]>),
+}
+
+/// What is reported of one hit that is not exempt: the count for the
+/// runtime, and the event.
+struct HitReport {
+    subject: Subject,
+    decided: ActionSet,
+    actions: ActionSet,
+    body: Box<EventBody>,
+}
+
+/// What a hit is a hit of.
+enum Subject {
+    Token(TokenId),
+    #[cfg(feature = "rules")]
+    Rule(RuleId),
+}
+
+impl HitReport {
+    /// Queues the count and the event. `added` tells whether the rows
+    /// that `fake_data` asked for were added: when they were not, the
+    /// report does not say `fake_data`.
+    fn emit(mut self, added: bool, out: &mut Output) {
+        if !added {
+            self.actions = without(self.actions, Action::FakeData);
+        }
+        self.body.action_taken = self.actions;
+        out.effects.push(match self.subject {
+            Subject::Token(token_id) => Effect::TokenHit {
+                token_id,
+                exempt: false,
+                decided: self.decided,
+                actions: self.actions,
+            },
+            #[cfg(feature = "rules")]
+            Subject::Rule(rule_id) => Effect::RuleHit {
+                rule_id,
+                exempt: false,
+                decided: self.decided,
+                actions: self.actions,
+            },
+        });
+        out.effects.push(Effect::Emit(self.body));
+    }
+}
+
 /// The state of the responses of one session.
 struct Responder {
     entropy: Box<dyn Entropy + Send>,
@@ -329,6 +406,12 @@ struct Responder {
     tarpit: Option<Tarpit>,
     /// The result the server is sending, while rows can be made up for it.
     rows: Option<FakeRows>,
+    /// Whose rows `rows` describes.
+    described: Described,
+    /// The report of the hit that asked for rows in the result the server
+    /// is sending, kept back until it is known whether they were added.
+    /// Only ever set while `rows` is.
+    held: Option<HitReport>,
     /// Whether the next `RowDescription` describes a prepared statement,
     /// whose formats are not those of its results.
     describing_statement: bool,
@@ -347,6 +430,51 @@ impl Responder {
         ])
     }
 
+    /// Hands over the report that is kept back, if any. `added` tells
+    /// whether rows were added to the result it waited for.
+    fn settle(&mut self, added: bool, out: &mut Output) {
+        if let Some(report) = self.held.take() {
+            report.emit(added, out);
+        }
+    }
+
+    /// No rows are added to the result the server is sending, whatever
+    /// asked for them, and the report that waited for it says so.
+    fn give_up(&mut self, out: &mut Output) {
+        self.rows = None;
+        self.settle(false, out);
+    }
+
+    /// Follows whose rows the server describes and whose rows it sends,
+    /// before the tracker moves on from the message with `tag`. `asked` is
+    /// what that message answers.
+    ///
+    /// A client can have one portal described and then run another, with
+    /// other columns or other formats. Rows are made up only for the
+    /// result that was described.
+    fn source(&mut self, tag: u8, asked: Asked<'_>, out: &mut Output) {
+        match tag {
+            backend::tag::ROW_DESCRIPTION => {
+                self.described = match asked {
+                    Asked::Query => Described::Query,
+                    Asked::Describe(portal) => Described::Portal(portal.into()),
+                    Asked::Execute(_) | Asked::Other => Described::Nothing,
+                };
+            }
+            backend::tag::DATA_ROW => {
+                let described = match (&self.described, asked) {
+                    (Described::Query, Asked::Query) => true,
+                    (Described::Portal(described), Asked::Execute(run)) => **described == *run,
+                    _ => false,
+                };
+                if !described {
+                    self.give_up(out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Follows the results of the session, before `frame` is searched, and
     /// tells whether a hit in it can add rows.
     fn before(
@@ -354,6 +482,7 @@ impl Responder {
         frame: Frame<'_>,
         statement: &Statement<'_>,
         context: &Context<'_>,
+        out: &mut Output,
     ) -> bool {
         let tag = frame.tag();
         match (from_wire(frame.direction()), tag) {
@@ -372,6 +501,8 @@ impl Responder {
                 false
             }
             (Direction::FromServer, backend::tag::ROW_DESCRIPTION) => {
+                // A result that begins ends the one before it.
+                self.give_up(out);
                 let statement = core::mem::take(&mut self.describing_statement);
                 self.rows = (!statement && wants_rows(context.policy))
                     .then(|| FakeRows::describe(frame))
@@ -380,7 +511,7 @@ impl Responder {
             }
             (Direction::FromServer, backend::tag::NO_DATA) => {
                 self.describing_statement = false;
-                self.rows = None;
+                self.give_up(out);
                 false
             }
             (Direction::FromServer, backend::tag::DATA_ROW) => {
@@ -412,25 +543,36 @@ impl Responder {
                 }
                 false
             }
-            backend::tag::COMMAND_COMPLETE => self.rows.take().is_some_and(|rows| {
-                rows.is_chosen()
-                    && !raised.kill
-                    && raised.error.is_none()
-                    && rows
-                        .finish(
-                            context.policy.actions().fake_data.rows,
-                            frame,
-                            context.policy.matcher(),
-                            &mut *self.entropy,
-                            &mut out.to_client,
-                        )
-                        .is_some()
-            }),
+            backend::tag::COMMAND_COMPLETE => {
+                // Rows are added only when a report waits to say so.
+                let reported = self.held.is_some();
+                let added = self.rows.take().is_some_and(|rows| {
+                    reported
+                        && rows.is_chosen()
+                        && !raised.kill
+                        && raised.error.is_none()
+                        && rows
+                            .finish(
+                                context.policy.actions().fake_data.rows,
+                                frame,
+                                context.policy.matcher(),
+                                &mut *self.entropy,
+                                &mut out.to_client,
+                            )
+                            .is_some()
+                });
+                self.settle(added, out);
+                added
+            }
+            // The result is over without a count of rows, or the portal
+            // whose rows were described is another one from here on.
             backend::tag::READY_FOR_QUERY
             | backend::tag::ERROR_RESPONSE
             | backend::tag::PORTAL_SUSPENDED
-            | backend::tag::EMPTY_QUERY_RESPONSE => {
-                self.rows = None;
+            | backend::tag::EMPTY_QUERY_RESPONSE
+            | backend::tag::BIND_COMPLETE
+            | backend::tag::CLOSE_COMPLETE => {
+                self.give_up(out);
                 false
             }
             _ => false,
@@ -659,17 +801,39 @@ impl Ledger {
 
         let mut body = self.body(EventKind::TokenHit, place);
         body.token_id = Some(token_id.clone());
-        body.action_taken = actions;
         self.flagged = true;
 
-        out.effects.push(Effect::TokenHit {
-            token_id,
-            exempt: false,
-            decided,
-            actions,
-        });
-        out.effects.push(Effect::Emit(Box::new(body)));
+        self.report(
+            HitReport {
+                subject: Subject::Token(token_id),
+                decided,
+                actions,
+                body: Box::new(body),
+            },
+            out,
+        );
         actions
+    }
+
+    /// Reports a hit: now, or when the result it is in has ended if the
+    /// hit asks for made-up rows, see the module documentation.
+    fn report(&mut self, report: HitReport, out: &mut Output) {
+        let Some(responder) = self.responder.as_mut() else {
+            return report.emit(true, out);
+        };
+        let fake = report.actions.contains(Action::FakeData);
+        if fake || report.actions.contains(Action::Kill) {
+            // The report that waits goes first. Nothing has been added
+            // yet: a later hit reports the rows, and a session that ends
+            // here gets none.
+            responder.settle(false, out);
+        }
+        if fake {
+            responder.held = Some(report);
+            out.effects.push(Effect::EventHeld);
+        } else {
+            report.emit(true, out);
+        }
     }
 
     /// The responses to one hit that are carried out, of those the policy
@@ -735,17 +899,18 @@ impl Ledger {
 
         let mut body = self.body(EventKind::RuleHit, place);
         body.rule_id = Some(rule_id.clone());
-        body.action_taken = actions;
         body.rows_so_far = rows_so_far;
         self.flagged = true;
 
-        out.effects.push(Effect::RuleHit {
-            rule_id,
-            exempt: false,
-            decided,
-            actions,
-        });
-        out.effects.push(Effect::Emit(Box::new(body)));
+        self.report(
+            HitReport {
+                subject: Subject::Rule(rule_id),
+                decided,
+                actions,
+                body: Box::new(body),
+            },
+            out,
+        );
         actions
     }
 }
@@ -794,6 +959,8 @@ impl Scanner {
             tarpits: Arc::clone(&responses.tarpits),
             tarpit: None,
             rows: None,
+            described: Described::Nothing,
+            held: None,
             describing_statement: false,
             limited: false,
         };
@@ -932,13 +1099,18 @@ impl Inspector for Scanner {
         }
         let statement = match direction {
             Direction::FromClient => self.tracker.client(frame, context.in_copy),
-            Direction::FromServer => self.tracker.server(tag, Some(frame.body())),
+            Direction::FromServer => {
+                if let Some(responder) = self.ledger.responder.as_mut() {
+                    responder.source(tag, self.tracker.asked(), out);
+                }
+                self.tracker.server(tag, Some(frame.body()))
+            }
         };
         let rows = self
             .ledger
             .responder
             .as_mut()
-            .is_some_and(|responder| responder.before(frame, &statement, context));
+            .is_some_and(|responder| responder.before(frame, &statement, context, out));
         let place = Place {
             direction,
             name: message_name(direction, tag),
@@ -1007,6 +1179,14 @@ impl Inspector for Scanner {
     ) -> Result<Verdict, InspectionError> {
         let tag = header.tag();
         let name = message_name(direction, tag);
+        // A message of the server that arrives in chunks is not followed:
+        // a row is not sampled and a description is not read. No rows are
+        // made up for the result it is in.
+        if direction == Direction::FromServer
+            && let Some(responder) = self.ledger.responder.as_mut()
+        {
+            responder.give_up(out);
+        }
         let statement = match direction {
             Direction::FromClient => self.tracker.client_chunked(tag, context.in_copy),
             Direction::FromServer => self.tracker.server(tag, None),
@@ -1127,6 +1307,16 @@ impl Inspector for Scanner {
         {
             let delay = tarpit.delay(to_client, &mut *responder.entropy);
             out.effects.push(Effect::Delay(delay));
+        }
+    }
+
+    fn event_due(&mut self, out: &mut Output) {
+        if let Some(responder) = self.ledger.responder.as_mut()
+            && responder.held.is_some()
+        {
+            // The report leaves without the rows, so none are added to
+            // this result any more.
+            responder.give_up(out);
         }
     }
 

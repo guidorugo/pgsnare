@@ -383,6 +383,20 @@ fn name(bytes: &[u8]) -> Result<Name, Unexpected> {
     Ok(bytes.into())
 }
 
+/// What a message of the server answers, as far as it tells whose rows a
+/// description describes and whose rows the server sends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Asked<'a> {
+    /// A `Query`.
+    Query,
+    /// A `Describe` of the portal of this name.
+    Describe(&'a [u8]),
+    /// An `Execute` of the portal of this name.
+    Execute(&'a [u8]),
+    /// Anything else, or the tracker has lost its place.
+    Other,
+}
+
 /// A portal the server has confirmed.
 struct Portal {
     text: Arc<Kept>,
@@ -730,6 +744,22 @@ impl Tracker {
             }
             Some(Pending::Execute { portal }) => self.confirmed(Target::Portal, portal),
             Some(Pending::Sync | Pending::FunctionCall) | None => None,
+        }
+    }
+
+    /// What the next message of the server answers.
+    pub(super) fn asked(&self) -> Asked<'_> {
+        if self.is_lost() {
+            return Asked::Other;
+        }
+        match self.pending.front() {
+            Some(Pending::Query(_)) => Asked::Query,
+            Some(Pending::Describe {
+                target: Target::Portal,
+                name,
+            }) => Asked::Describe(name),
+            Some(Pending::Execute { portal }) => Asked::Execute(portal),
+            _ => Asked::Other,
         }
     }
 

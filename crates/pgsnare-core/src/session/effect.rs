@@ -46,6 +46,15 @@ pub enum Effect {
     },
     /// Hand this event to the dispatcher, without waiting for it.
     Emit(Box<EventBody>),
+    /// The session keeps back the report of a hit until the result the hit
+    /// is in has ended, so that the report can say whether rows were added
+    /// to that result. The session has no clock: the runtime answers with
+    /// [`Report::EventDue`] when the time it allows for that has passed,
+    /// counted from the last effect of this kind, and once more when the
+    /// session ends, however it ends.
+    ///
+    /// [`Report::EventDue`]: super::Report::EventDue
+    EventHeld,
     /// Start TLS on the client connection, as its server side, once the
     /// bytes queued for the client have been sent.
     ///

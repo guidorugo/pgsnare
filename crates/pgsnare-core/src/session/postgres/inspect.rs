@@ -229,6 +229,15 @@ pub trait Inspector: Send {
         let _ = direction;
     }
 
+    /// Called when a report the inspector keeps back must not wait any
+    /// longer: the time the runtime allows has passed, or the session is
+    /// over. The inspector appends to `out` what it kept. It is called in
+    /// every state of a session, also one that has ended or that goes on
+    /// without inspection, and more than once.
+    fn event_due(&mut self, out: &mut Output) {
+        let _ = out;
+    }
+
     /// Called with the answer to an [`Effect::Analyse`] of this inspector,
     /// while the session holds the message the inspector answered with
     /// [`Verdict::Hold`].

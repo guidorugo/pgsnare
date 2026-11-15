@@ -1139,6 +1139,12 @@ impl ProtocolSession for PostgresSession {
         out: &mut Output,
     ) -> Result<(), SessionError> {
         match (report, self.phase) {
+            // Whatever became of the session, a report that was kept back
+            // is not lost with it.
+            (Report::EventDue, _) => {
+                self.inspector.event_due(out);
+                Ok(())
+            }
             (Report::ShuttingDown, _) => self.farewell(out),
             (_, Phase::Closed) => Ok(()),
             (Report::TarpitOver, Phase::Established) => {
