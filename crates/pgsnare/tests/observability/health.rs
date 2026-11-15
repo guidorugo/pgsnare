@@ -13,13 +13,15 @@ use crate::process::{
 use crate::support::{soon, until};
 
 /// A configuration with one listener and with ports of its own for health
-/// and metrics. Returns the file and the three ports.
+/// and metrics. `admin` is a port that is already taken, when one is given;
+/// the other ports are picked free. Returns the file and the three ports.
 fn configuration(
     dir: &TempDir,
     database: &Database,
     grace_period: &str,
+    admin: Option<u16>,
 ) -> (std::path::PathBuf, u16, u16, u16) {
-    let (port, admin, metrics) = (free_port(), free_port(), free_port());
+    let (port, admin, metrics) = (free_port(), admin.unwrap_or_else(free_port), free_port());
     let config = dir.write(
         "pgsnare.yaml",
         format!(
@@ -52,7 +54,7 @@ async fn healthcheck(config: &std::path::Path, ready: bool) -> (Option<i32>, Str
 async fn a_running_proxy_answers_its_health_check_and_serves_its_metrics() {
     let database = Database::start().await;
     let dir = TempDir::new();
-    let (config, port, admin, metrics) = configuration(&dir, &database, "1s");
+    let (config, port, admin, metrics) = configuration(&dir, &database, "1s", None);
     let mut pgsnare = Pgsnare::run(&config, &[]);
     pgsnare.listening(port).await;
 
@@ -143,7 +145,7 @@ async fn a_running_proxy_answers_its_health_check_and_serves_its_metrics() {
 async fn a_proxy_that_stops_is_healthy_and_not_ready() {
     let database = Database::start().await;
     let dir = TempDir::new();
-    let (config, port, admin, _metrics) = configuration(&dir, &database, "30s");
+    let (config, port, admin, _metrics) = configuration(&dir, &database, "30s", None);
     let mut pgsnare = Pgsnare::run(&config, &[]);
     pgsnare.listening(port).await;
 
@@ -185,9 +187,13 @@ async fn a_proxy_that_stops_is_healthy_and_not_ready() {
 async fn a_port_that_is_taken_keeps_the_proxy_from_starting() {
     let database = Database::start().await;
     let dir = TempDir::new();
-    let (config, _port, admin, _metrics) = configuration(&dir, &database, "1s");
-    // Something else listens where the admin listener is meant to.
-    let _taken = std::net::TcpListener::bind(("127.0.0.1", admin)).unwrap();
+    // Something else listens where the admin listener is meant to. The
+    // socket is bound before the port is written into the configuration
+    // and is held for the whole test, so the port is taken from the
+    // moment it is picked and no other test can take it in between.
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let admin = taken.local_addr().unwrap().port();
+    let (config, _port, _admin, _metrics) = configuration(&dir, &database, "1s", Some(admin));
 
     let mut pgsnare = Pgsnare::run(&config, &[]);
     let status = pgsnare.ended().await;
