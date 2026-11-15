@@ -182,9 +182,10 @@ events:
   sinks:
     - type: stdout
     # The receiver is a container on the internal network of the run, so
-    # plain HTTP is accepted here: see tests/hook/receiver.pl.
+    # plain HTTP is accepted here: see tests/hook/receiver.pl. The log masks
+    # the URL wherever it appears, so its path is a word nothing else has.
     - type: webhook
-      url: http://receiver:8080/pgsnare
+      url: http://receiver:8080/itest-events
       hmac_secret_file: /state/config/hook.key
       allow_insecure_http: true
 shutdown:
