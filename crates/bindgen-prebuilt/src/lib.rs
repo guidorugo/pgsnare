@@ -33,8 +33,9 @@
 //! - **The target is checked.** The declarations use C's `char`, `int`,
 //!   `unsigned`, `size_t`, `bool`, integers of a fixed width, pointers,
 //!   and structures of these, and they name the C types rather than a size.
-//!   They were made on 64-bit Linux on x86-64; 64-bit Linux on ARM lays all
-//!   of these out the same way. Any other target is refused.
+//!   They were made on 64-bit Linux on x86-64 with glibc; 64-bit Linux on
+//!   ARM lays all of these out the same way, and so does musl on either,
+//!   which the release image is built for. Any other target is refused.
 //!
 //! # Making the declarations again
 //!
