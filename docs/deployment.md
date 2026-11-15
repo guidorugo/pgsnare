@@ -145,6 +145,7 @@ The chart in [`deploy/chart/pgsnare/`](../deploy/chart/pgsnare/README.md) instal
 
 What to know:
 
+- **No writable file in a pod.** In a Kubernetes pod pgsnare needs no writable file at all. The events go to standard output (the chart default, `sinks: stdout: true` in the values in [`deploy/chart/pgsnare/`](../deploy/chart/pgsnare/README.md)) or to a webhook, and the root filesystem stays read-only. The `file` sink is for a host with a log collector.
 - **The NetworkPolicy needs a network plugin that enforces it.** Where the plugin does not, nothing in the chart restricts who reaches the pods, and the metrics port must not be opened. The chart cannot check this. It is tested on one plugin only.
 - **Namespace.** The pods meet the "restricted" Pod Security Standard in full, so a namespace that enforces it accepts them. The chart is installed that way in CI.
 - **Changing a token Secret needs no restart.** The kubelet updates the mounted files, which can take up to a few minutes (62 seconds in the CI cluster), and pgsnare reads them about two seconds later. A change of any other Secret, or of the values, needs new pods: `kubectl rollout restart deployment/<release>-pgsnare`.

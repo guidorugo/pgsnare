@@ -595,7 +595,7 @@ A retry carries the same event and `event_id` under a new timestamp and signatur
 
 **File.**
 
-- The file is created with mode `0600`. A file that is there keeps its mode, and pgsnare says in its log when others than the owner can read or write it.
+- The file is created with mode `0600`. A file that is there keeps its mode. Its group may read it, which a log collector in the same group needs; the group may not write to it and others may not use it, and pgsnare says in its log when the file is refused for its mode.
 - If the last part of the path is a symbolic link, the file is not opened. Only a regular file is written to. The directories on the way are the operator's to protect.
 - **Rotation.** Before each event the sink looks at what the path leads to. After a rename or a removal, the next event goes to a new file at the path, which the sink creates if nothing else has. After the file was emptied in place, the sink goes on at its new end. Nothing has to tell pgsnare.
 - A write that fails is tried again like any failed delivery. If only a part of a line reached the file, the next write starts with a line break, so that the broken line does not run into the next event.
