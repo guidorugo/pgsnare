@@ -91,7 +91,8 @@ pub use load::{LoadError, Loaded, MAX_FILE_BYTES, load};
 pub use names::{Endpoint, EnvVarName, Host, InvalidText, LabelName, ListenAddr, Name, WebhookUrl};
 pub use rules::{
     CatalogEnumerationRule, DEFAULT_MAX_PARSE_BYTES, FunctionsRule, MAX_MAX_PARSE_BYTES,
-    ParseFailurePolicy, RowThresholdRule, Rules, UnboundedReadRule,
+    PARSE_MEMORY_FACTOR, PARSER_MEMORY_BUDGET, PARSER_THREADS, ParseFailurePolicy,
+    RowThresholdRule, Rules, UnboundedReadRule,
 };
 pub use sinks::{
     DEFAULT_QUEUE_SIZE, DEFAULT_WEBHOOK_RETRIES, DEFAULT_WEBHOOK_TIMEOUT, FileSink, MAX_QUEUE_SIZE,

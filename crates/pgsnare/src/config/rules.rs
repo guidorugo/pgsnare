@@ -76,6 +76,27 @@ pub const DEFAULT_MAX_PARSE_BYTES: u64 = 64 * 1024;
 /// value would let one statement use up the memory of the host.
 pub const MAX_MAX_PARSE_BYTES: u64 = 1024 * 1024;
 
+/// How many times its size a statement can take in memory while a parser
+/// thread reads it: about 1,500, measured once on statements built to be
+/// expensive.
+pub const PARSE_MEMORY_FACTOR: u64 = 1_500;
+
+/// The number of parser threads a proxy starts, which is also how many
+/// statements are read at once.
+pub const PARSER_THREADS: u64 = 2;
+
+/// The memory the parser threads may take at their worst before
+/// `pgsnare config check` warns: 256 MiB.
+///
+/// The deployment documents give a proxy without rules a memory limit of
+/// 256 MiB, and one with rules 512 MiB. This is what the second leaves for
+/// the parser threads. The default [`Rules::max_parse_bytes`] takes about
+/// 188 MiB of it.
+pub const PARSER_MEMORY_BUDGET: u64 = 256 * 1024 * 1024;
+
+const _: () =
+    assert!(PARSER_THREADS * DEFAULT_MAX_PARSE_BYTES * PARSE_MEMORY_FACTOR <= PARSER_MEMORY_BUDGET);
+
 const fn default_max_parse_bytes() -> u64 {
     DEFAULT_MAX_PARSE_BYTES
 }
@@ -274,6 +295,16 @@ applies_where!(
 );
 
 impl Rules {
+    /// The memory the parser threads can take at their worst, in bytes:
+    /// every thread reading a statement of [`Rules::max_parse_bytes`] at
+    /// once, each at [`PARSE_MEMORY_FACTOR`] times its size.
+    #[must_use]
+    pub const fn parser_memory(&self) -> u64 {
+        PARSER_THREADS
+            .saturating_mul(self.max_parse_bytes)
+            .saturating_mul(PARSE_MEMORY_FACTOR)
+    }
+
     /// Checks the section. `listeners` are the names of the configured
     /// listeners, which a rule may refer to.
     pub(super) fn validate(&self, listeners: &[&str], at: &At, problems: &mut Problems) {

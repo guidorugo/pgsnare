@@ -463,6 +463,16 @@ mod tests {
     }
 
     #[test]
+    fn the_threads_started_by_default_are_those_the_configuration_counts_with() {
+        // `pgsnare config check` works out the memory the threads can take
+        // from this number.
+        assert_eq!(
+            u64::try_from(ParserSettings::default().threads).unwrap(),
+            crate::config::PARSER_THREADS
+        );
+    }
+
+    #[test]
     fn a_statement_is_analysed_once_and_then_comes_from_the_cache() {
         let pool = pool(2, 8);
         let limits = Limits::default();

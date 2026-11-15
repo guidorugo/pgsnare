@@ -13,7 +13,7 @@ use pgsnare_core::policy::{Action, ActionSet, OnError};
 
 use super::Config;
 use super::error::At;
-use super::rules::ParseFailurePolicy;
+use super::rules::{PARSER_MEMORY_BUDGET, ParseFailurePolicy};
 use super::sinks::{Sink, UrlSource};
 use super::tls::UpstreamTlsMode;
 
@@ -50,6 +50,10 @@ impl Config {
     ///   `tarpit`, while `rules.on_parse_failure` is not `block`: a
     ///   statement that cannot be analysed is then passed on, and the rule
     ///   does not judge it.
+    /// - `rules.max_parse_bytes` so large that the parser threads can take
+    ///   more than [`PARSER_MEMORY_BUDGET`] at their worst: a client that
+    ///   is logged in can then use up the memory limit that the deployment
+    ///   documents give a proxy with rules.
     ///
     /// Only the configuration is looked at. Nothing is read from disk and
     /// nothing is connected to.
@@ -133,6 +137,19 @@ impl Config {
                      makes the response of such a rule certain",
                 );
             }
+        }
+
+        if let Some(rules) = &self.rules
+            && rules.parser_memory() > PARSER_MEMORY_BUDGET
+        {
+            warn(
+                root.field("rules").field("max_parse_bytes"),
+                "the two parser threads can each take about 1,500 times the size of a \
+                 statement while they read it, which for this value is more than 256 MiB \
+                 together: give the process a memory limit of at least 256 MiB plus 3,000 \
+                 times this value, or a client that is logged in can have it ended for lack \
+                 of memory",
+            );
         }
 
         if !self.admin.listen.is_loopback() {
@@ -298,6 +315,34 @@ events:
             warnings(&format!("{BASE}metrics: {{ listen: \"[::]:9642\" }}\n")).len(),
             1
         );
+    }
+
+    #[test]
+    fn a_statement_size_that_outgrows_the_documented_memory_limit_is_a_warning() {
+        use super::super::rules::{PARSE_MEMORY_FACTOR, PARSER_THREADS};
+
+        if !cfg!(feature = "rules") {
+            return;
+        }
+        let warning = "rules.max_parse_bytes: the two parser threads can each take about 1,500 \
+                       times the size of a statement while they read it, which for this value \
+                       is more than 256 MiB together: give the process a memory limit of at \
+                       least 256 MiB plus 3,000 times this value, or a client that is logged \
+                       in can have it ended for lack of memory";
+        // The figures of the text are those of the check.
+        assert_eq!((PARSER_THREADS, PARSE_MEMORY_FACTOR), (2, 1_500));
+        assert_eq!(PARSER_THREADS * PARSE_MEMORY_FACTOR, 3_000);
+        assert_eq!(PARSER_MEMORY_BUDGET, 256 * 1024 * 1024);
+
+        let with = |size: &str| warnings(&format!("{BASE}rules:\n  max_parse_bytes: {size}\n"));
+        // The default, and the largest size that stays within 256 MiB.
+        assert!(warnings(&format!("{BASE}rules: {{}}\n")).is_empty());
+        assert!(with("64KiB").is_empty());
+        assert!(with("89478B").is_empty());
+        // One byte more, and every size up to the largest accepted.
+        assert_eq!(with("89479B"), [warning]);
+        assert_eq!(with("128KiB"), [warning]);
+        assert_eq!(with("1MiB"), [warning]);
     }
 
     #[test]
