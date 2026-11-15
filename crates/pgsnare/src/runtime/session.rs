@@ -750,7 +750,13 @@ impl Driver {
                 return;
             }
             match effect {
-                Effect::Close(leg) => self.close_after_flush(leg),
+                Effect::Close(leg) => {
+                    // What the session logic says last is not held back:
+                    // a session that is ended while it is slowed down gets
+                    // its error at once, and inside the time left to it.
+                    self.hold_client_until = None;
+                    self.close_after_flush(leg);
+                }
                 effect @ (Effect::Emit(_) | Effect::TokenHit { .. }) => self.note(effect),
                 Effect::QuerySeen => self.context.status.query_seen(),
                 Effect::EventHeld => {
@@ -758,6 +764,9 @@ impl Driver {
                     let now = Instant::now();
                     self.event_due = Some(now.checked_add(EVENT_HOLD).unwrap_or(now));
                 }
+                // A session that is being closed is not slowed down any
+                // more.
+                Effect::Delay(_) if self.client_closing => {}
                 Effect::Delay(delay) => {
                     let now = Instant::now();
                     let until = now.checked_add(delay).unwrap_or(now);
