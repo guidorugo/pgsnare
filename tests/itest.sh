@@ -853,10 +853,12 @@ first_hit() {
 within() {
     awk -v from="${1:-0}" -v to="${2:-0}" 'BEGIN { d = to - from; exit !(from > 0 && d >= 0 && d <= 3) }'
 }
+# reload_failures: how many failed reloads pgsnare logged that name the token
+# file in their reason (the field `file` names the configuration file).
 reload_failures() {
     compose logs --no-log-prefix pgsnare 2>&1 \
         | grep -F "the configuration could not be reloaded" \
-        | grep -cF "$(field file /state/config/reload/tokens.yaml)" || true
+        | grep -cF '"reason":"/state/config/reload/tokens.yaml: ' || true
 }
 
 in_live mkfifo /tmp/reload.in
