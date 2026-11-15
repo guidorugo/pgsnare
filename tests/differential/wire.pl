@@ -17,6 +17,11 @@
 #     copy-fail   start a COPY, send a row and give up
 #     function    call a function with a FunctionCall message
 #     negotiate   ask for protocol 3.99 with an option no server knows
+#     extended STATEMENT text|binary
+#                 run one statement over the extended protocol, with its
+#                 result in that format. The process id of the backend is
+#                 printed first, as "backend N", so that a test can look
+#                 for that backend in pg_stat_activity afterwards.
 #
 # The script prints every message the server sends from the end of the
 # login on, as its type and its body in hexadecimal. That is the output a
@@ -293,7 +298,39 @@ sub negotiate {
     disconnect();
 }
 
+# One statement over the extended protocol: Parse, Bind with one result
+# format for every column, Describe, Execute and Sync. A server that ends
+# the session on the way is reported by read_bytes, after the messages
+# that arrived before it hung up.
+sub extended {
+    my ($sql, $format) = @ARGV[2, 3];
+    die "Usage: wire.pl CONNINFO extended STATEMENT text|binary\n"
+        unless defined $format && $format =~ /\A(?:text|binary)\z/;
+    log_in();
+    query('SELECT pg_backend_pid()');
+    while (1) {
+        my ($type, $body) = read_message();
+        die "the server reported an error\n" if $type eq 'E';
+        if ($type eq 'D') {
+            my $length = unpack 'x2 N', $body;
+            print 'backend ', substr($body, 6, $length), "\n";
+        }
+        last if $type eq 'Z';
+    }
+    my $code = $format eq 'binary' ? 1 : 0;
+    send_bytes(
+        message('P', "\0$sql\0" . pack('n', 0))
+        . message('B', "\0\0" . pack('n n n n', 0, 0, 1, $code))
+        . message('D', "P\0")
+        . message('E', "\0" . pack('N', 0))
+        . message('S', '')
+    );
+    show_until('Z');
+    finish();
+}
+
 my %commands = (
+    'extended'  => \&extended,
     'portal'    => \&portal,
     'copy-fail' => \&copy_fail,
     'function'  => \&function,
