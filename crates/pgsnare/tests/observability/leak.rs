@@ -325,6 +325,32 @@ fn forms(secret: &[u8]) -> Vec<Form> {
         hex(secret, true),
         2 * PIECE,
     ));
+    // The hex form with a separator between the bytes, the way some tools
+    // print them. A piece spans a full byte on each side of a separator.
+    for (name, separator) in [
+        ("in hexadecimal, separated by spaces", " "),
+        ("in hexadecimal, separated by colons", ":"),
+    ] {
+        let separated = secret
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(separator)
+            .into_bytes();
+        forms.push(form(name, separated, 3 * PIECE + 2));
+    }
+    // The way a text that is not valid UTF-8 is written: every invalid
+    // byte as the replacement character, in its three UTF-8 bytes.
+    let lossy = String::from_utf8_lossy(secret).into_owned().into_bytes();
+    if lossy != secret {
+        forms.push(form("as lossy UTF-8", lossy, 3 * PIECE));
+    }
+    // The way bytes are escaped in a text, one `\x..` per byte.
+    let escaped: Vec<u8> = secret
+        .iter()
+        .flat_map(|byte| format!("\\x{byte:02x}").into_bytes())
+        .collect();
+    forms.push(form("escaped as \\x bytes", escaped, 4 * PIECE));
     // The way Rust shows bytes for debugging: [115, 118, 99, ...].
     let numbers: Vec<String> = secret.iter().map(u8::to_string).collect();
     forms.push(form(
@@ -832,6 +858,81 @@ async fn nothing_that_went_in_as_a_secret_comes_out_anywhere() {
     let mut refused_output = refused.stdout.bytes();
     refused_output.extend(refused.stderr.bytes());
 
+    // ------------------------------------------------------------------
+    // The commands that only read the configuration
+    // ------------------------------------------------------------------
+    // The report of `config check` on the configuration that is running,
+    // with the environment it runs with: the proxy starts from it, so the
+    // check passes, and the report is searched for every secret.
+    let mut check = Pgsnare::start(
+        &["config", "check", "--config", config.to_str().unwrap()],
+        &environment,
+    );
+    assert!(check.ended().await.success());
+    let mut config_check = check.stdout.bytes();
+    config_check.extend(check.stderr.bytes());
+
+    // The healthcheck of a configuration that holds the secrets and has
+    // an error of its own: the line that says it failed must not repeat
+    // what the file holds.
+    let broken_config = dir.write(
+        "broken.yaml",
+        format!(
+            "listeners:\n  - name: main\n    listen: 127.0.0.1:{port}\n    upstream: {}\n    \
+             client_tls: {{ mode: disable }}\n    upstream_tls: {{ mode: disable }}\n\
+             tokens:\n  - id: leak-user\n    values: [{}]\n  - id: leak-quoted\n    values: [{}]\n\
+             events:\n  sinks:\n    - type: stdout\n\
+             admin:\n  listen: 127.0.0.1:{admin}\n\
+             nonsense: true\n",
+            database.address,
+            yaml_quoted(secrets.token_user.text()),
+            yaml_quoted(secrets.token_quoted.text())
+        )
+        .as_bytes(),
+    );
+    let mut check = Pgsnare::start(
+        &["healthcheck", "--config", broken_config.to_str().unwrap()],
+        &[],
+    );
+    assert_eq!(check.ended().await.code(), Some(1));
+    let mut healthcheck_error = check.stdout.bytes();
+    healthcheck_error.extend(check.stderr.bytes());
+
+    // The check of a token file that is broken on the line of a value:
+    // the report says where it broke and must not repeat the line.
+    dir.write(
+        "tokens/broken.yaml",
+        format!(
+            "tokens:\n  - id: leak-broken\n    values: [\"{}\n",
+            secrets.token_cut.text()
+        )
+        .as_bytes(),
+    );
+    let broken_tokens_config = dir.write(
+        "broken-tokens.yaml",
+        format!(
+            "listeners:\n  - name: main\n    listen: 127.0.0.1:{port}\n    upstream: {}\n    \
+             client_tls: {{ mode: disable }}\n    upstream_tls: {{ mode: disable }}\n\
+             token_files:\n  - tokens/broken.yaml\n\
+             events:\n  sinks:\n    - type: stdout\n\
+             admin:\n  listen: 127.0.0.1:{admin}\n",
+            database.address
+        )
+        .as_bytes(),
+    );
+    let mut check = Pgsnare::start(
+        &[
+            "config",
+            "check",
+            "--config",
+            broken_tokens_config.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert_eq!(check.ended().await.code(), Some(1));
+    let mut broken_token_check = check.stdout.bytes();
+    broken_token_check.extend(check.stderr.bytes());
+
     let outputs = [
         Output {
             name: "standard output, where the stdout sink writes",
@@ -880,6 +981,18 @@ async fn nothing_that_went_in_as_a_secret_comes_out_anywhere() {
         Output {
             name: "the output of a start that was refused",
             bytes: refused_output,
+        },
+        Output {
+            name: "the report of pgsnare config check",
+            bytes: config_check,
+        },
+        Output {
+            name: "the output of a healthcheck whose configuration has an error",
+            bytes: healthcheck_error,
+        },
+        Output {
+            name: "the report of a check of a broken token file",
+            bytes: broken_token_check,
         },
     ];
 
