@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The long runs that the short run of fuzz.yml leaves separate: every fuzz
+# target for half an hour, each in its own job, and the benchmark.
+
+name: nightly
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  fuzz-long:
+    name: fuzz-long
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - crate: pgsnare-proto
+            target: backend_views
+          - crate: pgsnare-proto
+            target: framer_client
+          - crate: pgsnare-proto
+            target: framer_server
+          - crate: pgsnare-proto
+            target: frontend_views
+          - crate: pgsnare-proto
+            target: startup
+          - crate: pgsnare-core
+            target: rules
+          - crate: pgsnare-core
+            target: scanning
+          - crate: pgsnare-core
+            target: session
+          - crate: pgsnare
+            target: config_loader
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions: {}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/dev-image
+      - run: make fuzz
+        env:
+          FUZZ_SECONDS: "1800"
+          FUZZ_CRATE: ${{ matrix.crate }}
+          FUZZ_TARGET: ${{ matrix.target }}
+      - name: Keep the crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-artifacts-${{ matrix.crate }}-${{ matrix.target }}
+          path: crates/*/fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  bench-nightly:
+    name: bench-nightly
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions: {}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/dev-image
+      - run: |
+          set -o pipefail
+          make bench | tee bench.txt
