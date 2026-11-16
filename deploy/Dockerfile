@@ -64,7 +64,7 @@ WORKDIR /build
 # both.
 COPY Cargo.toml Cargo.lock LICENSE ./
 COPY crates ./crates
-COPY scripts/notices.sh ./
+COPY scripts/notices.sh scripts/
 
 # A static binary for the architecture of this machine, with the default
 # features, the SQL rules among them, and exactly the dependencies of
