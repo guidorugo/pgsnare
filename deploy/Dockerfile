@@ -61,10 +61,13 @@ WORKDIR /build
 # purpose, so the build uses the toolchain of the image and downloads none.
 # The licence of the repository and the script that writes the licence
 # notices of the dependencies come in with it, as the image must carry
-# both.
+# both. The script copies the licence files the crates do not carry
+# verbatim from the directories deploy/notices/NAME, so those come in
+# with it too.
 COPY Cargo.toml Cargo.lock LICENSE ./
 COPY crates ./crates
 COPY scripts/notices.sh scripts/
+COPY deploy/notices deploy/notices
 
 # A static binary for the architecture of this machine, with the default
 # features, the SQL rules among them, and exactly the dependencies of

@@ -171,6 +171,12 @@ passes "the release holds the licence notices of the dependencies" \
     bash -c 'set -euo pipefail
         [[ -s "$1" ]]
         grep -q "^pg_query " "$1"
+        grep -qF "  file: pg_query.rs-LICENSE" "$1"
+        grep -qF "Copyright (c) 2021 Paul Mason <paul@form1.co.nz>" "$1"
+        grep -qF "  file: libpg_query-LICENSE" "$1"
+        grep -qF "Copyright (c) 2015, Lukas Fittl <lukas@fittl.com>" "$1"
+        grep -qF "  file: postgresql-COPYRIGHT" "$1"
+        grep -qF "PostgreSQL Database Management System" "$1"
         cmp -s "$1" "$2"' \
     - "$out/pgsnare-$version-THIRD-PARTY-NOTICES" "$input/THIRD-PARTY-NOTICES"
 passes "the SBOM of the binaries is an SPDX document that lists a crate of the lock file" \

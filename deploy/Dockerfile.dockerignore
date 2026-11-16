@@ -11,3 +11,4 @@ crates/*/fuzz
 **/target
 !LICENSE
 !scripts/notices.sh
+!deploy/notices

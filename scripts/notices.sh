@@ -9,17 +9,26 @@
 # licence, its repository, and the text of every file in its source
 # directory whose name starts with LICENSE, LICENCE, COPYING, COPYRIGHT
 # or NOTICE, in any case.
-# The C code that the package pg_query bundles adds the licence and
-# copyright files it carries up to three levels below its source.
+# A package that bundles code whose licence files the published crate
+# does not carry, such as pg_query, holds them here,
+# under deploy/notices/NAME, as verbatim copies of the files of the
+# repositories the code comes from, with a SOURCES.md that says where
+# each of them was taken from. The files of that directory, except the
+# SOURCES.md, go into the notices of the package. The notices are
+# written only when every file of that directory is there and not empty,
+# and the directories of pg_query and aws-lc-sys hold the files their
+# code needs: a missing or empty one ends the script with an error.
 #
 #   scripts/notices.sh FILE
 #
 # The crates of this repository are left out: the licence of the
 # repository goes with them. A package that carries no such file is
-# listed with the name of the licence its manifest gives. Nothing is
-# written from memory: only files are copied, byte for byte. The result
-# is deterministic: the packages are sorted by name and version, and
-# the files of a package by name.
+# listed with the name of the licence its manifest gives. A package
+# whose source directory is not there ends the script with an error, and
+# so does a command of a pipeline that fails. Nothing is written from
+# memory: only files are copied, byte for byte. The result is
+# deterministic: the packages are sorted by name and version, and the
+# files of a package by name.
 #
 # It needs cargo and nothing the development image does not hold: no jq
 # and no python3 in it, so the metadata is parsed with awk.
@@ -206,9 +215,14 @@ walk() {
                 if (node == "" || !(node in seen)) continue
                 if (pf[idx, "source"] != "") {
                     count++
+                    # A field that the manifest leaves empty would fold the
+                    # columns of the line the script reads it from, so it
+                    # is named.
                     printf "%s\t%s\t%s\t%s\t%s\n", \
-                        pf[idx, "name"], pf[idx, "version"], pf[idx, "license"], \
-                        pf[idx, "repository"], pf[idx, "manifest_path"]
+                        pf[idx, "name"], pf[idx, "version"], \
+                        (pf[idx, "license"] == "") ? "(none)" : pf[idx, "license"], \
+                        (pf[idx, "repository"] == "") ? "(none)" : pf[idx, "repository"], \
+                        pf[idx, "manifest_path"]
                 }
             }
             if (count == 0) {
@@ -237,17 +251,34 @@ copy_file() {
     fi
 }
 
+# The files that the notices of the package must take from
+# deploy/notices/NAME, when that package is in the list: the licence
+# files of the code it bundles that the published crate does not carry.
+extra_files_of() {
+    case "$1" in
+        pg_query)
+            printf '%s\n' \
+                pg_query.rs-LICENSE libpg_query-LICENSE postgresql-COPYRIGHT
+            ;;
+    esac
+}
+
 mkdir -p -- "$(dirname -- "$out")"
 {
     echo "The licence notices of the packages that pgsnare depends on, with"
-    echo "its default features, the SQL rules among them, and of the C code"
-    echo "that the package pg_query bundles. The crates of this repository"
-    echo "are left out: the licence of the repository goes with them. Only"
-    echo "files are copied; no licence text is written from memory."
+    echo "its default features, the SQL rules among them, and of the code"
+    echo "the packages bundle whose licences their crates do not carry. The"
+    echo "crates of this repository are left out: the licence of the"
+    echo "repository goes with them. Only files are copied; no licence text"
+    echo "is written from memory."
     while IFS=$'\t' read -r name version license repository manifest; do
         [[ -n "$license" ]] || license="(none)"
         [[ -n "$repository" ]] || repository="(none)"
         dir="${manifest%/*}"
+        if [[ ! -d "$dir" ]]; then
+            echo "notices: the source directory of $name $version is not at $dir" >&2
+            exit 1
+        fi
         echo
         echo "$name $version"
         echo "  licence: $license"
@@ -255,7 +286,7 @@ mkdir -p -- "$(dirname -- "$out")"
         if ! find "$dir" -maxdepth 1 -type f \
                 \( -iname 'LICENSE*' -o -iname 'LICENCE*' -o -iname 'COPYING*' \
                    -o -iname 'COPYRIGHT*' -o -iname 'NOTICE*' \) \
-            | sort > "$work/files"; then
+             | sort > "$work/files"; then
             echo "notices: the files of $dir could not be listed" >&2
             exit 1
         fi
@@ -267,32 +298,40 @@ mkdir -p -- "$(dirname -- "$out")"
         else
             echo "  No licence file in the package; licence: $license"
         fi
-        # The C code that pg_query bundles, up to three levels below its
-        # source. A file that the search above already copied, in the
-        # source itself, is not copied twice.
-        if [[ "$name" == pg_query ]]; then
-            echo "  C code of the crate:"
-            if ! find "$dir" -maxdepth 3 -iname 'LICENSE*' \
-                    -o -maxdepth 3 -iname 'COPYRIGHT*' \
-                | sort > "$work/cfiles"; then
-                echo "notices: the C code of $dir could not be listed" >&2
+        # The licence files of the code the crate bundles that the
+        # published crate does not carry: the verbatim copies under
+        # deploy/notices/NAME, where the SOURCES.md names the repository,
+        # the tag and the commit each file was taken from. The
+        # SOURCES.md is the record of where the files come from, and is
+        # not a licence itself, so it is not copied.
+        extra="$root/deploy/notices/$name"
+        if [[ -n "$(extra_files_of "$name")" ]]; then
+            while IFS= read -r file; do
+                if [[ ! -s "$extra/$file" ]]; then
+                    echo "notices: the licence file deploy/notices/$name/$file is missing or empty" >&2
+                    exit 1
+                fi
+            done < <(extra_files_of "$name")
+        fi
+        if [[ -d "$extra" ]]; then
+            if ! find "$extra" -maxdepth 1 -type f ! -name SOURCES.md \
+                    | sort > "$work/efiles"; then
+                echo "notices: the files of $extra could not be listed" >&2
                 exit 1
             fi
-            cfiles=()
-            while IFS= read -r file; do
-                rel="${file#"$dir"/}"
-                if [[ "$rel" == */* ]]; then
-                    cfiles+=("$rel")
-                fi
-            done < "$work/cfiles"
-            if [[ ${#cfiles[@]} -gt 0 ]]; then
-                for rel in "${cfiles[@]}"; do
-                    echo "  file: $rel"
-                    copy_file "$dir/$rel"
-                done
-            else
-                echo "  no licence or copyright file of the C code in the crate"
+            if [[ ! -s "$work/efiles" ]]; then
+                echo "notices: the directory deploy/notices/$name holds no licence file" >&2
+                exit 1
             fi
+            echo "  Licences the crate does not carry, copied from the repositories of the code it bundles:"
+            while IFS= read -r file; do
+                if [[ ! -s "$file" ]]; then
+                    echo "notices: the licence file $file is empty" >&2
+                    exit 1
+                fi
+                echo "  file: ${file##*/}"
+                copy_file "$file"
+            done < "$work/efiles"
         fi
     done < "$work/packages"
 } > "$out"

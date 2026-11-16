@@ -16,7 +16,8 @@
 #   2. The files of the image: pgsnare is owned by root and cannot be
 #      written, the licence notices of the dependencies and the licence of
 #      the repository are there, of root, and not empty, the notices hold
-#      an entry for pg_query, no file has the setuid or setgid bit, nothing
+#      the licences of the code the package pg_query bundles, no file has
+#      the setuid or setgid bit, nothing
 #      but the home directory of the user belongs to anyone but root,
 #      nothing outside a sticky directory can be written by everybody, no
 #      package manager cache is left, and the CA certificates are there.
@@ -330,12 +331,46 @@ must_pass "a sticky directory and the home directory are allowed" bash -c \
     "$(declare -f list_names not_writable_by_all only_root_owns); work='$work'; not_writable_by_all allowed && only_root_owns allowed"
 
 # The notices go with the C code of the rules the binary holds: they must
-# name the package that bundles it.
+# hold the licences of the code that the package pg_query bundles, not
+# only an entry that names it.
 "$docker" cp --follow-link "$container:/usr/share/doc/pgsnare/THIRD-PARTY-NOTICES" "$work/notices" >/dev/null
 if grep -q '^pg_query ' "$work/notices"; then
     echo "image-test: ok: the notices hold an entry for pg_query"
 else
     fail "the notices of the image hold no entry for pg_query"
+fi
+notices_line() {
+    grep -qF -- "$1" "$work/notices"
+}
+if notices_line '  file: pg_query.rs-LICENSE'; then
+    echo "image-test: ok: the notices hold the licence of the pg_query crate"
+else
+    fail "the notices of the image hold no heading for the licence of the pg_query crate"
+fi
+if notices_line 'Copyright (c) 2021 Paul Mason <paul@form1.co.nz>'; then
+    echo "image-test: ok: the notices hold the text of the licence of the pg_query crate"
+else
+    fail "the notices of the image hold no line of the licence of the pg_query crate"
+fi
+if notices_line '  file: libpg_query-LICENSE'; then
+    echo "image-test: ok: the notices hold the licence of the C code of the rules"
+else
+    fail "the notices of the image hold no heading for the licence of the C code of the rules"
+fi
+if notices_line 'Copyright (c) 2015, Lukas Fittl <lukas@fittl.com>'; then
+    echo "image-test: ok: the notices hold the text of the licence of the C code of the rules"
+else
+    fail "the notices of the image hold no line of the licence of the C code of the rules"
+fi
+if notices_line '  file: postgresql-COPYRIGHT'; then
+    echo "image-test: ok: the notices hold the copyright of the PostgreSQL code of the rules"
+else
+    fail "the notices of the image hold no heading for the copyright of the PostgreSQL code of the rules"
+fi
+if notices_line 'PostgreSQL Database Management System'; then
+    echo "image-test: ok: the notices hold the text of the copyright of the PostgreSQL code of the rules"
+else
+    fail "the notices of the image hold no line of the copyright of the PostgreSQL code of the rules"
 fi
 
 echo "image-test: the binary must need no interpreter and no library"
