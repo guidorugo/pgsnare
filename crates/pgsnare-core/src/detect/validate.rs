@@ -14,7 +14,7 @@ use aho_corasick::automaton::OverlappingState;
 use aho_corasick::{AhoCorasick, AhoCorasickKind, MatchKind};
 
 use super::error::{BuildError, ValidationError, ValidationErrors, ValueLocation};
-use super::pattern::{MIN_VALUE_LEN, PatternForm, hex_lower, uuid_bytes};
+use super::pattern::{MIN_VALUE_LEN, PatternForm, hex_lower, uuid_bytes, varied_enough};
 use super::token::TokenSpec;
 
 /// A value that passed the rules for single values, with what is derived
@@ -113,10 +113,10 @@ struct Spelling<'s> {
 /// off the other.
 ///
 /// The texts that match a value are: the value as configured, its hex form,
-/// its sixteen bytes if it is a canonical UUID, and, for a case-insensitive
-/// token, the value in any letter case. None of them may contain a pattern
-/// of another value. When this check passes, each of those texts makes the
-/// matcher report its own value and nothing else.
+/// its sixteen bytes if it is a canonical UUID of enough byte variety, and,
+/// for a case-insensitive token, the value in any letter case. None of them
+/// may contain a pattern of another value. When this check passes, each of
+/// those texts makes the matcher report its own value and nothing else.
 ///
 /// Comparing every pair directly would take time quadratic in the number of
 /// values. Instead, all spellings go into one case-insensitive automaton and
@@ -145,7 +145,9 @@ pub(crate) fn check_conflicts(
                 form: PatternForm::Hex,
                 bytes: &value.hex,
             });
-            if let Some(uuid) = &value.uuid {
+            if let Some(uuid) = &value.uuid
+                && varied_enough(uuid)
+            {
                 forms.push(Spelling {
                     slot,
                     form: PatternForm::UuidBinary,
@@ -780,6 +782,34 @@ mod tests {
             TokenSpec::new("uuid", ["61626364-6566-6768-696a-6b6c6d6e6f70"]),
             TokenSpec::new("other", ["not-a-uuid-but-12-bytes"]),
         ]));
+    }
+
+    #[test]
+    fn a_uuid_with_little_variety_holds_no_sixteen_bytes() {
+        // The nil UUID holds sixteen NUL bytes. A value of the same bytes is
+        // accepted with it: the bytes of a UUID with little variety are not
+        // looked for, so the two never set each other off.
+        assert!(accepted(&[
+            TokenSpec::new("nil", ["00000000-0000-0000-0000-000000000000"]),
+            TokenSpec::new("nuls", ["\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"]),
+        ]));
+        // A UUID of eight distinct bytes still holds its sixteen, and the
+        // same pair is refused.
+        assert_eq!(
+            problems(&[
+                TokenSpec::new("eight", ["00000000-0102-0304-0506-070606060606"]),
+                TokenSpec::new(
+                    "bytes",
+                    ["\0\0\0\0\x01\x02\x03\x04\x05\x06\x07\x06\x06\x06\x06"]
+                ),
+            ]),
+            [contains(
+                at("eight", 0, 0),
+                PatternForm::UuidBinary,
+                at("bytes", 1, 0),
+                PatternForm::Raw
+            )]
+        );
     }
 
     #[test]

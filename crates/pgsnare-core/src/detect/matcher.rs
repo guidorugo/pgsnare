@@ -12,7 +12,7 @@ use aho_corasick::automaton::OverlappingState;
 use aho_corasick::{AhoCorasick, AhoCorasickKind, MatchKind};
 
 use super::error::{BuildError, ScanError, ValidationErrors};
-use super::pattern::PatternForm;
+use super::pattern::{PatternForm, varied_enough};
 use super::stream::StreamScanner;
 use super::token::{TokenId, TokenSpec};
 use super::validate::{self, Slot};
@@ -373,8 +373,12 @@ impl Matcher {
                 slot.hex.as_slice(),
             ));
             // A value that is a canonical UUID is sent as its sixteen bytes
-            // in a binary result and a binary COPY.
-            if let Some(uuid) = &slot.uuid {
+            // in a binary result and a binary COPY. The pattern exists only
+            // if the bytes carry enough variety to be worth it: below that,
+            // an unrelated sixteen-byte value would match by chance.
+            if let Some(uuid) = &slot.uuid
+                && varied_enough(uuid)
+            {
                 exact.push((
                     PatternInfo::new(slot, PatternForm::UuidBinary),
                     uuid.as_slice(),
@@ -441,8 +445,8 @@ impl Matcher {
     }
 
     /// The number of compiled patterns: two per value, one more per value
-    /// that is a canonical UUID, plus one per value that is also matched
-    /// case-insensitively.
+    /// that is a canonical UUID of enough byte variety, plus one per value
+    /// that is also matched case-insensitively.
     pub fn pattern_count(&self) -> usize {
         self.sets()
             .map(|set| set.patterns.len())
@@ -592,6 +596,11 @@ mod tests {
         0xf8, 0x1d, 0x4f, 0xae, 0x7d, 0xec, 0x11, 0xd0, 0xa7, 0x65, 0x00, 0xa0, 0xc9, 0x1e, 0x6b,
         0xf6,
     ];
+    const NIL_UUID: &str = "00000000-0000-0000-0000-000000000000";
+    const MAX_UUID: &str = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+    const SEQUENTIAL_UUID: &str = "00000000-0000-0000-0000-000000000417";
+    const SEVEN_DISTINCT: &str = "00000000-0102-0304-0506-060606060606";
+    const EIGHT_DISTINCT: &str = "00000000-0102-0304-0506-070606060606";
 
     fn build(tokens: &[TokenSpec]) -> Matcher {
         Matcher::build(tokens).expect("the token list is valid")
@@ -726,6 +735,53 @@ mod tests {
         assert_eq!(
             scan(&matcher, UUID.to_uppercase().as_bytes()),
             [hit("row-uuid", 0, PatternForm::Raw, 0..36)]
+        );
+    }
+
+    #[test]
+    fn a_uuid_with_little_variety_gets_no_binary_pattern() {
+        // The nil UUID holds sixteen copies of one byte.
+        let matcher = build(&[TokenSpec::new("nil", [NIL_UUID])]);
+        assert_eq!(matcher.pattern_count(), 2);
+        assert_eq!(scan(&matcher, &[0x00; 16]), []);
+        // Every byte the same is the other extreme.
+        let matcher = build(&[TokenSpec::new("max", [MAX_UUID])]);
+        assert_eq!(matcher.pattern_count(), 2);
+        assert_eq!(scan(&matcher, &[0xff; 16]), []);
+        // A sequential counter holds two values out of sixteen.
+        let matcher = build(&[TokenSpec::new("counter", [SEQUENTIAL_UUID])]);
+        assert_eq!(matcher.pattern_count(), 2);
+        assert_eq!(
+            scan(&matcher, &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 23]),
+            []
+        );
+        // The text forms are still looked for.
+        let nil = build(&[TokenSpec::new("nil", [NIL_UUID])]);
+        assert_eq!(
+            scan(&nil, NIL_UUID.as_bytes()),
+            [hit("nil", 0, PatternForm::Raw, 0..36)]
+        );
+        assert_eq!(
+            scan(&matcher, SEQUENTIAL_UUID.as_bytes()),
+            [hit("counter", 0, PatternForm::Raw, 0..36)]
+        );
+    }
+
+    #[test]
+    fn the_binary_pattern_appears_at_eight_distinct_bytes() {
+        let matcher = build(&[
+            TokenSpec::new("seven", [SEVEN_DISTINCT]),
+            TokenSpec::new("eight", [EIGHT_DISTINCT]),
+        ]);
+        // Two patterns per value, one more for the value whose sixteen bytes
+        // hold eight distinct values.
+        assert_eq!(matcher.pattern_count(), 5);
+        let seven = crate::detect::uuid_bytes(SEVEN_DISTINCT.as_bytes()).expect("a canonical UUID");
+        let eight = crate::detect::uuid_bytes(EIGHT_DISTINCT.as_bytes()).expect("a canonical UUID");
+        assert_eq!(scan(&matcher, &seven), []);
+        assert_eq!(
+            scan(&matcher, &eight),
+            [hit("eight", 0, PatternForm::UuidBinary, 0..16)]
         );
     }
 

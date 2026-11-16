@@ -66,7 +66,7 @@
 //! | [`PatternForm::Raw`] | The bytes of the value | The value wherever it is printed as it is: text and binary results, JSON, arrays, composite rows, CSV, COPY output, error messages, query text |
 //! | [`PatternForm::Hex`] | The value as lowercase hexadecimal digits | The value inside a `bytea` printed in text format, and the output of `encode(…, 'hex')` |
 //! | [`PatternForm::CaseInsensitive`] | The value with ASCII letter case ignored | Only for tokens that ask for it: the value after `upper()`, `lower()` or the like |
-//! | [`PatternForm::UuidBinary`] | The sixteen bytes of a value that is a canonical UUID | Only for values written as 8-4-4-4-12 hexadecimal digits: the value in a binary result and a binary COPY |
+//! | [`PatternForm::UuidBinary`] | The sixteen bytes of a value that is a canonical UUID | Only for values written as 8-4-4-4-12 hexadecimal digits that carry at least [`MIN_UUID_BYTE_VARIETY`] distinct byte values: the value in a binary result and a binary COPY |
 //!
 //! Matching is on substrings of raw bytes. That is what lets one code path
 //! find a value nested in JSON, in an array or in an aggregated string.
@@ -101,8 +101,9 @@
 //!
 //! The last two rules guarantee that data matching one value never sets off
 //! another. They cover every text the matcher accepts for a value: the value
-//! as configured, its hex form, its sixteen bytes if it is a canonical UUID,
-//! and, for a case-insensitive token, the value in any letter case. A value
+//! as configured, its hex form, its sixteen bytes if it is a canonical UUID
+//! of enough byte variety, and, for a case-insensitive token, the value in
+//! any letter case. A value
 //! is therefore also refused if, for example, it contains the hex form of
 //! another value.
 //!
@@ -145,8 +146,11 @@
 //! - **Binary results.** In the binary result format a text, `bytea` or JSON
 //!   value is sent as its bytes and is found. A value that is a canonical
 //!   UUID is sent as its sixteen bytes and is found by the
-//!   [`PatternForm::UuidBinary`] pattern. A number or a date is sent in
-//!   another encoding, so a value kept in such a column is missed there.
+//!   [`PatternForm::UuidBinary`] pattern, unless those sixteen bytes carry
+//!   fewer than [`MIN_UUID_BYTE_VARIETY`] distinct values, in which case the
+//!   pattern would match unrelated sixteen-byte values by chance. A number
+//!   or a date is sent in another encoding, so a value kept in such a column
+//!   is missed there.
 //! - **Other transformations.** A value that was hashed, cut, encoded in
 //!   another way or encrypted before it was sent does not match.
 //! - **Split values.** A scanner finds a value split across the chunks it is
@@ -162,6 +166,6 @@ mod validate;
 
 pub use error::{BuildError, ScanError, ValidationError, ValidationErrors, ValueLocation};
 pub use matcher::{Match, Matcher, Matches};
-pub use pattern::{MIN_VALUE_LEN, PatternForm, uuid_bytes};
+pub use pattern::{MIN_UUID_BYTE_VARIETY, MIN_VALUE_LEN, PatternForm, uuid_bytes, varied_enough};
 pub use stream::StreamScanner;
 pub use token::{TokenId, TokenSpec, TokenValue};

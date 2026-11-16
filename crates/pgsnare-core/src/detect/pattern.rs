@@ -28,7 +28,9 @@ pub enum PatternForm {
     /// The sixteen bytes a value that is a canonical UUID encodes. This is
     /// how PostgreSQL sends a `uuid` value in a binary result or a binary
     /// COPY. Only the values that are written as 8-4-4-4-12 hexadecimal
-    /// digits have this form.
+    /// digits and carry at least [`MIN_UUID_BYTE_VARIETY`] distinct byte
+    /// values have this form: below that variety, unrelated sixteen-byte
+    /// values would match by chance.
     UuidBinary,
 }
 
@@ -98,6 +100,29 @@ pub fn uuid_bytes(value: &[u8]) -> Option<Vec<u8>> {
         index = index.checked_add(2)?;
     }
     Some(bytes)
+}
+
+/// The fewest distinct byte values the sixteen bytes of a canonical UUID
+/// must carry to be searched for in their binary form.
+///
+/// A binary result or a binary COPY holds raw sixteen-byte values, and
+/// sixteen bytes of little variety, such as the nil UUID or a run of one
+/// byte, sit in them by chance. Below this variety the binary form matches
+/// too often for nothing, so it is not compiled and a configuration that
+/// relies on one warns about it.
+pub const MIN_UUID_BYTE_VARIETY: usize = 8;
+
+/// Whether the sixteen bytes of a canonical UUID carry enough variety to be
+/// searched for in their binary form.
+#[must_use]
+pub fn varied_enough(bytes: &[u8]) -> bool {
+    let mut seen: Vec<u8> = Vec::with_capacity(bytes.len());
+    for &byte in bytes {
+        if !seen.contains(&byte) {
+            seen.push(byte);
+        }
+    }
+    seen.len() >= MIN_UUID_BYTE_VARIETY
 }
 
 /// Writes `bytes` as lowercase hexadecimal digits, two per byte.
@@ -196,5 +221,24 @@ mod tests {
         for value in not_uuids {
             assert_eq!(uuid_bytes(value), None, "{value:?}");
         }
+    }
+
+    #[test]
+    fn the_binary_form_needs_eight_distinct_bytes() {
+        assert!(!varied_enough(&[0x00; 16])); // the nil UUID
+        assert!(!varied_enough(&[0xff; 16])); // every byte the same
+        // Eight distinct bytes, the least that earns the form.
+        assert!(!varied_enough(&[
+            0, 1, 2, 3, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6
+        ]));
+        assert!(varied_enough(&[
+            0, 1, 2, 3, 4, 5, 6, 7, 6, 6, 6, 6, 6, 6, 6, 6
+        ]));
+        // A generated UUID has all sixteen bytes different.
+        assert!(varied_enough(
+            uuid_bytes(b"f81d4fae-7dec-11d0-a765-00a0c91e6bf6")
+                .unwrap()
+                .as_slice()
+        ));
     }
 }

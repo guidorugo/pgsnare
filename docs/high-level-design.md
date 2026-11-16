@@ -279,7 +279,7 @@ Not supported in the first version: login with client certificates, GSSAPI encry
 
 - A token is one or more values with an id, an optional scope hint used only for reporting, and its response.
 - Values must be ASCII and at least 12 bytes. Matching then does not depend on the client's character encoding, and accidental matches are implausible.
-- Each value compiles to a small set of byte patterns: the raw value, its lowercase hex form (how `bytea` is printed in text format), the sixteen bytes of a value written as a canonical UUID (how PostgreSQL sends a `uuid` value in a binary result or a binary COPY) and, if requested, a case-insensitive variant.
+- Each value compiles to a small set of byte patterns: the raw value, its lowercase hex form (how `bytea` is printed in text format), the sixteen bytes of a value written as a canonical UUID (how PostgreSQL sends a `uuid` value in a binary result or a binary COPY), but only when those sixteen bytes hold at least eight distinct values — below that, a nil or sequential UUID would match unrelated sixteen-byte values by chance, and a configuration holding one warns — and, if requested, a case-insensitive variant.
 - A token list in which data matching one value would also match another is rejected. That covers a value used twice and a value that contains a pattern of another. Every match then belongs to exactly one token. The loader of the configuration applies this rule, so a configuration that loads is one the matcher compiles.
 - The values pgsnare generates follow these rules by construction: see [section 9.1](#91-bait).
 - All patterns are matched in one pass with the Aho-Corasick algorithm.
