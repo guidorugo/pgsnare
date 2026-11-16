@@ -55,7 +55,9 @@
 #   - A hit raises a token_hit event with the id of the token (or a
 #     rule_hit event with the id of the rule) for its session.
 #   - With kill, the session ends, and nothing the client received holds
-#     the value as it is written, in hexadecimal or in base64.
+#     the value as it is written, in hexadecimal, in base64, or, for a
+#     value that is a canonical UUID, as its thirty-two digits or its
+#     sixteen bytes.
 #   - A gap raises no such event, and its session goes on to the end. A gap
 #     that is detected fails the run, so that the list of gaps stays true.
 #   - At least 50 cases ran, and all of them to the end.

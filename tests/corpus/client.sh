@@ -31,7 +31,8 @@
 #
 #   - A run that must end the session (kill): the session ended before its
 #     last statement, and nothing the client received holds the value as it
-#     is written, in hexadecimal or in base64.
+#     is written, in hexadecimal, in base64, or, for a value that is a
+#     canonical UUID, as its thirty-two digits or its sixteen bytes.
 #   - Every other run: the session lived to its last statement, and a
 #     statement failed exactly when the case says that one does.
 #
@@ -90,7 +91,9 @@ hex() {
 }
 
 # holds FILE TEXT: whether FILE holds TEXT as it is written, in hexadecimal
-# of either case, or in base64.
+# of either case, or in base64. A value that is a canonical UUID is also
+# looked for as its thirty-two hexadecimal digits, of either case, and as
+# the sixteen bytes it encodes.
 holds() {
     lower="$(hex "$2")"
     upper="$(printf '%s' "$lower" | tr 'a-f' 'A-F')"
@@ -100,6 +103,21 @@ holds() {
             return 0
         fi
     done
+    if printf '%s' "$2" | grep -q '^[0-9a-fA-F]\{8\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{12\}$'; then
+        # The digits without their hyphens, as a dump of a binary result
+        # prints them.
+        digits="$(printf '%s' "$2" | tr -d '-' | tr 'A-F' 'a-f')"
+        digits_upper="$(printf '%s' "$digits" | tr 'a-f' 'A-F')"
+        if grep -qaF -- "$digits" "$1" || grep -qaF -- "$digits_upper" "$1"; then
+            return 0
+        fi
+        # The sixteen bytes it encodes, wherever they sit in the file: the
+        # lowercase hexadecimal of the file holds the same thirty-two
+        # digits.
+        if od -An -v -tx1 "$1" | tr -d ' \n' | grep -qF -- "$digits"; then
+            return 0
+        fi
+    fi
     return 1
 }
 
@@ -156,6 +174,24 @@ for mode in simple extended-text extended-binary; do
         exit 1
     fi
 done
+
+# The same is true of the value of the typed token, in the forms PostgreSQL
+# itself sends it: its text in a text result, its thirty-two digits in a
+# dump of a binary result, and its sixteen bytes in a binary COPY.
+echo "SELECT u FROM bait_typed;" >"$work/body.sql"
+for mode in simple extended-text extended-binary; do
+    run_sql "$mode" "$direct dbname=corpus_kill" || true
+    if ! holds "$work/out" "$(value_of typed kill)" || ! holds "$work/out" "$still_open"; then
+        echo "corpus: the search does not find the value of a uuid column or the end of a session in what PostgreSQL $version itself sends ($mode)" >&2
+        exit 1
+    fi
+done
+echo "COPY bait_typed TO STDOUT WITH (FORMAT binary);" >"$work/body.sql"
+run_sql simple "$direct dbname=corpus_kill" || true
+if ! holds "$work/out" "$(value_of typed kill)" || ! holds "$work/out" "$still_open"; then
+    echo "corpus: the search does not find the sixteen bytes of a binary COPY or the end of a session in what PostgreSQL $version itself sends" >&2
+    exit 1
+fi
 
 # --- The cases ----------------------------------------------------------------
 
