@@ -4,9 +4,10 @@
 # Writes the licence notices of the code that pgsnare ships to the file
 # named as the first argument: for every package that is a normal
 # dependency of the package pgsnare with its default features, the SQL
-# rules among them, its name, its version, its licence, its repository,
-# and the text of every file in its source directory whose name starts
-# with LICENSE, LICENCE, COPYING, COPYRIGHT or NOTICE, in any case.
+# rules among them, on the musl target of the architecture of this
+# machine, its name, its version, its licence, its repository, and the
+# text of every file in its source directory whose name starts with
+# LICENSE, LICENCE, COPYING, COPYRIGHT or NOTICE, in any case.
 # The C code that the package pg_query bundles adds the licence and
 # copyright files it carries up to three levels below its source.
 #
@@ -41,7 +42,18 @@ name_of_package=pgsnare
 version="$(sed -nE '/^\[workspace\.package\]/,/^\[/{s/^version = "([^"]+)"$/\1/p}' Cargo.toml)"
 [[ -n "$version" ]] || { echo "notices: Cargo.toml does not declare one version of the workspace" >&2; exit 1; }
 
-if ! meta="$(cargo metadata --format-version 1 --locked)"; then
+# The image builds the binary for the musl target of the architecture of
+# this machine, and the build downloads the sources of the crates of that
+# target alone. The resolve of the metadata holds the crates of every
+# platform of Cargo.lock, so it is filtered to that target, and every
+# source directory the script reads is one the build has downloaded.
+case "$(uname -m)" in
+    x86_64) target=x86_64-unknown-linux-musl ;;
+    aarch64) target=aarch64-unknown-linux-musl ;;
+    *) echo "notices: unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+
+if ! meta="$(cargo metadata --format-version 1 --locked --filter-platform "$target")"; then
     echo "notices: cargo metadata failed" >&2
     exit 1
 fi
