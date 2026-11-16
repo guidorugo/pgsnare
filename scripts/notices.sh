@@ -7,10 +7,11 @@
 # rules among them, on the two musl targets the release ships, x86_64
 # and aarch64, the same file for both, its name, its version, its
 # licence, its repository, and the text of every file in its source
-# directory whose name starts with LICENSE, LICENCE, COPYING, COPYRIGHT
-# or NOTICE, in any case.
+# directory, at any depth, whose name starts with LICENSE, LICENCE,
+# COPYING, COPYRIGHT or NOTICE, in any case, each under its path in the
+# crate, in the order of that path.
 # A package that bundles code whose licence files the published crate
-# does not carry, such as pg_query, holds them here,
+# does not carry, such as pg_query and aws-lc-sys, holds them here,
 # under deploy/notices/NAME, as verbatim copies of the files of the
 # repositories the code comes from, with a SOURCES.md that says where
 # each of them was taken from. The files of that directory, except the
@@ -28,7 +29,7 @@
 # so does a command of a pipeline that fails. Nothing is written from
 # memory: only files are copied, byte for byte. The result is
 # deterministic: the packages are sorted by name and version, and the
-# files of a package by name.
+# files of a package by path.
 #
 # It needs cargo and nothing the development image does not hold: no jq
 # and no python3 in it, so the metadata is parsed with awk.
@@ -260,6 +261,11 @@ extra_files_of() {
             printf '%s\n' \
                 pg_query.rs-LICENSE libpg_query-LICENSE postgresql-COPYRIGHT
             ;;
+        aws-lc-sys)
+            printf '%s\n' \
+                s2n-bignum-imported-LICENSE jitterentropy-library-LICENSE \
+                googletest-LICENSE wycheproof_testvectors-LICENSE
+            ;;
     esac
 }
 
@@ -283,7 +289,7 @@ mkdir -p -- "$(dirname -- "$out")"
         echo "$name $version"
         echo "  licence: $license"
         echo "  repository: $repository"
-        if ! find "$dir" -maxdepth 1 -type f \
+        if ! find "$dir" -type f \
                 \( -iname 'LICENSE*' -o -iname 'LICENCE*' -o -iname 'COPYING*' \
                    -o -iname 'COPYRIGHT*' -o -iname 'NOTICE*' \) \
              | sort > "$work/files"; then
@@ -292,7 +298,7 @@ mkdir -p -- "$(dirname -- "$out")"
         fi
         if [[ -s "$work/files" ]]; then
             while IFS= read -r file; do
-                echo "  file: ${file##*/}"
+                echo "  file: ${file#"$dir"/}"
                 copy_file "$file"
             done < "$work/files"
         else
