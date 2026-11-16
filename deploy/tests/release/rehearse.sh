@@ -125,7 +125,7 @@ refuses "is not the file the build reported" "an input that the build did not re
     env BUILD_SUMS_AMD64="$(printf '%064d' 0)" "$publish" "$version" "$registry" "key=$key" "$input" "$work/never"
 
 mkdir "$work/altered-input"
-cp "$input"/SHA256SUMS-* "$input"/pgsnare-* "$work/altered-input/"
+cp "$input"/SHA256SUMS-* "$input"/pgsnare-* "$input"/THIRD-PARTY-NOTICES "$work/altered-input/"
 change_byte "$work/altered-input/pgsnare-arm64" 4096
 refuses "does not match its sums" "an input with a changed byte in a binary" \
     "$publish" "$version" "$registry" "key=$key" "$work/altered-input" "$work/never"
@@ -167,6 +167,12 @@ for arch in amd64 arm64; do
         bash -c 'grep -q "\"spdxVersion\":\"SPDX-" "$1" && grep -q "\"name\":\"alpine-baselayout\"" "$1"' \
         - "$out/pgsnare-$version-image-$arch.spdx.json"
 done
+passes "the release holds the licence notices of the dependencies" \
+    bash -c 'set -euo pipefail
+        [[ -s "$1" ]]
+        grep -q "^pg_query " "$1"
+        cmp -s "$1" "$2"' \
+    - "$out/pgsnare-$version-THIRD-PARTY-NOTICES" "$input/THIRD-PARTY-NOTICES"
 passes "the SBOM of the binaries is an SPDX document that lists a crate of the lock file" \
     bash -c 'grep -q "\"spdxVersion\":\"SPDX-" "$1" && grep -q "\"name\":\"rustls\"" "$1"' \
     - "$out/pgsnare-$version-crates.spdx.json"

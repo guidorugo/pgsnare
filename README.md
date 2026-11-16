@@ -278,3 +278,5 @@ The image, the chart, the cluster tests, the Compose example and the release reh
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
+
+The binary also holds the code of the packages it depends on, among them the C code of libpg_query and of PostgreSQL that the SQL rules bring in, and their licences require the copyright notice and the licence text to go with every copy. `scripts/notices.sh` collects those notices into `THIRD-PARTY-NOTICES` without writing a licence from memory: it copies only the files the packages carry. `make notices` writes it to `target/THIRD-PARTY-NOTICES`; the image holds it at `/usr/share/doc/pgsnare/THIRD-PARTY-NOTICES`, and every release attaches it.
