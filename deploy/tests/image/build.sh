@@ -10,7 +10,10 @@
 #
 #   pgsnare-image-ARCH.tar   the image, as `docker save` writes it
 #   pgsnare-ARCH             the binary that the `binary` stage exports
-#   SHA256SUMS-ARCH          the sums of both
+#   THIRD-PARTY-NOTICES      the licence notices the image holds, taken
+#                            from the image, the same for both
+#                            architectures
+#   SHA256SUMS-ARCH          the sums of all of the above
 #
 # ARCHITECTURE, when given, must be the architecture of this machine: the
 # image is built natively and never under emulation. Nothing is pushed
@@ -63,7 +66,15 @@ echo "build: the image for $arch"
 echo "build: the binary for $arch"
 "${build[@]}" --target binary --output "type=local,dest=$work/binary" "$root"
 
+# The licence notices the image holds, next to the binary: the release
+# attaches the same file, so it is taken from the image that was built.
+echo "build: the notices for $arch"
+container="$("$docker" create "$tag")"
+"$docker" cp --follow-link "$container:/usr/share/doc/pgsnare/THIRD-PARTY-NOTICES" "$work/notices" >/dev/null
+"$docker" rm "$container" >/dev/null
+install --mode 0644 "$work/notices" "$out/THIRD-PARTY-NOTICES"
+
 "$docker" save --output "$out/pgsnare-image-$arch.tar" "$tag"
 install --mode 0755 "$work/binary/pgsnare" "$out/pgsnare-$arch"
-(cd "$out" && sha256sum "pgsnare-image-$arch.tar" "pgsnare-$arch" > "SHA256SUMS-$arch")
+(cd "$out" && sha256sum "pgsnare-image-$arch.tar" "pgsnare-$arch" THIRD-PARTY-NOTICES > "SHA256SUMS-$arch")
 sed 's/^/build: /' "$out/SHA256SUMS-$arch"

@@ -59,8 +59,12 @@ WORKDIR /build
 # The workspace and nothing else: deploy/Dockerfile.dockerignore keeps the
 # rest of the repository out of the build. rust-toolchain.toml stays out on
 # purpose, so the build uses the toolchain of the image and downloads none.
-COPY Cargo.toml Cargo.lock ./
+# The licence of the repository and the script that writes the licence
+# notices of the dependencies come in with it, as the image must carry
+# both.
+COPY Cargo.toml Cargo.lock LICENSE ./
 COPY crates ./crates
+COPY scripts/notices.sh ./
 
 # A static binary for the architecture of this machine, with the default
 # features, the SQL rules among them, and exactly the dependencies of
@@ -82,6 +86,9 @@ RUN set -eu; \
     rustup target add "$target"; \
     cargo build --release --locked --package pgsnare --bin pgsnare --target "$target"; \
     install -D --mode 0555 "target/$target/release/pgsnare" /out/pgsnare; \
+    scripts/notices.sh /out/notices; \
+    install --mode 0644 /out/notices /out/THIRD-PARTY-NOTICES; \
+    install --mode 0644 LICENSE /out/LICENSE; \
     if readelf --program-headers --wide /out/pgsnare | grep -q 'INTERP'; then \
         echo "the binary asks for an interpreter" >&2; exit 1; \
     fi; \
@@ -132,6 +139,12 @@ RUN set -eu; \
 
 # Owned by root and not writable, so the process cannot replace it.
 COPY --from=build --chown=0:0 --chmod=0555 /out/pgsnare /usr/local/bin/pgsnare
+
+# The licences that go with every copy of the code the binary holds: the
+# notices of the packages it depends on, and the licence of the
+# repository, which covers the crates of the repository among them.
+COPY --from=build --chown=0:0 --chmod=0644 /out/THIRD-PARTY-NOTICES /usr/share/doc/pgsnare/THIRD-PARTY-NOTICES
+COPY --from=build --chown=0:0 --chmod=0644 /out/LICENSE /usr/share/doc/pgsnare/LICENSE
 
 # A number and not a name: Kubernetes can check that a number is not 0, and
 # cannot check a name. This is the user `nonroot` made above.

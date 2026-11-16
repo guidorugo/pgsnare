@@ -9,3 +9,5 @@
 !crates
 crates/*/fuzz
 **/target
+!LICENSE
+!scripts/notices.sh
