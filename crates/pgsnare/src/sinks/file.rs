@@ -7,10 +7,10 @@
 //! - **It is created closed to other users**, with mode `0600`. A file
 //!   that is there already is written to only if it is closed enough: it
 //!   belongs to the user pgsnare runs as, its mode gives the group no
-//!   write and others nothing, and it has one name, no hard link beside
-//!   it. Reading by the group is a normal arrangement: a log collector in
-//!   the same group, as the `0640` of a `logrotate` `create`. Any other
-//!   file is refused, and no event is written to it.
+//!   write or execute and others nothing, and it has one name, no hard
+//!   link beside it. Reading by the group is a normal arrangement: a log
+//!   collector in the same group, as the `0640` of a `logrotate`
+//!   `create`. Any other file is refused, and no event is written to it.
 //! - **A symbolic link is never followed.** If the last part of the path
 //!   is a link, the file is not opened: an event is not written to wherever
 //!   somebody pointed a link. The directories on the way are the
@@ -62,7 +62,8 @@ pub enum FileError {
     Open(io::ErrorKind),
     /// The file belongs to another user than the one pgsnare runs as.
     OtherOwner,
-    /// The mode of the file gives the group a write, or anything to others.
+    /// The mode of the file gives the group a write or an execute, or
+    /// anything to others.
     OpenToOthers,
     /// The file has more than one name.
     Linked,
@@ -80,8 +81,8 @@ impl FileError {
                 "the file belongs to another user, and events are not written to it"
             }
             Self::OpenToOthers => {
-                "the file can be read or written by others than its owner, and events are not \
-                 written to it"
+                "the file can be read, written or executed by users other than its owner, and \
+                 events are not written to it"
             }
             Self::Linked => "the file has more than one name, and events are not written to it",
         }
@@ -114,9 +115,9 @@ const fn refusal(mode: u32, owner: u32, names: u64, user: u32) -> Option<FileErr
         return Some(FileError::OtherOwner);
     }
     // The group may read the file: a collector in the same group, as the
-    // 0640 of a logrotate create. A write for the group and anything for
-    // others are not.
-    if mode & 0o027 != 0 {
+    // 0640 of a logrotate create. A write for the group, an execute for
+    // the group and anything for others are not.
+    if mode & 0o037 != 0 {
         return Some(FileError::OpenToOthers);
     }
     if names != 1 {
@@ -446,7 +447,7 @@ mod tests {
     async fn a_file_that_is_open_to_others_is_not_written_to() {
         let dir = TempDir::new();
         let path = dir.0.join("events.jsonl");
-        for open in [0o660, 0o644, 0o620, 0o604, 0o602, 0o666] {
+        for open in [0o660, 0o650, 0o644, 0o620, 0o610, 0o604, 0o602, 0o666] {
             std::fs::write(&path, "an earlier line\n").unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(open)).unwrap();
             assert_eq!(
@@ -495,13 +496,16 @@ mod tests {
     }
 
     #[test]
-    fn only_a_file_of_the_user_that_gives_the_group_no_write_and_others_nothing_is_taken() {
+    fn only_a_file_that_gives_the_group_no_write_or_execute_and_others_nothing_is_taken() {
         assert_eq!(refusal(0o100_600, 1000, 1, 1000), None);
         assert_eq!(refusal(0o100_400, 0, 1, 0), None);
-        // The group may read it: a log collector in the same group.
-        // Execute, too: the only group bit that is refused is the write.
+        // The group may read it: a log collector in the same group. That
+        // is the only group bit that is taken.
         assert_eq!(refusal(0o100_640, 1000, 1, 1000), None);
-        assert_eq!(refusal(0o100_610, 1000, 1, 1000), None);
+        assert_eq!(
+            refusal(0o100_610, 1000, 1, 1000),
+            Some(FileError::OpenToOthers)
+        );
         // The file of another user, also for a process that may write to
         // any file.
         assert_eq!(
@@ -509,7 +513,7 @@ mod tests {
             Some(FileError::OtherOwner)
         );
         assert_eq!(refusal(0o100_600, 1000, 1, 0), Some(FileError::OtherOwner));
-        for bit in [0o020, 0o004, 0o002, 0o001] {
+        for bit in [0o020, 0o010, 0o004, 0o002, 0o001] {
             assert_eq!(
                 refusal(0o100_600 | bit, 1000, 1, 1000),
                 Some(FileError::OpenToOthers),

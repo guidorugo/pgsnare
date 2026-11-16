@@ -268,6 +268,8 @@ tokens:
   - id: billing-canary
     values: [\"Canary.Invoice.000417\", \"ABCD-EFGH-IJKL-MNOP\"]
     case_insensitive: true
+  - id: row-uuid
+    values: [\"f81d4fae-7dec-11d0-a765-00a0c91e6bf6\"]
 ";
 
     fn found(input: &[u8]) -> Vec<(String, usize, PatternForm)> {
@@ -325,6 +327,16 @@ tokens:
             found(b"CANARY.INVOICE.000417"),
             [hit("billing-canary", 0, PatternForm::CaseInsensitive)]
         );
+        // In its sixteen bytes, as a uuid column is sent in a binary result
+        // or a binary COPY.
+        let uuid_bytes = [
+            0xf8u8, 0x1d, 0x4f, 0xae, 0x7d, 0xec, 0x11, 0xd0, 0xa7, 0x65, 0x00, 0xa0, 0xc9, 0x1e,
+            0x6b, 0xf6,
+        ];
+        assert_eq!(
+            found(&uuid_bytes),
+            [hit("row-uuid", 0, PatternForm::UuidBinary)]
+        );
         // Bytes that are not text are scanned like any others.
         assert_eq!(
             found(b"\xff\x00svc.backup.aaaaaaaaaaaa\xfe"),
@@ -380,6 +392,21 @@ tokens:
             "MNOP",
             "4142",
         ] {
+            assert!(!text.contains(secret), "{text}");
+        }
+
+        // A value of the uuid token in its sixteen bytes, as a binary
+        // result sends it.
+        let uuid_bytes = [
+            0xf8u8, 0x1d, 0x4f, 0xae, 0x7d, 0xec, 0x11, 0xd0, 0xa7, 0x65, 0x00, 0xa0, 0xc9, 0x1e,
+            0x6b, 0xf6,
+        ];
+        let text = report(&find(&config, &uuid_bytes).unwrap());
+        assert_eq!(
+            text,
+            "matches honeytoken row-uuid: values[0], in its sixteen bytes\n"
+        );
+        for secret in ["f81d4fae", "a765", "00a0"] {
             assert!(!text.contains(secret), "{text}");
         }
     }

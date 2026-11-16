@@ -777,11 +777,25 @@ mod tests {
             )]
         );
         // The reverse: the raw value of one token is the hex digits of the
-        // bytes of the other's UUID.
+        // bytes of the other's UUID. The digits are a text, not the bytes,
+        // so nothing matches.
         assert!(accepted(&[
             TokenSpec::new("uuid", ["61626364-6566-6768-696a-6b6c6d6e6f70"]),
-            TokenSpec::new("other", ["not-a-uuid-but-12-bytes"]),
+            TokenSpec::new("other", ["6162636465666768696a6b6c6d6e6f70"]),
         ]));
+        // A text that holds the bytes themselves does match.
+        assert_eq!(
+            problems(&[
+                TokenSpec::new("uuid", ["61626364-6566-6768-696a-6b6c6d6e6f70"]),
+                TokenSpec::new("other", ["x-abcdefghijklmnop-y"]),
+            ]),
+            [contains(
+                at("other", 1, 0),
+                PatternForm::Raw,
+                at("uuid", 0, 0),
+                PatternForm::UuidBinary
+            )]
+        );
     }
 
     #[test]
