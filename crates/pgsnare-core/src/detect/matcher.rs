@@ -277,7 +277,8 @@ pub(crate) fn widen(index: usize) -> u64 {
 }
 
 pub(crate) struct Inner {
-    /// Raw and hex patterns of every value. Absent if there are no values.
+    /// Raw, hex and UUID binary patterns of every value. Absent if there are
+    /// no values.
     exact: Option<PatternSet>,
     /// Case-insensitive patterns. Absent unless a token asks for them.
     folded: Option<PatternSet>,
@@ -363,7 +364,7 @@ impl Matcher {
         }
         conflicts?;
 
-        let mut exact = Vec::with_capacity(slots.len().saturating_mul(2));
+        let mut exact = Vec::with_capacity(slots.len().saturating_mul(3));
         let mut folded = Vec::new();
         for slot in &slots {
             exact.push((PatternInfo::new(slot, PatternForm::Raw), slot.raw));
@@ -371,6 +372,14 @@ impl Matcher {
                 PatternInfo::new(slot, PatternForm::Hex),
                 slot.hex.as_slice(),
             ));
+            // A value that is a canonical UUID is sent as its sixteen bytes
+            // in a binary result and a binary COPY.
+            if let Some(uuid) = &slot.uuid {
+                exact.push((
+                    PatternInfo::new(slot, PatternForm::UuidBinary),
+                    uuid.as_slice(),
+                ));
+            }
             // A value without letters reads the same in every case, and the
             // raw pattern already finds it.
             if slot.case_insensitive && slot.raw.iter().any(u8::is_ascii_alphabetic) {
@@ -431,8 +440,9 @@ impl Matcher {
         self.inner.token_count
     }
 
-    /// The number of compiled patterns: two per value, plus one per value
-    /// that is also matched case-insensitively.
+    /// The number of compiled patterns: two per value, one more per value
+    /// that is a canonical UUID, plus one per value that is also matched
+    /// case-insensitively.
     pub fn pattern_count(&self) -> usize {
         self.sets()
             .map(|set| set.patterns.len())
@@ -577,6 +587,11 @@ mod tests {
     const EMAIL: &str = "svc.backup.8f3k2q@mail.example";
     const EMAIL_HEX: &str = "7376632e6261636b75702e3866336b3271406d61696c2e6578616d706c65";
     const INVOICE: &str = "Canary.Invoice.000417";
+    const UUID: &str = "f81d4fae-7dec-11d0-a765-00a0c91e6bf6";
+    const UUID_BYTES: [u8; 16] = [
+        0xf8, 0x1d, 0x4f, 0xae, 0x7d, 0xec, 0x11, 0xd0, 0xa7, 0x65, 0x00, 0xa0, 0xc9, 0x1e, 0x6b,
+        0xf6,
+    ];
 
     fn build(tokens: &[TokenSpec]) -> Matcher {
         Matcher::build(tokens).expect("the token list is valid")
@@ -641,6 +656,91 @@ mod tests {
         assert_eq!(
             scan(&matcher, haystack.as_bytes()),
             [hit("users-admin-backup", 0, PatternForm::Hex, 4..64)]
+        );
+    }
+
+    #[test]
+    fn a_uuid_value_is_found_in_its_sixteen_bytes() {
+        let matcher = build(&[TokenSpec::new("row-uuid", [UUID])]);
+        assert_eq!(matcher.pattern_count(), 3);
+        // A row of a binary result: other columns around the sixteen bytes
+        // of the uuid column.
+        let mut haystack = vec![0x00, 0x00, 0x04, 0x01];
+        haystack.extend_from_slice(&UUID_BYTES);
+        haystack.extend_from_slice(&[0x01, 0xff, 0x00]);
+        assert_eq!(
+            scan(&matcher, &haystack),
+            [hit("row-uuid", 0, PatternForm::UuidBinary, 4..20)]
+        );
+    }
+
+    #[test]
+    fn a_uuid_value_is_found_when_its_sixteen_bytes_cross_a_chunk() {
+        let matcher = build(&[TokenSpec::new("row-uuid", [UUID])]);
+        let mut message = vec![0x00, 0x00, 0x10, 0x00, 0x01];
+        message.extend_from_slice(&UUID_BYTES);
+        message.extend_from_slice(&[0x01, 0xff]);
+        let (head, tail) = message.split_at(7);
+        let mut scanner = matcher.stream();
+        let mut hits = Vec::new();
+        for chunk in [head, tail] {
+            for found in scanner.feed(chunk) {
+                hits.push(found.expect("a scan does not fail"));
+            }
+        }
+        assert_eq!(
+            scan(&matcher, &message),
+            [hit("row-uuid", 0, PatternForm::UuidBinary, 5..21)]
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].token_id().as_str(), "row-uuid");
+        assert_eq!(hits[0].form(), PatternForm::UuidBinary);
+        assert_eq!(hits[0].range(), 5..21);
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_uuid_gets_no_more_patterns() {
+        // Thirty-six bytes like a UUID, with one byte that is not a hex
+        // digit.
+        let broken = "f81d4fag-7dec-11d0-a765-00a0c91e6bf6";
+        let matcher = build(&[TokenSpec::new("row-uuid", [broken])]);
+        assert_eq!(matcher.pattern_count(), 2);
+        // The sixteen bytes it would be are not looked for.
+        assert_eq!(scan(&matcher, &UUID_BYTES), []);
+        // No hyphens is not the canonical form either.
+        let compact = "f81d4fae7dec11d0a76500a0c91e6bf6";
+        let matcher = build(&[TokenSpec::new("row-uuid", [compact])]);
+        assert_eq!(matcher.pattern_count(), 2);
+        assert_eq!(scan(&matcher, &UUID_BYTES), []);
+    }
+
+    #[test]
+    fn an_uppercase_uuid_value_gives_the_same_sixteen_bytes() {
+        let matcher = build(&[TokenSpec::new("row-uuid", [UUID.to_uppercase().as_str()])]);
+        assert_eq!(matcher.pattern_count(), 3);
+        assert_eq!(
+            scan(&matcher, &UUID_BYTES),
+            [hit("row-uuid", 0, PatternForm::UuidBinary, 0..16)]
+        );
+        // The text is found in its configured case.
+        assert_eq!(
+            scan(&matcher, UUID.to_uppercase().as_bytes()),
+            [hit("row-uuid", 0, PatternForm::Raw, 0..36)]
+        );
+    }
+
+    #[test]
+    fn a_uuid_value_is_still_found_in_its_text_forms() {
+        let matcher = build(&[TokenSpec::new("row-uuid", [UUID])]);
+        let row = format!("u={UUID} n=1");
+        assert_eq!(
+            scan(&matcher, row.as_bytes()),
+            [hit("row-uuid", 0, PatternForm::Raw, 2..38)]
+        );
+        let hexed = crate::detect::pattern::hex_lower(UUID.as_bytes());
+        assert_eq!(
+            scan(&matcher, &hexed),
+            [hit("row-uuid", 0, PatternForm::Hex, 0..72)]
         );
     }
 

@@ -279,7 +279,7 @@ Not supported in the first version: login with client certificates, GSSAPI encry
 
 - A token is one or more values with an id, an optional scope hint used only for reporting, and its response.
 - Values must be ASCII and at least 12 bytes. Matching then does not depend on the client's character encoding, and accidental matches are implausible.
-- Each value compiles to a small set of byte patterns: the raw value, its lowercase hex form (how `bytea` is printed in text format) and, if requested, a case-insensitive variant.
+- Each value compiles to a small set of byte patterns: the raw value, its lowercase hex form (how `bytea` is printed in text format), the sixteen bytes of a value written as a canonical UUID (how PostgreSQL sends a `uuid` value in a binary result or a binary COPY) and, if requested, a case-insensitive variant.
 - A token list in which data matching one value would also match another is rejected. That covers a value used twice and a value that contains a pattern of another. Every match then belongs to exactly one token. The loader of the configuration applies this rule, so a configuration that loads is one the matcher compiles.
 - The values pgsnare generates follow these rules by construction: see [section 9.1](#91-bait).
 - All patterns are matched in one pass with the Aho-Corasick algorithm.
@@ -655,7 +655,7 @@ The admin and the metrics listener have the same limits and the same rules:
 
 **Redaction** is one module that everything passes through before it leaves the process: the dispatcher gives it every event before any sink sees it, the log gives it every text of a line, and a name becomes a metric label through it and in no other way.
 
-- **What it removes.** Honeytoken values in every form the matcher finds them in: as written, as lowercase hexadecimal digits and, for a token that asks for it, in any letter case. The patterns are the matcher's own, so what detection finds, redaction removes. It also removes the beginning of a value where a name was cut inside it, and the URL of every webhook. Each is replaced by `[redacted]`. If the search itself fails, nothing of the text is shown.
+- **What it removes.** Honeytoken values in every form the matcher finds them in: as written, as lowercase hexadecimal digits, as the sixteen bytes of a value that is a canonical UUID and, for a token that asks for it, in any letter case. The patterns are the matcher's own, so what detection finds, redaction removes. It also removes the beginning of a value where a name was cut inside it, and the URL of every webhook. Each is replaced by `[redacted]`. If the search itself fails, nothing of the text is shown.
 - **What it does not look for.** Key material: a signing key and a private key are handed to the cryptographic library, and no error, log line or event is built from them. Looking for them would mean keeping a second copy of every key. Passwords and bind parameters: pgsnare relays them without keeping them, and no event, log line or metric has a place for one.
 - **Where it ends.** A value that was written in another form, such as base64, is not recognised. The rule for the code that logs stays the first protection, and the leak test of [section 17](#17-verification) searches for those forms. The URL of a webhook is known to the redaction layer once all sinks are built, and the code that builds them logs no URL.
 

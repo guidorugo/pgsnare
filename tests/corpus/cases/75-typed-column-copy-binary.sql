@@ -1,4 +1,4 @@
--- label: gap
+-- label: hit
 -- describe: A value that is a UUID, in a column of type uuid, read with COPY in binary format, which sends its sixteen bytes whatever the protocol.
 -- token: typed
 

@@ -303,6 +303,26 @@ const fn contains_message(container: PatternForm, contained: PatternForm) -> &'s
             "the hex form of this value contains another value in another letter case, and \
              that value ignores case, so data that matches this one would set off both"
         }
+        (PatternForm::UuidBinary, PatternForm::Raw) => {
+            "the binary form of this value contains another value, so data that matches it \
+             would set off both"
+        }
+        (PatternForm::UuidBinary, PatternForm::Hex) => {
+            "the binary form of this value contains the hex form of another value, so data \
+             that matches it would set off both"
+        }
+        (PatternForm::UuidBinary, PatternForm::CaseInsensitive) => {
+            "the binary form of this value contains another value in another letter case, \
+             and that value ignores case, so data that matches this one would set off both"
+        }
+        (PatternForm::Raw, PatternForm::UuidBinary) => {
+            "this value contains the binary form of another value, so data that matches it \
+             would set off both"
+        }
+        (PatternForm::Hex, PatternForm::UuidBinary) => {
+            "the hex form of this value contains the binary form of another value, so data \
+             that matches it would set off both"
+        }
         (PatternForm::CaseInsensitive, PatternForm::Hex) => {
             "this value ignores case, and in another letter case it contains the hex form of \
              another value, so data that matches it would set off both"

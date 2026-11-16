@@ -169,6 +169,7 @@ pub fn report(found: &[Found]) -> String {
                 PatternForm::Raw => "as it is",
                 PatternForm::Hex => "in hexadecimal",
                 PatternForm::CaseInsensitive => "in another letter case",
+                PatternForm::UuidBinary => "in its sixteen bytes",
                 _ => "in another form",
             }
         ));

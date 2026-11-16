@@ -531,6 +531,22 @@ fn missed_where_a_query_escaped_a_single_quote() {
 }
 
 #[test]
+fn found_in_the_binary_form_of_a_uuid() {
+    // A uuid is printed in lowercase, and is its sixteen bytes in binary.
+    let uuid = "f81d4fae-7dec-11d0-a765-00a0c91e6bf6";
+    // SELECT 'F81D4FAE-7DEC-11D0-A765-00A0C91E6BF6'::uuid
+    assert_found(uuid, "f81d4fae-7dec-11d0-a765-00a0c91e6bf6", 1);
+    // SELECT uuid_send('f81d4fae-7dec-11d0-a765-00a0c91e6bf6'::uuid)
+    assert_eq!(
+        hits(
+            &matcher_for(uuid),
+            &binary("f81d4fae7dec11d0a76500a0c91e6bf6")
+        ),
+        [(PatternForm::UuidBinary, 0)]
+    );
+}
+
+#[test]
 fn missed_in_the_binary_form_of_a_type_that_is_not_text() {
     // A number is its digits in text format and something else in binary.
     let card = "4929000000000017";
@@ -540,11 +556,4 @@ fn missed_in_the_binary_form_of_a_type_that_is_not_text() {
     assert_missed(card, binary("001182e63e191011"));
     // SELECT numeric_send(4929000000000017::numeric)
     assert_missed(card, binary("00040003000000001341000000000011"));
-
-    // A uuid is printed in lowercase, and is sixteen bytes in binary.
-    let uuid = "f81d4fae-7dec-11d0-a765-00a0c91e6bf6";
-    // SELECT 'F81D4FAE-7DEC-11D0-A765-00A0C91E6BF6'::uuid
-    assert_found(uuid, "f81d4fae-7dec-11d0-a765-00a0c91e6bf6", 1);
-    // SELECT uuid_send('f81d4fae-7dec-11d0-a765-00a0c91e6bf6'::uuid)
-    assert_missed(uuid, binary("f81d4fae7dec11d0a76500a0c91e6bf6"));
 }
