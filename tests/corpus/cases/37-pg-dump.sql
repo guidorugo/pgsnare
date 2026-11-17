@@ -1,0 +1,4 @@
+-- label: hit
+-- describe: A full dump of the database with pg_dump, which reads tables with COPY and decides the protocol itself.
+-- needs: pg_dump
+-- modes: simple

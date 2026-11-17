@@ -11,9 +11,12 @@
 //! - An error names the variable or the file and says what is wrong with
 //!   it. It never contains anything that was read.
 //! - A file is read up to [`MAX_SECRET_BYTES`] and no further.
-//! - One line break at the end of a file is not part of the secret. Tools
-//!   that write a secret to a file tend to add one, and a receiver that
-//!   was given the secret without it could verify nothing.
+//! - One line break at the end of a file that holds text is not part of
+//!   the secret. Tools that write a secret to a file tend to add one, and
+//!   a receiver that was given the secret without it could verify nothing.
+//!   A file that is not valid UTF-8 holds a key of raw bytes, and every
+//!   byte of it is the key: a byte that looks like a line break is not
+//!   taken away from it.
 //!
 //! Whether a file is closed to other users is not checked here. `pgsnare
 //! run` checks that for every file that holds a secret before it reads the
@@ -64,7 +67,7 @@ pub(crate) fn from_env(variable: &EnvVarName) -> Result<Zeroizing<Vec<u8>>, Stri
     Ok(value)
 }
 
-/// The content of a file, without one line break at its end.
+/// The content of a file, without one line break at the end of a text.
 pub(crate) fn from_file(file: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
     let failed = |problem: &str| format!("{}: {problem}", file.display());
     let opened = File::open(file)
@@ -94,7 +97,8 @@ pub(crate) fn from_file(file: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
         )));
     }
     content.truncate(filled);
-    if content.last() == Some(&b'\n') {
+    // Only a text ends with a line break that is not part of it.
+    if core::str::from_utf8(&content).is_ok() && content.last() == Some(&b'\n') {
         content.pop();
         if content.last() == Some(&b'\r') {
             content.pop();
@@ -163,6 +167,12 @@ mod tests {
         assert_eq!(read("two", b"key\n\n"), Ok(b"key\n".to_vec()));
         assert_eq!(read("spaces", b" key \n"), Ok(b" key ".to_vec()));
         assert_eq!(read("binary", &[0, 255, 10, 13]), Ok(vec![0, 255, 10, 13]));
+        // A key of raw bytes keeps every byte, whatever its last ones are.
+        assert_eq!(
+            read("raw", &[0x9f, 0xa2, 0, 10]),
+            Ok(vec![0x9f, 0xa2, 0, 10])
+        );
+        assert_eq!(read("raw dos", &[0x9f, 13, 10]), Ok(vec![0x9f, 13, 10]));
         // A key of exactly the largest size is taken.
         let largest = vec![b'k'; MAX_SECRET_BYTES];
         assert_eq!(read("largest", &largest), Ok(largest));

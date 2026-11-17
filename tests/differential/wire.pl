@@ -10,13 +10,32 @@
 #   wire.pl CONNINFO COMMAND
 #
 #   CONNINFO   a libpq keyword/value string. The keywords host, port, user,
-#              dbname, sslmode and max_protocol_version are understood.
-#              The password comes from the environment (PGPASSWORD).
+#              dbname, sslmode, max_protocol_version, application_name and
+#              client_encoding are understood. The password comes from the
+#              environment (PGPASSWORD).
 #   COMMAND    one of:
 #     portal      fetch a result three rows at a time
 #     copy-fail   start a COPY, send a row and give up
 #     function    call a function with a FunctionCall message
 #     negotiate   ask for protocol 3.99 with an option no server knows
+#     extended STATEMENT text|binary
+#                 run one statement over the extended protocol, with its
+#                 result in that format. The process id of the backend is
+#                 printed first, as "backend N", so that a test can look
+#                 for that backend in pg_stat_activity afterwards.
+#     script FILE text|binary [pipeline] [rows=N]
+#                 run the statements of a file over the extended protocol,
+#                 one after the other in one session, with their results in
+#                 that format. In the file a line that begins with "--" is
+#                 a comment, and a statement ends with a line that ends
+#                 with a semicolon. With `pipeline` all statements are sent
+#                 before the first answer is read, with one Sync; with
+#                 `rows=N` each Execute asks for N rows, until the portal
+#                 is read. A statement that fails does not end the script.
+#                 The last thing the script does is a simple query that
+#                 answers "the session is still open". When the server
+#                 hangs up in the middle of a message, what had arrived of
+#                 its body is printed as "partial" and hexadecimal.
 #
 # The script prints every message the server sends from the end of the
 # login on, as its type and its body in hexadecimal. That is the output a
@@ -81,14 +100,20 @@ sub send_bytes {
     }
 }
 
+# What has arrived of the bytes that are being read. A command that shows
+# what came before the server hung up finds it here.
+my $pending = '';
+
 sub read_bytes {
     my ($wanted) = @_;
-    my $bytes = '';
-    while (length($bytes) < $wanted) {
-        my $count = sysread($reader, $bytes, $wanted - length($bytes), length($bytes));
+    $pending = '';
+    while (length($pending) < $wanted) {
+        my $count = sysread($reader, $pending, $wanted - length($pending), length($pending));
         die "cannot read: $!\n" unless defined $count;
         die "the server closed the connection\n" if $count == 0;
     }
+    my $bytes = $pending;
+    $pending = '';
     return $bytes;
 }
 
@@ -185,7 +210,11 @@ sub scram {
 # ReadyForQuery.
 sub log_in {
     connect_to_server();
-    send_bytes(startup($minor, 'user', $option{user}, 'database', $option{dbname}));
+    my @parameters = ('user', $option{user}, 'database', $option{dbname});
+    for my $name (qw(application_name client_encoding)) {
+        push @parameters, $name, $option{$name} if defined $option{$name};
+    }
+    send_bytes(startup($minor, @parameters));
     while (1) {
         my ($type, $body) = read_message();
         # A server older than the protocol version asked for says so first.
@@ -293,7 +322,124 @@ sub negotiate {
     disconnect();
 }
 
+# One statement over the extended protocol: Parse, Bind with one result
+# format for every column, Describe, Execute and Sync. A server that ends
+# the session on the way is reported by read_bytes, after the messages
+# that arrived before it hung up.
+sub extended {
+    my ($sql, $format) = @ARGV[2, 3];
+    die "Usage: wire.pl CONNINFO extended STATEMENT text|binary\n"
+        unless defined $format && $format =~ /\A(?:text|binary)\z/;
+    log_in();
+    query('SELECT pg_backend_pid()');
+    while (1) {
+        my ($type, $body) = read_message();
+        die "the server reported an error\n" if $type eq 'E';
+        if ($type eq 'D') {
+            my $length = unpack 'x2 N', $body;
+            print 'backend ', substr($body, 6, $length), "\n";
+        }
+        last if $type eq 'Z';
+    }
+    my $code = $format eq 'binary' ? 1 : 0;
+    send_bytes(
+        message('P', "\0$sql\0" . pack('n', 0))
+        . message('B', "\0\0" . pack('n n n n', 0, 0, 1, $code))
+        . message('D', "P\0")
+        . message('E', "\0" . pack('N', 0))
+        . message('S', '')
+    );
+    show_until('Z');
+    finish();
+}
+
+# The statements of a file: see the usage.
+sub statements {
+    my ($path) = @_;
+    open my $file, '<', $path or die "cannot read $path: $!\n";
+    my (@statements, $statement);
+    while (my $line = <$file>) {
+        next if $line =~ /\A--/ || $line !~ /\S/;
+        $line =~ s/\s+\z//;
+        $statement = defined $statement ? "$statement\n$line" : $line;
+        if ($statement =~ s/;\z//) {
+            push @statements, $statement;
+            undef $statement;
+        }
+    }
+    close $file;
+    die "$path: the last statement does not end with a semicolon\n" if defined $statement;
+    die "$path: there is no statement\n" unless @statements;
+    return @statements;
+}
+
+# The statements of a file over the extended protocol, each as Parse, Bind
+# with one result format for every column, Describe and Execute.
+sub script {
+    my ($path, $format, @settings) = @ARGV[2 .. $#ARGV];
+    die "Usage: wire.pl CONNINFO script FILE text|binary [pipeline] [rows=N]\n"
+        unless defined $format && $format =~ /\A(?:text|binary)\z/;
+    my ($pipeline, $limit) = (0, 0);
+    for my $setting (@settings) {
+        if ($setting eq 'pipeline') {
+            $pipeline = 1;
+        } elsif ($setting =~ /\Arows=([1-9][0-9]{0,5})\z/) {
+            $limit = $1;
+        } else {
+            die "wire.pl: unknown setting: $setting\n";
+        }
+    }
+    my @statements = statements($path);
+    my $code = $format eq 'binary' ? 1 : 0;
+    my $execute = message('E', "\0" . pack('N', $limit));
+    # A write to a server that has hung up is an error to report, not a
+    # signal to die of.
+    local $SIG{PIPE} = 'IGNORE';
+    log_in();
+    my $done = eval {
+        my $ahead = '';
+        for my $sql (@statements) {
+            my $asked = message('P', "\0$sql\0" . pack('n', 0))
+                . message('B', "\0\0" . pack('n n n n', 0, 0, 1, $code))
+                . message('D', "P\0")
+                . $execute;
+            if ($pipeline) {
+                $ahead .= $asked;
+            } elsif ($limit == 0) {
+                send_bytes($asked . message('S', ''));
+                show_until('Z');
+            } else {
+                # Flush after each Execute: the portal lives until the Sync.
+                send_bytes($asked . message('H', ''));
+                while (1) {
+                    my ($type, $body) = read_message();
+                    show($type, $body);
+                    last if $type eq 'C' || $type eq 'E' || $type eq 'I';
+                    send_bytes($execute . message('H', '')) if $type eq 's';
+                }
+                send_bytes(message('S', ''));
+                show_until('Z');
+            }
+        }
+        if ($pipeline) {
+            send_bytes($ahead . message('S', ''));
+            show_until('Z');
+        }
+        query("SELECT 'the session' || ' is still open'");
+        show_until('Z');
+        1;
+    };
+    if (!$done) {
+        my $error = $@;
+        printf "partial %s\n", unpack('H*', $pending) if length $pending;
+        die $error;
+    }
+    finish();
+}
+
 my %commands = (
+    'extended'  => \&extended,
+    'script'    => \&script,
     'portal'    => \&portal,
     'copy-fail' => \&copy_fail,
     'function'  => \&function,

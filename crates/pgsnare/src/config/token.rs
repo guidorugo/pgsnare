@@ -303,9 +303,37 @@ const fn contains_message(container: PatternForm, contained: PatternForm) -> &'s
             "the hex form of this value contains another value in another letter case, and \
              that value ignores case, so data that matches this one would set off both"
         }
+        (PatternForm::UuidBinary, PatternForm::Raw) => {
+            "the binary form of this value contains another value, so data that matches it \
+             would set off both"
+        }
+        (PatternForm::UuidBinary, PatternForm::Hex) => {
+            "the binary form of this value contains the hex form of another value, so data \
+             that matches it would set off both"
+        }
+        (PatternForm::UuidBinary, PatternForm::CaseInsensitive) => {
+            "the binary form of this value contains another value in another letter case, \
+             and that value ignores case, so data that matches this one would set off both"
+        }
+        (PatternForm::UuidBinary, PatternForm::UuidBinary) => {
+            "the binary form of this value contains the binary form of another value, so data \
+             that matches it would set off both"
+        }
+        (PatternForm::Raw, PatternForm::UuidBinary) => {
+            "this value contains the binary form of another value, so data that matches it \
+             would set off both"
+        }
+        (PatternForm::Hex, PatternForm::UuidBinary) => {
+            "the hex form of this value contains the binary form of another value, so data \
+             that matches it would set off both"
+        }
         (PatternForm::CaseInsensitive, PatternForm::Hex) => {
             "this value ignores case, and in another letter case it contains the hex form of \
              another value, so data that matches it would set off both"
+        }
+        (PatternForm::CaseInsensitive, PatternForm::UuidBinary) => {
+            "this value ignores case, and in another letter case it contains the binary form \
+             of another value, so data that matches it would set off both"
         }
         (PatternForm::CaseInsensitive, _) => {
             "this value ignores case, and in another letter case it contains another value, \
@@ -760,6 +788,7 @@ tokens:
             PatternForm::Raw,
             PatternForm::Hex,
             PatternForm::CaseInsensitive,
+            PatternForm::UuidBinary,
         ];
         let mut messages = std::collections::BTreeSet::new();
         for container in forms {
@@ -770,8 +799,9 @@ tokens:
             }
         }
         // Each pair of forms the matcher reports has a message of its own.
-        // Both values in another letter case is a pair it never reports.
-        assert_eq!(messages.len(), 8);
+        // Only "a value in another letter case" and the same pair again,
+        // with both values in another letter case, share one.
+        assert_eq!(messages.len(), 15);
     }
 
     #[test]

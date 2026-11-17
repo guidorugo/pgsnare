@@ -58,6 +58,7 @@ Each token has its own response: `alert` (the default), `kill`, `tarpit`, `fake_
 
 ## Known limits
 
+- **Tokens in typed columns are found only where the column's binary form is looked for.** A token in a `uuid` column is found in text results, and in binary results when its sixteen bytes hold at least eight distinct values: always for a generated random UUID, never for the nil UUID or a sequential counter, so use generated random UUIDs there. Tokens for other typed columns (integers, numerics, dates) are found only in text results, so plant other tokens in text columns.
 - **A honeytoken used as a password is not detected.** Login messages (the password a client sends) are not scanned, so an attacker who tries a stolen account's honeytoken password is not seen at that moment. A honeytoken used as a **user name** is detected, because the startup message is scanned, and so is any use of the value in a query. Do not rely on a planted password hash alone; plant it in a column and read it through pgsnare.
 - Detection is of the value as it travels. A value that is hashed, cut or re-encoded inside the database is not matched.
 - Blind extraction infers data without returning it. A honeytoken is not seen by it.

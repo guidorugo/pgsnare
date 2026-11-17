@@ -612,31 +612,48 @@ fn the_file_of_a_file_sink_is_checked_and_never_created() {
     run_refuses_it_too(&fixture);
     assert!(!fixture.path("elsewhere").exists());
 
-    // A file that is there and that others can read is a warning, and
-    // stays as it is.
+    // A file that is there and that others can read is not written to,
+    // and stays as it is.
     fixture.write_with_mode("open.jsonl", "{}\n", 0o644);
     fixture.write("pgsnare.yaml", &with_file(&fixture.arg("open.jsonl")));
     let run = check(&fixture, &[]);
-    assert_eq!(run.status, 0, "{}", run.stdout);
+    assert_eq!(run.status, 1, "{}", run.stdout);
     assert_eq!(
-        lines(&fixture, &run, "warning: "),
+        lines(&fixture, &run, "error: "),
         [
-            "events.sinks[1] (file): <dir>/open.jsonl: the file events are written to can be \
-             read or written by others than its owner"
+            "events.sinks[1] (file): <dir>/open.jsonl: the file is open to more than its owner \
+             and readers of its group, and events are not written to it"
         ]
     );
+    run_refuses_it_too(&fixture);
     assert_eq!(
         std::fs::read_to_string(fixture.path("open.jsonl")).unwrap(),
+        "{}\n"
+    );
+
+    // Closed to others, it is taken.
+    fixture.write_with_mode("closed.jsonl", "{}\n", 0o600);
+    fixture.write("pgsnare.yaml", &with_file(&fixture.arg("closed.jsonl")));
+    let run = check(&fixture, &[]);
+    assert_eq!(run.status, 0, "{}", run.stdout);
+    assert!(
+        lines(&fixture, &run, "warning: ").is_empty(),
+        "{}",
+        run.stdout
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.path("closed.jsonl")).unwrap(),
         "{}\n"
     );
 }
 
 #[test]
-fn every_sink_is_reported_and_a_short_signing_key_is_a_warning() {
+fn every_sink_is_reported_and_a_signing_key_must_be_long_enough() {
     let fixture = Fixture::new();
     fixture.certificates();
     fixture.write("hook-url", "https://alerts.example.com/hooks/pgsnare\n");
-    fixture.write("hook-secret", "short");
+    // One byte less than a signing key must have.
+    fixture.write("hook-secret", "fifteen-bytes-k");
     let sinks = format!(
         "    - type: webhook\n      url: https://alerts.example.com/hooks/pgsnare\n      \
          hmac_secret_env: PGSNARE_TEST_SECRET_THAT_IS_NOT_SET\n\
@@ -646,7 +663,30 @@ fn every_sink_is_reported_and_a_short_signing_key_is_a_warning() {
     fixture.write("pgsnare.yaml", &fixture::valid(&sinks));
     let run = check(&fixture, &[]);
     assert_eq!(run.status, 1, "{}", run.stdout);
-    // `pgsnare run` stops at the first of these. The check reports both.
+    // `pgsnare run` stops at the first of these. The check reports all.
+    assert_eq!(
+        lines(&fixture, &run, "error: "),
+        [
+            "events.sinks[1] (webhook): the environment variable \
+             PGSNARE_TEST_SECRET_THAT_IS_NOT_SET is not set",
+            "events.sinks[2] (webhook): the signing key of this webhook is shorter than 16 bytes",
+            "events.sinks[3] (file): <dir>/missing/events.jsonl: the file cannot be opened: \
+             entity not found",
+        ]
+    );
+    assert!(
+        lines(&fixture, &run, "warning: ").is_empty(),
+        "{}",
+        run.stdout
+    );
+    assert!(!run.stdout.contains("fifteen"), "{}", run.stdout);
+    run_refuses_it_too(&fixture);
+
+    // A key of the fewest bytes is taken, with a warning: it is shorter
+    // than a key should be.
+    fixture.write("hook-secret", "sixteen-bytes-ke");
+    let run = check(&fixture, &[]);
+    assert_eq!(run.status, 1, "{}", run.stdout);
     assert_eq!(
         lines(&fixture, &run, "error: "),
         [

@@ -1,0 +1,4 @@
+-- label: gap
+-- describe: The value used as the password of a login. Login messages are not searched, and with SCRAM the password is never sent. The database refuses the login.
+-- needs: login
+-- modes: simple

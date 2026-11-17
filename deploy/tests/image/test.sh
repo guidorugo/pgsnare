@@ -14,13 +14,16 @@
 #   1. The image names a numeric user that is not 0, its entry point is
 #      pgsnare, and its health check is `pgsnare healthcheck` in exec form.
 #   2. The files of the image: pgsnare is owned by root and cannot be
-#      written, no file has the setuid or setgid bit, nothing but the home
-#      directory of the user belongs to anyone but root, nothing outside a
-#      sticky directory can be written by everybody, no package manager
-#      cache is left, and the CA certificates are there. (The base has a
-#      shell and a package manager: the owner chose it. The process cannot
-#      use them to install anything: it is not root, holds no capability and
-#      has a read-only root filesystem.)
+#      written, the licence notices of the dependencies and the licence of
+#      the repository are there, of root, and not empty, the notices hold
+#      the licences of the code the package pg_query bundles, no file has
+#      the setuid or setgid bit, nothing
+#      but the home directory of the user belongs to anyone but root,
+#      nothing outside a sticky directory can be written by everybody, no
+#      package manager cache is left, and the CA certificates are there.
+#      (The base has a shell and a package manager: the owner chose it. The
+#      process cannot use them to install anything: it is not root, holds no
+#      capability and has a read-only root filesystem.)
 #   3. The binary asks for no interpreter and no shared library.
 #   4. With a read-only root filesystem, without capabilities and with
 #      `no-new-privileges`, the container finds a PostgreSQL container by
@@ -216,6 +219,22 @@ has_certificates() {
     fi
 }
 
+# has_notices NAME: the image holds the licence notices of the
+# dependencies and the licence of the repository, both files of root with
+# mode 0644, and not empty.
+has_notices() {
+    if ! grep -qE '^-rw-r--r-- 0/0 [1-9][0-9]* usr/share/doc/pgsnare/THIRD-PARTY-NOTICES$' "$work/$1.list"; then
+        echo "the image has no /usr/share/doc/pgsnare/THIRD-PARTY-NOTICES of root with mode 0644:"
+        grep -E ' usr/share/doc/pgsnare/' "$work/$1.list" | sed 's/^/    /' || true
+        return 1
+    fi
+    if ! grep -qE '^-rw-r--r-- 0/0 [1-9][0-9]* usr/share/doc/pgsnare/LICENSE$' "$work/$1.list"; then
+        echo "the image has no /usr/share/doc/pgsnare/LICENSE of root with mode 0644:"
+        grep -E ' usr/share/doc/pgsnare/' "$work/$1.list" | sed 's/^/    /' || true
+        return 1
+    fi
+}
+
 # is_static FILE
 is_static() {
     local header
@@ -276,6 +295,8 @@ reference_container="$listed"
 grep -qE '^-[^ ]+ [^ ]+ [1-9][0-9]* usr/local/bin/pgsnare$' "$work/image.list" \
     || fail "the image does not hold /usr/local/bin/pgsnare"
 must_pass "pgsnare is a file of root that nobody can write" pgsnare_is_sealed image
+must_pass "the licence notices and the licence of the repository are there" has_notices image
+must_reject "the licence notices and the licence of the repository are there" has_notices reference
 must_pass "no file has the setuid or the setgid bit" no_setuid image
 must_reject "no file has the setuid or the setgid bit" no_setuid reference
 must_pass "only root owns files, apart from the home directory" only_root_owns image
@@ -295,6 +316,7 @@ drwxrwxrwx 0/0 0 var/anything/
 -rw-r--r-- 0/0 100 var/lib/apt/lists/index
 LIST
 must_reject "pgsnare is a file of root that nobody can write" pgsnare_is_sealed made-up
+must_reject "the licence notices and the licence of the repository are there" has_notices made-up
 must_reject "no file has the setuid or the setgid bit" no_setuid made-up
 must_reject "only root owns files, apart from the home directory" only_root_owns made-up
 must_reject "nothing but a sticky directory can be written by everybody" not_writable_by_all made-up
@@ -307,6 +329,79 @@ drwx------ 65532/65532 0 home/nonroot/
 LIST
 must_pass "a sticky directory and the home directory are allowed" bash -c \
     "$(declare -f list_names not_writable_by_all only_root_owns); work='$work'; not_writable_by_all allowed && only_root_owns allowed"
+
+# The notices go with the C code of the rules the binary holds: they must
+# hold the licences of the code that the package pg_query bundles, not
+# only an entry that names it.
+"$docker" cp --follow-link "$container:/usr/share/doc/pgsnare/THIRD-PARTY-NOTICES" "$work/notices" >/dev/null
+if grep -q '^pg_query ' "$work/notices"; then
+    echo "image-test: ok: the notices hold an entry for pg_query"
+else
+    fail "the notices of the image hold no entry for pg_query"
+fi
+notices_line() {
+    grep -qF -- "$1" "$work/notices"
+}
+if notices_line '  file: pg_query.rs-LICENSE'; then
+    echo "image-test: ok: the notices hold the licence of the pg_query crate"
+else
+    fail "the notices of the image hold no heading for the licence of the pg_query crate"
+fi
+if notices_line 'Copyright (c) 2021 Paul Mason <paul@form1.co.nz>'; then
+    echo "image-test: ok: the notices hold the text of the licence of the pg_query crate"
+else
+    fail "the notices of the image hold no line of the licence of the pg_query crate"
+fi
+if notices_line '  file: libpg_query-LICENSE'; then
+    echo "image-test: ok: the notices hold the licence of the C code of the rules"
+else
+    fail "the notices of the image hold no heading for the licence of the C code of the rules"
+fi
+if notices_line 'Copyright (c) 2015, Lukas Fittl <lukas@fittl.com>'; then
+    echo "image-test: ok: the notices hold the text of the licence of the C code of the rules"
+else
+    fail "the notices of the image hold no line of the licence of the C code of the rules"
+fi
+if notices_line '  file: postgresql-COPYRIGHT'; then
+    echo "image-test: ok: the notices hold the copyright of the PostgreSQL code of the rules"
+else
+    fail "the notices of the image hold no heading for the copyright of the PostgreSQL code of the rules"
+fi
+if notices_line 'PostgreSQL Database Management System'; then
+    echo "image-test: ok: the notices hold the text of the copyright of the PostgreSQL code of the rules"
+else
+    fail "the notices of the image hold no line of the copyright of the PostgreSQL code of the rules"
+fi
+if notices_line '  file: upb-LICENSE'; then
+    echo "image-test: ok: the notices hold the licence of the upb code of the rules"
+else
+    fail "the notices of the image hold no heading for the licence of the upb code of the rules"
+fi
+if notices_line 'Copyright 2008 Google Inc.  All rights reserved.'; then
+    echo "image-test: ok: the notices hold the text of the licence of the upb code of the rules"
+else
+    fail "the notices of the image hold no line of the licence of the upb code of the rules"
+fi
+if notices_line '  file: utf8_range-LICENSE'; then
+    echo "image-test: ok: the notices hold the licence of the utf8_range code of the rules"
+else
+    fail "the notices of the image hold no heading for the licence of the utf8_range code of the rules"
+fi
+if notices_line 'Copyright (c) 2019 Yibo Cai'; then
+    echo "image-test: ok: the notices hold the text of the licence of the utf8_range code of the rules"
+else
+    fail "the notices of the image hold no line of the licence of the utf8_range code of the rules"
+fi
+if notices_line '  file: xxHash-LICENSE'; then
+    echo "image-test: ok: the notices hold the licence of the xxhash code of the rules"
+else
+    fail "the notices of the image hold no heading for the licence of the xxhash code of the rules"
+fi
+if notices_line 'Copyright (c) 2012-2020 Yann Collet'; then
+    echo "image-test: ok: the notices hold the text of the licence of the xxhash code of the rules"
+else
+    fail "the notices of the image hold no line of the licence of the xxhash code of the rules"
+fi
 
 echo "image-test: the binary must need no interpreter and no library"
 "$docker" cp --follow-link "$container:/usr/local/bin/pgsnare" "$work/pgsnare" >/dev/null

@@ -43,6 +43,17 @@
 //! were busy, or the time allowed has passed. The session logic gets one
 //! of them, always.
 //!
+//! # A report that waits for the end of a result
+//!
+//! The session logic may keep back the report of a hit until the result
+//! the hit is in has ended, to say in it whether rows were added to that
+//! result. It has no clock, so this module keeps the time: [`EVENT_HOLD`]
+//! after the session logic said that it keeps a report, it is told to hand
+//! the report over as it stands. A client that reads slowly, or a database
+//! that takes its time, cannot hold an alert back for longer. And when a
+//! session ends, however it ends, the session logic is asked one last time
+//! for what it kept, so no report is lost with a session.
+//!
 //! # What the proxy adds
 //!
 //! Once the database has accepted the login, the session measures how long
@@ -95,6 +106,10 @@ pub(crate) const IDLE_AFTER: Duration = Duration::from_secs(2);
 
 /// How long a session that is closing has to send what is still queued.
 pub(crate) const LINGER: Duration = Duration::from_secs(5);
+
+/// How long the report of a hit may wait for the end of the result the hit
+/// is in. An alert is late by this much at most.
+pub(crate) const EVENT_HOLD: Duration = Duration::from_millis(500);
 
 /// How long forwarding a cancel request may take.
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -314,6 +329,9 @@ struct Driver {
     hold_client_until: Option<Instant>,
     /// When the session stops being tarpitted, and is killed.
     tarpit_until: Option<Instant>,
+    /// When the session logic is told to hand over the report it keeps
+    /// back.
+    event_due: Option<Instant>,
     /// When the oldest bytes were read whose outcome has not been written
     /// to the client in full, and the same for the database.
     to_client_since: Option<Instant>,
@@ -366,6 +384,7 @@ pub(crate) async fn run(
         login_deadline,
         hold_client_until: None,
         tarpit_until: None,
+        event_due: None,
         to_client_since: None,
         to_backend_since: None,
         linger_until: None,
@@ -485,6 +504,11 @@ impl Driver {
                     self.tarpit_until = None;
                     self.hold_client_until = None;
                     self.report(Report::TarpitOver);
+                    self.carry_out().await;
+                }
+                () = sleep_until_some(self.event_due), if self.event_due.is_some() => {
+                    self.event_due = None;
+                    self.report(Report::EventDue);
                     self.carry_out().await;
                 }
                 answer = next_answer(&mut self.analysing), if analysing => {
@@ -726,18 +750,23 @@ impl Driver {
                 return;
             }
             match effect {
-                Effect::Close(leg) => self.close_after_flush(leg),
-                Effect::Emit(body) => self.context.events.submit(body),
-                Effect::QuerySeen => self.context.status.query_seen(),
-                Effect::TokenHit {
-                    token_id,
-                    exempt,
-                    actions,
-                    decided: _,
-                } => {
-                    self.context.status.token_hit(&token_id, exempt);
-                    self.context.status.actions_taken(actions);
+                Effect::Close(leg) => {
+                    // What the session logic says last is not held back:
+                    // a session that is ended while it is slowed down gets
+                    // its error at once, and inside the time left to it.
+                    self.hold_client_until = None;
+                    self.close_after_flush(leg);
                 }
+                effect @ (Effect::Emit(_) | Effect::TokenHit { .. }) => self.note(effect),
+                Effect::QuerySeen => self.context.status.query_seen(),
+                Effect::EventHeld => {
+                    // A moment the clock cannot name is now.
+                    let now = Instant::now();
+                    self.event_due = Some(now.checked_add(EVENT_HOLD).unwrap_or(now));
+                }
+                // A session that is being closed is not slowed down any
+                // more.
+                Effect::Delay(_) if self.client_closing => {}
                 Effect::Delay(delay) => {
                     let now = Instant::now();
                     let until = now.checked_add(delay).unwrap_or(now);
@@ -774,19 +803,7 @@ impl Driver {
                     self.context.status.actions_taken(actions);
                 }
                 #[cfg(feature = "rules")]
-                Effect::RuleHit {
-                    rule_id,
-                    exempt,
-                    actions,
-                    decided: _,
-                } => {
-                    // A hit in an exempt session triggers nothing, and
-                    // there is no counter of its own for it.
-                    if !exempt {
-                        self.context.status.rule_hit(&rule_id);
-                        self.context.status.actions_taken(actions);
-                    }
-                }
+                effect @ Effect::RuleHit { .. } => self.note(effect),
                 // An effect this runtime does not know cannot be carried
                 // out, and a session must not go on as if it had been.
                 _ => {
@@ -798,6 +815,37 @@ impl Driver {
                 }
             }
             queue.extend(mem::take(&mut self.out.effects));
+        }
+    }
+
+    /// Carries out an effect that only reports or counts: the event of
+    /// the session logic goes to the dispatcher, and a hit is counted.
+    /// Any other effect is left alone.
+    fn note(&self, effect: Effect) {
+        match effect {
+            Effect::Emit(body) => self.context.events.submit(body),
+            Effect::TokenHit {
+                token_id,
+                exempt,
+                actions,
+                decided: _,
+            } => {
+                self.context.status.token_hit(&token_id, exempt);
+                self.context.status.actions_taken(actions);
+            }
+            // A hit of a rule in an exempt session triggers nothing, and
+            // there is no counter of its own for it.
+            #[cfg(feature = "rules")]
+            Effect::RuleHit {
+                rule_id,
+                exempt: false,
+                actions,
+                decided: _,
+            } => {
+                self.context.status.rule_hit(&rule_id);
+                self.context.status.actions_taken(actions);
+            }
+            _ => {}
         }
     }
 
@@ -1083,6 +1131,26 @@ impl Driver {
             self.out.to_server = Vec::new();
         }
         self.out.effects = Vec::new();
+    }
+}
+
+impl Drop for Driver {
+    /// A session that ends, however it ends, hands over the report its
+    /// logic kept back: an alert is not lost with its session.
+    fn drop(&mut self) {
+        // Code that is being unwound is not called again.
+        if std::thread::panicking() {
+            return;
+        }
+        let policy = self.context.policy.snapshot();
+        // The session is over whatever its logic answers, and nothing but
+        // the report and the count is carried out.
+        let _ = self
+            .session
+            .on_report(Report::EventDue, &policy, &mut self.out);
+        for effect in mem::take(&mut self.out.effects) {
+            self.note(effect);
+        }
     }
 }
 

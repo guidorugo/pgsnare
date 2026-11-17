@@ -13,15 +13,15 @@ use pgsnare_core::actions::TarpitPlaces;
 use pgsnare_core::bait::Entropy;
 use pgsnare_core::detect::{Matcher, TokenSpec};
 use pgsnare_core::policy::{
-    Action, ActionSet, ActionSettings, FakeDataSettings, Inspection, KillSettings, OnError,
-    PolicySnapshot, TarpitSettings, TokenId, TokenPolicy,
+    Action, ActionSet, ActionSettings, Escalation, FakeDataSettings, Inspection, KillSettings,
+    OnError, PolicySnapshot, TarpitSettings, TokenId, TokenPolicy,
 };
 use pgsnare_core::session::postgres::{Postgres, Responses};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::support::{
     Database, ProxyOptions, Running, answer, error_fields, frame, query, read_frame, read_packet,
-    read_to_end, welcome,
+    read_to_end, until, welcome,
 };
 
 const TOKEN_ID: &str = "users-admin-backup";
@@ -29,8 +29,13 @@ const VALUE: &str = "svc.backup.8f3k2q@mail.example";
 const CANCEL_CODE: [u8; 4] = 80_877_102u32.to_be_bytes();
 
 fn options(tarpit: TarpitSettings) -> ProxyOptions {
+    options_with(tarpit, None)
+}
+
+fn options_with(tarpit: TarpitSettings, escalate: Option<Escalation>) -> ProxyOptions {
     let mut token = TokenPolicy::new(TokenId::new(TOKEN_ID).unwrap());
     token.actions = ActionSet::of(&[Action::Tarpit]);
+    token.escalate = escalate;
     let policy = PolicySnapshot::builder()
         .inspection(Inspection::new(OnError::FailClosed, 1024 * 1024))
         .token(token)
@@ -194,4 +199,40 @@ async fn a_session_beyond_the_number_allowed_is_killed_not_held() {
     assert!(!received.windows(VALUE.len()).any(|w| w == VALUE.as_bytes()));
     assert!(started.elapsed() < Duration::from_secs(2));
     drop(held);
+}
+
+#[tokio::test]
+async fn a_kill_in_a_held_session_is_not_held_back() {
+    // The client is held back for far longer than a closing session is
+    // given to send what it still has to say.
+    let database = database(false).await;
+    let options = options_with(
+        settings(Duration::from_secs(30), Duration::from_secs(120), 4),
+        Some(Escalation::new(2, ActionSet::of(&[Action::Kill]))),
+    );
+    let proxy = Running::start_with(Running::listener(database.upstream()), options).await;
+    let (mut client, _) = proxy.log_in().await;
+
+    // The first hit: the answer of the database is held back.
+    client
+        .write_all(&query("SELECT name FROM users"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut buffer = [0u8; 16];
+    let early = tokio::time::timeout(Duration::from_millis(100), client.read(&mut buffer)).await;
+    assert!(early.is_err(), "the client was not held back");
+
+    // The second hit, in a statement of the client, ends the session. Its
+    // error arrives at once, behind what was held back.
+    let started = Instant::now();
+    client
+        .write_all(&query(&format!("SELECT '{VALUE}'")))
+        .await
+        .unwrap();
+    let received = read_to_end(&mut client).await;
+    let elapsed = started.elapsed();
+    assert!(is_killed(&received), "the client was not told");
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    until(|| proxy.status.counters().actions[1] == 1).await;
 }

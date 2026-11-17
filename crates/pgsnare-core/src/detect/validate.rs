@@ -14,7 +14,7 @@ use aho_corasick::automaton::OverlappingState;
 use aho_corasick::{AhoCorasick, AhoCorasickKind, MatchKind};
 
 use super::error::{BuildError, ValidationError, ValidationErrors, ValueLocation};
-use super::pattern::{MIN_VALUE_LEN, PatternForm, hex_lower};
+use super::pattern::{MIN_VALUE_LEN, PatternForm, hex_lower, uuid_bytes, varied_enough};
 use super::token::TokenSpec;
 
 /// A value that passed the rules for single values, with what is derived
@@ -25,6 +25,8 @@ pub(crate) struct Slot<'t> {
     pub(crate) raw: &'t [u8],
     /// The value in lowercase hexadecimal.
     pub(crate) hex: Vec<u8>,
+    /// The sixteen bytes the value encodes, if it is a canonical UUID.
+    pub(crate) uuid: Option<Vec<u8>>,
     /// Whether the value's token ignores ASCII letter case.
     pub(crate) case_insensitive: bool,
 }
@@ -88,6 +90,7 @@ pub(crate) fn check_tokens<'t>(
                     location,
                     raw,
                     hex: hex_lower(raw),
+                    uuid: uuid_bytes(raw),
                     case_insensitive: token.is_case_insensitive(),
                 });
             }
@@ -110,9 +113,10 @@ struct Spelling<'s> {
 /// off the other.
 ///
 /// The texts that match a value are: the value as configured, its hex form,
-/// and, for a case-insensitive token, the value in any letter case. None of
-/// them may contain a pattern of another value. When this check passes, each
-/// of those texts makes the matcher report its own value and nothing else.
+/// its sixteen bytes if it is a canonical UUID of enough byte variety, and,
+/// for a case-insensitive token, the value in any letter case. None of them
+/// may contain a pattern of another value. When this check passes, each of
+/// those texts makes the matcher report its own value and nothing else.
 ///
 /// Comparing every pair directly would take time quadratic in the number of
 /// values. Instead, all spellings go into one case-insensitive automaton and
@@ -130,18 +134,27 @@ pub(crate) fn check_conflicts(
         .iter()
         .enumerate()
         .flat_map(|(slot, value)| {
-            [
-                Spelling {
+            let mut forms: Vec<Spelling<'_>> = Vec::with_capacity(3);
+            forms.push(Spelling {
+                slot,
+                form: PatternForm::Raw,
+                bytes: value.raw,
+            });
+            forms.push(Spelling {
+                slot,
+                form: PatternForm::Hex,
+                bytes: &value.hex,
+            });
+            if let Some(uuid) = &value.uuid
+                && varied_enough(uuid)
+            {
+                forms.push(Spelling {
                     slot,
-                    form: PatternForm::Raw,
-                    bytes: value.raw,
-                },
-                Spelling {
-                    slot,
-                    form: PatternForm::Hex,
-                    bytes: &value.hex,
-                },
-            ]
+                    form: PatternForm::UuidBinary,
+                    bytes: uuid,
+                });
+            }
+            forms
         })
         .collect();
 
@@ -732,6 +745,85 @@ mod tests {
         // The hex form of this value is twenty-four times `3`, which
         // contains the value itself. That is no conflict.
         assert!(accepted(&[TokenSpec::new("threes", ["333333333333"])]));
+    }
+
+    #[test]
+    fn a_uuid_value_is_also_its_sixteen_bytes() {
+        // Two tokens that hold the same UUID in different letter cases: the
+        // sixteen bytes of a binary result set both off.
+        assert_eq!(
+            problems(&[
+                TokenSpec::new("lower", ["f81d4fae-7dec-11d0-a765-00a0c91e6bf6"]),
+                TokenSpec::new("upper", ["F81D4FAE-7DEC-11D0-A765-00A0C91E6BF6"]),
+            ]),
+            [contains(
+                at("upper", 1, 0),
+                PatternForm::UuidBinary,
+                at("lower", 0, 0),
+                PatternForm::UuidBinary
+            )]
+        );
+        // A text value that holds the sixteen bytes of another value's UUID.
+        assert_eq!(
+            problems(&[
+                TokenSpec::new("text", ["id-svc.backup.8f3k2-end"]),
+                TokenSpec::new("uuid", ["7376632e-6261-636b-7570-2e3866336b32"]),
+            ]),
+            [contains(
+                at("text", 0, 0),
+                PatternForm::Raw,
+                at("uuid", 1, 0),
+                PatternForm::UuidBinary
+            )]
+        );
+        // The reverse: the raw value of one token is the hex digits of the
+        // bytes of the other's UUID. The digits are a text, not the bytes,
+        // so nothing matches.
+        assert!(accepted(&[
+            TokenSpec::new("uuid", ["61626364-6566-6768-696a-6b6c6d6e6f70"]),
+            TokenSpec::new("other", ["6162636465666768696a6b6c6d6e6f70"]),
+        ]));
+        // A text that holds the bytes themselves does match.
+        assert_eq!(
+            problems(&[
+                TokenSpec::new("uuid", ["61626364-6566-6768-696a-6b6c6d6e6f70"]),
+                TokenSpec::new("other", ["x-abcdefghijklmnop-y"]),
+            ]),
+            [contains(
+                at("other", 1, 0),
+                PatternForm::Raw,
+                at("uuid", 0, 0),
+                PatternForm::UuidBinary
+            )]
+        );
+    }
+
+    #[test]
+    fn a_uuid_with_little_variety_holds_no_sixteen_bytes() {
+        // The nil UUID holds sixteen NUL bytes. A value of the same bytes is
+        // accepted with it: the bytes of a UUID with little variety are not
+        // looked for, so the two never set each other off.
+        assert!(accepted(&[
+            TokenSpec::new("nil", ["00000000-0000-0000-0000-000000000000"]),
+            TokenSpec::new("nuls", ["\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"]),
+        ]));
+        // A UUID of eight distinct bytes still holds its sixteen, and the
+        // same pair is refused.
+        assert_eq!(
+            problems(&[
+                TokenSpec::new("eight", ["00000000-0102-0304-0506-070606060606"]),
+                TokenSpec::new(
+                    "bytes",
+                    ["\0\0\0\0\x01\x02\x03\x04\x05\x06\x07\x06\x06\x06\x06"]
+                ),
+            ]),
+            [contains(
+                at("eight", 0, 0),
+                PatternForm::UuidBinary,
+                at("bytes", 1, 0),
+                PatternForm::Raw
+            )]
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 A PostgreSQL proxy that catches data theft with honeytokens.
 
 > [!IMPORTANT]
-> pgsnare is under construction. It finds honeytokens and answers them, and the repository holds a container image definition, a Helm chart, a Compose example and the release procedure, but **no version has been released**: there is no published image, chart or binary yet, and the release procedure has never run for real. The integration tests have so far run only `alert` and `kill` against PostgreSQL. Do not rely on pgsnare to protect production data yet.
+> pgsnare is under construction. It finds honeytokens and answers them, and the repository holds a container image definition, a Helm chart, a Compose example and the release procedure, but **no version has been released**: there is no published image, chart or binary yet, and the release procedure has never run for real. The integration tests run `alert`, `kill`, `tarpit`, `fake_data` and a hit delivered to a webhook against PostgreSQL 15 to 18, a reload against PostgreSQL 15, and a detection corpus of 73 cases against each version. Do not rely on pgsnare to protect production data yet.
 > [Status and roadmap](#status-and-roadmap) shows what exists today. The design is described in [docs/high-level-design.md](docs/high-level-design.md). To try it, follow the [quickstart](docs/quickstart.md).
 
 ## What it is
@@ -85,14 +85,15 @@ What each response does, and where it stops:
 - **`alert`** emits a `token_hit` event through the dispatcher, which never makes the session wait. A full queue loses the event and counts it. Each sink keeps a quarter of its queue for hits, so a flood of other events does not push a hit out; a queue of fewer than four places keeps none.
 - **`kill`** withholds the message, sends the client a `FATAL` error with the configured SQLSTATE and message, sends a cancel request with the key the database gave the session, and closes both connections. It needs no database credentials. If the client has already received part of the message, both connections are closed without an error. A hit in a login message is answered before the database is reached.
 - **`tarpit`** delays what is sent to the client: each read from the database that has bytes for the client waits a random time in the `delay` range, and `max_bytes_per_second` slows it further. Nothing more is read from the database while the session is held. A session is held at most `max_duration`, and at most `max_sessions` sessions are held at once, counted for the whole process; past either limit the session is killed.
-- **`fake_data`** adds `rows` made-up rows before the end of a result and raises the row count to match. The rows recombine values sampled from the real rows of that result, with generated bait in credential-like columns. It is done only for a text-format result of one `SELECT`, `TABLE` or `VALUES` statement that the proxy has seen the description of, with at most 256 text columns, and never after a statement with a row limit in the same session. Otherwise the hit is reported as `alert`. At most 8 MiB are added to a result. Rows are added at the end, so an `ORDER BY` other than ascending `id` is broken.
+- **`fake_data`** adds `rows` made-up rows before the end of a result and raises the row count to match. The rows recombine values sampled from the real rows of that result, with generated bait in credential-like columns. It is done only for a text-format result of one `SELECT`, `TABLE` or `VALUES` statement that the proxy has seen the description of, with at most 256 text columns, and never after a statement with a row limit in the same session. Otherwise the hit is reported as `alert`. The event of a hit that asks for made-up rows is held until the end of the result, at most half a second, and says `fake_data` only if the rows were added, otherwise `alert`; a result that takes longer than the hold gets its event as `alert` and its rest passes on unchanged. Of the hits of one result, only the last one that asks for rows reports `fake_data`; the earlier ones report `alert`, and `pgsnare_actions_total{action="fake_data"}` counts results that got rows, not hits. At most 8 MiB are added to a result. Rows are added at the end, so an `ORDER BY` other than ascending `id` is broken.
 
 Limits to know about:
 
 - Detection is of the value as it travels. A value that is hashed, cut or re-encoded inside the database does not match, and `kill` withholds the message that holds the token, not the messages before it. A message larger than `max_buffered_frame` is scanned as a stream, and bytes before the token inside it can reach the client.
 - Statements are attributed by following the protocol, not by parsing SQL; only the optional [SQL rules](#sql-rules) parse. A statement prepared or deallocated by an SQL command is not followed. When the proxy loses its place, the event says the statement is unknown, and the hit is still raised.
 - `query_redaction: full` is a debugging mode. It puts statements into events as they were sent, so **a password written in a statement is shown**, to everyone who can read the events and the log (token values are still removed). `fingerprint`, the default, is the setting to use in production.
-- If `fake_data` was decided and rows cannot be added at the end of the result, for example after a cursor `FETCH`, the result goes on unchanged, though the event says `fake_data`.
+- If the rows of a `fake_data` hit cannot be added at the end of the result, for example after a cursor `FETCH`, the result goes on unchanged and the event of the hit says `alert`, not `fake_data`.
+- The log removes the path of a webhook URL wherever that text appears, so a short or common path, such as `/pgsnare`, can also mask parts of unrelated log lines, such as a name of a file. Use a long, random path in a webhook URL.
 
 ### Reload
 
@@ -162,6 +163,7 @@ A security tool should be clear about its limits.
 - **Transformed values.** A value that is hashed, cut, re-encoded or encrypted inside the database before it leaves does not match.
 - **Blind extraction.** Boolean or time-based SQL injection infers data without ever returning it.
 - **Rows already sent.** `kill` withholds the row that contains the token, not the rows that came before it in the same result.
+- **A typed column in a binary result.** A value that is a canonical UUID is also searched for in its sixteen bytes, so a honeytoken in a `uuid` column is found in a binary result and in a binary COPY. A honeytoken in any other typed column is found only in text results: a binary result sends the value in the form of its type, and that form is not searched for.
 - **Traffic that bypasses it.** The network must force database connections through pgsnare.
 - **A honeytoken used as a password.** Login messages are not scanned, so a honeytoken that an intruder sends as a password is not detected. A honeytoken used as a user name, or in a query, is. This is a known limit; alternatives are on the [future work](#future-work) list.
 
@@ -204,12 +206,13 @@ Because pgsnare relays logins instead of terminating them, the TLS setup has to 
 
 ## Status and roadmap
 
-pgsnare cannot be relied on yet: it detects and responds, but no version has been released, and the integration tests have so far run only `alert` and `kill` against PostgreSQL. What exists today:
+pgsnare cannot be relied on yet: it detects and responds, but no version has been released. What exists today:
 
 - **Relay.** `pgsnare run` puts a proxy between clients and a database: TLS on both legs, logins, simple and extended queries, COPY, replication, notifications, function calls and cancellation, for protocol 3.0 and 3.2. Tests compare what a client sees from PostgreSQL 15 to 18 directly and through pgsnare, in every supported TLS setup.
 - **Detection.** Every message, in both directions, is scanned for honeytoken values before it is forwarded, and so are the startup parameters and the user name at login. A value split across reads, across the chunks of a large message or across `CopyData` messages is found. A hit becomes a `token_hit` event that names the token, the session and the statement.
-- **Policy and responses.** Per token: `alert`, `kill`, `tarpit` and `fake_data`, combinations, escalation after repeated hits, exemptions by user and address range, and a `session_activity` event for each statement of a flagged session. Counted in `pgsnare_queries_total`, `pgsnare_hits_total` and `pgsnare_actions_total`. See [Configuring responses](#configuring-responses). The responses are tested with the proxy running in test programs, with a real client socket and a database made for the test. The integration tests also read a honeytoken through the proxy from PostgreSQL, once with `alert` and once with `kill`; `tarpit`, `fake_data` and reload are not yet run against PostgreSQL.
-- **SQL rules.** Optional rules judge a statement with the grammar of PostgreSQL 18 before it is passed on: catalogue enumeration, unbounded reads of listed tables, functions from a list, and a row threshold counted through the statement tracker. They are configured per rule, listener and user, answer like a token hit, and follow a parse-failure policy (`allow`, `alert`, `block`). See [SQL rules](#sql-rules). Tested with the real parser in test programs and fuzzed; the integration tests run one rule (`functions` with `kill`) against PostgreSQL 15 to 18.
+- **Policy and responses.** Per token: `alert`, `kill`, `tarpit` and `fake_data`, combinations, escalation after repeated hits, exemptions by user and address range, and a `session_activity` event for each statement of a flagged session. Counted in `pgsnare_queries_total`, `pgsnare_hits_total` and `pgsnare_actions_total`. See [Configuring responses](#configuring-responses). The responses are tested with the proxy running in test programs, with a real client socket and a database made for the test, and the integration tests run them against PostgreSQL 15 to 18: `kill` over the extended protocol in text and binary, `tarpit` with its limits, `fake_data` in a text result and its fallback to `alert` in a binary one, and a hit delivered to a webhook, with a signature header, within 2 s. A reload by signal and by a file change is run against PostgreSQL 15 only.
+- **SQL rules.** Optional rules judge a statement with the grammar of PostgreSQL 18 before it is passed on: catalogue enumeration, unbounded reads of listed tables, functions from a list, and a row threshold counted through the statement tracker. They are configured per rule, listener and user, answer like a token hit, and follow a parse-failure policy (`allow`, `alert`, `block`). See [SQL rules](#sql-rules). Tested with the real parser in test programs and fuzzed; the integration tests run the `functions` rule with `kill` and the `catalog_enumeration` rule against PostgreSQL 15 to 18.
+- **Verification.** A detection corpus of 73 in-band exfiltration cases runs in the integration tests against PostgreSQL 15 to 18, over the simple protocol and the extended protocol in text and binary: 54 cases are labelled as hits and are detected, 19 are labelled as known gaps and are asserted as misses, and the gaps are listed in [the design document](docs/high-level-design.md#86-known-gaps). Hostile clients (malformed frames, lengths above the limits, a slow sender, a connection flood) and hostile databases (malformed, truncated and oversized answers) end with their panic counters at zero, and all but one with a well-behaved client served afterwards. The leak test searches every way out of a running proxy, including the outputs of the commands that read the configuration, for every secret it holds. Fuzz targets cover the framer, the startup packets, the session, the scanning path with the responses, the rules and the configuration loader; they run for thirty seconds on every pull request, and a nightly workflow runs them for half an hour each and runs the benchmark. The nightly workflow has not run: a new workflow can start only once it is on the default branch.
 - **Reload.** `SIGHUP` or a change to a configuration or token file replaces the policy without dropping a session. See [Reload](#reload).
 - **Events and observability.** Events reach four sinks through a dispatcher that never makes database traffic wait: a signed webhook over verified HTTPS, standard output, a file and syslog. `pgsnare run` serves `/healthz` and `/readyz` on an admin listener and Prometheus metrics on a listener of their own, both on loopback by default, and `pgsnare healthcheck` asks the admin listener. The log is JSON, one object for each line, on standard error, written by a thread of its own through a queue, so a log nobody reads costs lines and never makes a session wait. One redaction layer stands before every event, log line and metric label.
 - **Wire protocol.** Framing, message views and encoders for protocol 3.0 and 3.2, tested against traffic captured from PostgreSQL 15 to 18.
@@ -226,10 +229,10 @@ The steps to the first release:
 | Step | What it delivers | State |
 |---|---|---|
 | 1. Relay | A proxy that real clients cannot tell from the database | Done |
-| 2. Detect and alert | Honeytokens, events and sinks. The first usable version | Built: detection, events, sinks, health and metrics. `tarpit`, `fake_data` and reload not yet run against PostgreSQL |
-| 3. Respond | Kill, tarpit, fake data and exemptions | Built, with the same limit |
-| 4. SQL rules | Optional checks on the statements themselves | Built, behind the `rules` build feature. Only the `functions` rule with `kill` has run against PostgreSQL |
-| 5. Prove and ship | Detection corpus, fuzzing, benchmarks, container image, Helm chart and documentation | Image, chart, examples, release procedure and guides built; the first release (0.0.1) is not made. Detection corpus and benchmarks: not run |
+| 2. Detect and alert | Honeytokens, events and sinks. The first usable version | Built: detection, events, sinks, health and metrics. `tarpit` and `fake_data` now run against PostgreSQL 15 to 18, reload against PostgreSQL 15 |
+| 3. Respond | Kill, tarpit, fake data and exemptions | Built: the responses run against PostgreSQL 15 to 18 |
+| 4. SQL rules | Optional checks on the statements themselves | Built, behind the `rules` build feature. The `functions` rule with `kill` and the `catalog_enumeration` rule run against PostgreSQL 15 to 18 |
+| 5. Prove and ship | Detection corpus, fuzzing, benchmarks, container image, Helm chart and documentation | Image, chart, examples, release procedure and guides built; the first release (0.0.1) is not made. The detection corpus runs in the integration tests; the nightly long fuzzing and the nightly benchmark have not run. Not built: a 24-hour soak, a memory test with 10,000 idle connections, the regression suite of PostgreSQL through the proxy, a matrix of client libraries, and a benchmark on a reference machine (the figures a nightly benchmark would give come from shared runners) |
 
 Progress is tracked in [the pgsnare epic](https://github.com/guidorugo/pgsnare/issues/2).
 
@@ -242,7 +245,7 @@ You need Docker with the Compose plugin, and `make`. Every build and test runs i
 | `make build` | Builds the workspace |
 | `make test` | Runs the tests of every crate, with and without the optional SQL rules. They include the sinks against receivers made for the test, and the leak test |
 | `make lint` | Checks formatting, runs Clippy with warnings denied, and builds the API documentation |
-| `make itest` | Builds pgsnare and runs it in front of PostgreSQL 15 to 18: the differential scenarios, the login table, the container checks, and what the commands print |
+| `make itest` | Builds pgsnare and runs it in front of PostgreSQL 15 to 18: the differential scenarios, the login table, the container checks, what the commands print, the responses, the detection corpus and the SQL rules |
 | `make fuzz` | Runs every fuzz target for a short time |
 | `make deny` | Checks the advisories, licences and sources of every dependency |
 | `make scan` | Scans for secrets and private network addresses |
@@ -251,9 +254,11 @@ The SQL rules are a build feature, `rules`, on by default. It brings in PostgreS
 
 CI runs the last six on every pull request, and all of them must pass before it can be merged.
 
+The long runs run in the workflow [`nightly.yml`](.github/workflows/nightly.yml), on a schedule and by hand, not on every pull request. It has two jobs: `fuzz-long`, which runs one fuzz target per job, nine targets for half an hour each, and uploads the crashing inputs on a failure, and `bench-nightly`, which runs `make bench`; its output is in the job log only. A new workflow can start only once it is on the default branch, so it has not run yet. One suite can be run by hand with `make fuzz` (the variables `FUZZ_SECONDS`, `FUZZ_CRATE` and `FUZZ_TARGET` narrow the run) or with `tests/bench.sh`.
+
 The image, the chart, the cluster tests, the Compose example and the release rehearsal are not `make` targets: they run in CI only, in the workflow [`deploy.yml`](.github/workflows/deploy.yml), on every pull request, every push and nightly. They build and scan the image, check the chart, start a `kind` cluster and a Compose project, and rehearse a release against a registry inside the runner. Nothing of them publishes anything. The scripts are under `deploy/tests/`, and each can be read as the documented procedure.
 
-`tests/bench.sh` runs a small benchmark, against PostgreSQL directly and through pgsnare. It gives a baseline for one machine and is not part of CI.
+`tests/bench.sh` runs a small benchmark, against PostgreSQL directly and through pgsnare. It gives a baseline for one machine and is not part of CI, and it is not the reference benchmark of the design document: there is no script with pinned CPU sets yet, and the `bench-nightly` job runs `make bench` on the shared runners of CI.
 
 ## Repository layout
 
@@ -271,10 +276,12 @@ The image, the chart, the cluster tests, the Compose example and the release reh
 | `deploy/release` | The scripts that publish, sign and verify a release. |
 | `deploy/tools` | The list of every downloaded tool, with its version and checksums, and the installer. |
 | `deploy/tests` | The tests of the image, the scan, the chart, the cluster, the release and the repository rules. They run in CI. |
-| `tests` | Integration tests. They compare what a client sees from PostgreSQL directly and through pgsnare, try every row of the login table, check pgsnare as a container, and give PostgreSQL what `pgsnare token generate` prints. |
+| `tests` | Integration tests. They compare what a client sees from PostgreSQL directly and through pgsnare, try every row of the login table, check pgsnare as a container, give PostgreSQL what `pgsnare token generate` prints, and hold the detection corpus (`tests/corpus/`): one case per file, a label and a description, and a runner that counts a case it cannot run as not run. |
 | `docs` | The design, the quickstart, the guides (deployment, hardening, honeytoken placement, threat model), and how to verify and make a release. |
-| `.github/workflows` | The checks (`lint`, `test`, `deny`, `scan`, `itest`, `fuzz`), the image and cluster checks (`deploy`) and the release workflow (`release`). |
+| `.github/workflows` | The checks (`lint`, `test`, `deny`, `scan`, `itest`, `fuzz`), the image and cluster checks (`deploy`), the long runs (`nightly`) and the release workflow (`release`). |
 
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
+
+The binary also holds the code of the packages it depends on, among them the C code of libpg_query and of PostgreSQL that the SQL rules bring in, and their licences require the copyright notice and the licence text to go with every copy. `scripts/notices.sh` collects those notices into `THIRD-PARTY-NOTICES` without writing a licence from memory: it copies the files the packages carry, and, for a package whose published crate does not carry the licences of the code it bundles, the verbatim copies of them the repository holds under `deploy/notices/NAME`, where a SOURCES.md names the repository, the tag and the commit each file was taken from. `make notices` writes it to `target/THIRD-PARTY-NOTICES`; the image holds it at `/usr/share/doc/pgsnare/THIRD-PARTY-NOTICES`, and every release attaches it.

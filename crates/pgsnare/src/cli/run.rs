@@ -72,6 +72,8 @@ pub fn run(args: &Args) -> u8 {
     // tests, keeps the first log.
     let redaction = Redaction::default();
     crate::log::install(redaction.clone());
+    // Before anything is read that a panic message could repeat.
+    install_panic_hook();
     let status = match start(args, &redaction) {
         Ok(()) => SUCCESS,
         Err(reason) => {
@@ -168,7 +170,6 @@ fn start(args: &Args, redaction: &Redaction) -> Result<(), String> {
         files,
         generation: policy.generation(),
     };
-    install_panic_hook();
     runtime.block_on(serve(
         proxy,
         Arc::new(SharedPolicy::new(policy)),

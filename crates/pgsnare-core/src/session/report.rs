@@ -44,6 +44,14 @@ pub enum Report {
     ///
     /// [`Effect::Tarpit`]: super::Effect::Tarpit
     TarpitOver,
+    /// The report of a hit that the session keeps back, see
+    /// [`Effect::EventHeld`], must not wait any longer, or the session is
+    /// over. The session hands over what it kept, saying what has been
+    /// carried out so far. A session that keeps nothing does nothing. This
+    /// report fits every state of a session.
+    ///
+    /// [`Effect::EventHeld`]: super::Effect::EventHeld
+    EventDue,
     /// The answer to [`Effect::Analyse`]: the analysis of the statement,
     /// or the reason there is none. An answer the session does not wait
     /// for, such as one that comes after another answer under the same

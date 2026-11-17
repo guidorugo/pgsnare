@@ -152,6 +152,13 @@ verified="{ mode: verify-full, ca: /state/certs/ca.crt }"
     done
     echo "rules:"
     echo "  functions: { names: [pg_sleep], actions: [alert, kill], listeners: [$scoped] }"
+    # The rule cases of the detection corpus (tests/corpus) use this one too.
+    echo "  catalog_enumeration: { actions: [alert], listeners: [$scoped] }"
+    # The tokens from itest-kill-ext on are those of the responses read
+    # against real databases; tests/itest.sh names them. The tarpit is
+    # short, so that its limits are reached within the run. The tokens
+    # corpus-* are those of the detection corpus: tests/corpus/client.sh has
+    # the same values. Two of them are written as a UUID.
     cat <<'REST'
 tokens:
   - id: itest-alert
@@ -159,13 +166,52 @@ tokens:
   - id: itest-kill
     values: ["itest-bait-kill-7e20a9"]
     actions: [kill]
+  - id: itest-kill-ext
+    values: ["itest-bait-killext-3f6b91"]
+    actions: [kill]
+  - id: itest-tarpit
+    values: ["itest-bait-tarpit-a4d702"]
+    actions: [tarpit]
+  - id: itest-fake
+    values: ["itest-bait-fake-41ac0e"]
+    actions: [fake_data]
+  - id: itest-hook
+    values: ["itest-bait-hook-90e5c3"]
+  - id: corpus-alert
+    values: ["corpus-bait-alert-c41f07e9"]
+  - id: corpus-kill
+    values: ["corpus-bait-kill-8d2b56a3"]
+    actions: [kill]
+  - id: corpus-typed-alert
+    values: ["7c1e4b02-93a5-4d6f-8e17-5ab0c3d2f619"]
+  - id: corpus-typed-kill
+    values: ["e85d0a34-1f7b-4c29-b6e0-92d4718a3c5f"]
+    actions: [kill]
+token_files:
+  - reload/tokens.yaml
+actions:
+  tarpit: { delay: 2s-3s, max_duration: 10s, max_sessions: 1 }
+  fake_data: { rows: 3 }
 events:
   sinks:
     - type: stdout
+    # The receiver is a container on the internal network of the run, so
+    # plain HTTP is accepted here: see tests/hook/receiver.pl. The log masks
+    # the URL wherever it appears, so its path is a word nothing else has.
+    - type: webhook
+      url: http://receiver:8080/itest-events
+      hmac_secret_file: /state/config/hook.key
+      allow_insecure_http: true
 shutdown:
   grace_period: 10s
 REST
 } > "$config"
+
+# The signing key of the webhook, for this run only.
+od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$state/config/hook.key"
+
+# The token file the reload checks change while pgsnare runs.
+"$(dirname "$0")/reload.sh" initial
 
 # --- Files that are open to other users --------------------------------------
 #

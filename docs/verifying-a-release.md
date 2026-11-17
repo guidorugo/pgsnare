@@ -11,6 +11,7 @@ For a version `V`, such as `1.2.3`:
 | File | What it is |
 |---|---|
 | `pgsnare-V-linux-amd64.tar.gz`, `pgsnare-V-linux-arm64.tar.gz` | The static binary for x86_64 and for aarch64, with the licence |
+| `pgsnare-V-THIRD-PARTY-NOTICES` | The licence notices of the packages the binary depends on, and of the C code that the package `pg_query` bundles: the notices the licences of that code require to go with every copy. It is the same file the image of the release holds at `/usr/share/doc/pgsnare/THIRD-PARTY-NOTICES`, which the build takes from the image and checks against the sums before the release attaches it |
 | `pgsnare-V-crates.spdx.json` | SBOM of the binaries: every crate of the lock file the build was held to. That is a little more than a binary links, because the lock file also names crates that only tests use |
 | `pgsnare-V-image-amd64.spdx.json`, `pgsnare-V-image-arm64.spdx.json` | SBOM of the image: the packages of its base, and the binary as one file |
 | `pgsnare-V-chart.tgz` | The Helm chart, with the image of the release written into its values by digest |

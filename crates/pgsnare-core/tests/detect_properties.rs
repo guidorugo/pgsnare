@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 
 use pgsnare_core::detect::{
     BuildError, MIN_VALUE_LEN, Match, Matcher, PatternForm, TokenSpec, ValidationError,
-    ValueLocation,
+    ValueLocation, uuid_bytes, varied_enough,
 };
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -56,7 +56,29 @@ fn value() -> impl Strategy<Value = Vec<u8>> {
         // Repeats itself, so that its occurrences can overlap each other.
         1 => (letters(1..=3), MIN_VALUE_LEN..=16)
             .prop_map(|(unit, len)| unit.iter().copied().cycle().take(len).collect()),
+        // A canonical UUID, with every hex digit available: its sixteen
+        // bytes hold as many distinct values as the digits give.
+        1 => vec(select(UUID_DIGITS), 32).prop_map(uuid_from),
+        // A canonical UUID of little variety: the nil UUID and a repeating
+        // byte are made of two digits.
+        1 => vec(select(b"0f"), 32).prop_map(uuid_from),
     ]
+}
+
+/// The hexadecimal digits a canonical UUID is made of.
+const UUID_DIGITS: &[u8] = b"0123456789abcdef";
+
+/// The thirty-two hex digits of a canonical UUID, with its hyphens in the
+/// places that make it one.
+fn uuid_from(digits: Vec<u8>) -> Vec<u8> {
+    let mut value = Vec::with_capacity(36);
+    for (index, &digit) in digits.iter().enumerate() {
+        if matches!(index, 8 | 12 | 16 | 20) {
+            value.push(b'-');
+        }
+        value.push(digit);
+    }
+    value
 }
 
 fn token_defs() -> impl Strategy<Value = Vec<TokenDef>> {
@@ -121,6 +143,7 @@ enum Spelling {
     Hex,
     UpperHex,
     OtherCase,
+    Uuid,
 }
 
 /// One piece of generated input.
@@ -147,6 +170,9 @@ fn piece() -> impl Strategy<Value = Piece> {
         2 => Just(Spelling::Hex),
         1 => Just(Spelling::UpperHex),
         2 => Just(Spelling::OtherCase),
+        // The sixteen bytes a value that is a canonical UUID is sent in,
+        // as a binary result and a binary COPY send it.
+        1 => Just(Spelling::Uuid),
     ];
     prop_oneof![
         1 => vec(any::<u8>(), 0..24).prop_map(Piece::Bytes),
@@ -185,6 +211,9 @@ fn render(pieces: &[Piece], defs: &[TokenDef]) -> Vec<u8> {
                     Spelling::Hex => hex(value),
                     Spelling::UpperHex => hex(value).to_ascii_uppercase(),
                     Spelling::OtherCase => flip_case(value, flips),
+                    // A value that is not a canonical UUID has no sixteen
+                    // bytes, and gives up nothing of the input.
+                    Spelling::Uuid => uuid_bytes(value).unwrap_or_default(),
                 };
                 let end = text.len().saturating_sub(*cut_back);
                 let start = (*cut_front).min(end);
@@ -235,6 +264,9 @@ fn plain_search(defs: &[TokenDef], haystack: &[u8]) -> Vec<Found> {
     for (token_index, def) in defs.iter().enumerate() {
         for (value_index, value) in def.values.iter().enumerate() {
             let hex = hex(value);
+            // The matcher compiles the binary form of a value only when the
+            // sixteen bytes of the UUID it is made of carry enough variety.
+            let uuid = uuid_bytes(value).filter(|uuid| varied_enough(uuid));
             for start in 0..haystack.len() {
                 let rest = &haystack[start..];
                 let mut add = |form, len: usize| {
@@ -256,6 +288,11 @@ fn plain_search(defs: &[TokenDef], haystack: &[u8]) -> Vec<Found> {
                 }
                 if rest.starts_with(&hex) {
                     add(PatternForm::Hex, hex.len());
+                }
+                if let Some(uuid) = &uuid
+                    && rest.starts_with(uuid)
+                {
+                    add(PatternForm::UuidBinary, uuid.len());
                 }
             }
         }
@@ -636,10 +673,11 @@ fn is_valid(value: &[u8]) -> bool {
 /// Whether some text that matches the first value also contains a pattern of
 /// the second.
 ///
-/// The texts of a value are the value itself, its hex form and, if its token
+/// The texts of a value are the value itself, its hex form, its sixteen
+/// bytes if it is a canonical UUID of enough byte variety, and, if its token
 /// ignores case, the value in any letter case. Its patterns are the value
-/// itself, matched in any letter case if its token ignores case, and its hex
-/// form.
+/// itself, matched in any letter case if its token ignores case, its hex
+/// form, and the same sixteen bytes.
 fn sets_off(defs: &[TokenDef], first: Slot, second: Slot) -> bool {
     let (a, a_any_case) = (
         &defs[first.0].values[first.1],
@@ -650,13 +688,33 @@ fn sets_off(defs: &[TokenDef], first: Slot, second: Slot) -> bool {
         defs[second.0].case_insensitive,
     );
     let (a_hex, b_hex) = (hex(a), hex(b));
+    // The matcher compiles the binary form of a value only when the sixteen
+    // bytes of the UUID it is made of carry enough variety.
+    let a_uuid = uuid_bytes(a).filter(|uuid| varied_enough(uuid));
+    let b_uuid = uuid_bytes(b).filter(|uuid| varied_enough(uuid));
 
     contains(a, b)
         || contains(a, &b_hex)
         || contains(&a_hex, b)
         || contains(&a_hex, &b_hex)
-        || (b_any_case && (contains_in_any_case(a, b) || contains_in_any_case(&a_hex, b)))
-        || (a_any_case && (contains_in_any_case(a, b) || contains_in_any_case(a, &b_hex)))
+        || a_uuid.as_deref().is_some_and(|bytes| contains(bytes, b) || contains(bytes, &b_hex))
+        || b_uuid.as_deref().is_some_and(|bytes| contains(a, bytes) || contains(&a_hex, bytes))
+        // Two spellings of the same sixteen bytes, in different letter
+        // cases, meet in the binary form.
+        || a_uuid
+            .as_deref()
+            .is_some_and(|x| b_uuid.as_deref().is_some_and(|y| contains(x, y)))
+        || (b_any_case
+            && (contains_in_any_case(a, b)
+                || contains_in_any_case(&a_hex, b)
+                || a_uuid.as_deref().is_some_and(|bytes| contains_in_any_case(bytes, b))
+                || b_uuid.as_deref().is_some_and(|bytes| {
+                    contains_in_any_case(a, bytes) || contains_in_any_case(&a_hex, bytes)
+                })))
+        || (a_any_case
+            && (contains_in_any_case(a, b)
+                || contains_in_any_case(a, &b_hex)
+                || b_uuid.as_deref().is_some_and(|bytes| contains_in_any_case(a, bytes))))
 }
 
 /// The pairs of values that conflict, found by comparing every pair.
@@ -689,6 +747,7 @@ fn text_in_form(defs: &[TokenDef], location: &ValueLocation, form: PatternForm) 
     let value = &defs[location.token_index].values[location.value_index];
     match form {
         PatternForm::Hex => hex(value),
+        PatternForm::UuidBinary => uuid_bytes(value).unwrap_or_default(),
         _ => value.clone(),
     }
 }
@@ -795,8 +854,9 @@ proptest! {
     }
 
     /// In an accepted list, no text that matches one value sets off another:
-    /// scanning a value, its hex form or, for a token that ignores case, the
-    /// value in another case reports that value and nothing else.
+    /// scanning a value, its hex form, its sixteen bytes if the matcher
+    /// compiles them, or, for a token that ignores case, the value in another
+    /// case reports that value and nothing else.
     #[test]
     fn in_an_accepted_list_a_value_sets_off_only_itself(
         defs in related_tokens(),
@@ -808,6 +868,9 @@ proptest! {
         for (token_index, def) in defs.iter().enumerate() {
             for (value_index, value) in def.values.iter().enumerate() {
                 let mut texts = vec![value.clone(), hex(value)];
+                if let Some(bytes) = uuid_bytes(value).filter(|uuid| varied_enough(uuid)) {
+                    texts.push(bytes);
+                }
                 if def.case_insensitive {
                     texts.push(flip_case(value, &flips));
                     texts.push(value.to_ascii_lowercase());

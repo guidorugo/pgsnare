@@ -107,6 +107,7 @@ read_mode() {
 release_files() {
     local version="$1"
     printf '%s\n' \
+        "pgsnare-$version-THIRD-PARTY-NOTICES" \
         "pgsnare-$version-chart.tgz" \
         "pgsnare-$version-crates.spdx.json" \
         "pgsnare-$version-digests.txt" \

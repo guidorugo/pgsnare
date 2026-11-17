@@ -2,8 +2,10 @@
 
 //! The shared code of the fuzz targets of `pgsnare-core`.
 //!
-//! There are two targets. `rules` feeds bytes to the SQL parser and the
-//! rules, see [`fuzz_rules`]. `session` is described here: it drives the whole logic of a
+//! There are three targets. `rules` feeds bytes to the SQL parser and the
+//! rules, see [`fuzz_rules`]. `scanning` drives a session that looks for
+//! honeytokens and responds to them, see [`fuzz_scanning`]. `session` is
+//! described here: it drives the whole logic of a
 //! PostgreSQL session the way a runtime does: with bytes from the client
 //! and from the server in any order and cut anywhere, with reports, and
 //! with a policy that changes on the way.
@@ -53,8 +55,10 @@
 //! ```
 
 mod rules;
+mod scanning;
 
 pub use rules::fuzz_rules;
+pub use scanning::{Reached, fuzz_scanning, run_scanning};
 
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};

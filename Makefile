@@ -7,6 +7,8 @@
 #
 #   make image    build the development image, unless it already exists
 #   make build    build the workspace
+#   make notices  write the licence notices of the dependencies to
+#                 target/THIRD-PARTY-NOTICES
 #   make test     run the unit tests, with and without the default features
 #   make lint     check the repository rules and formatting, run clippy with
 #                 warnings denied, and build the documentation the same way
@@ -65,7 +67,7 @@ RUN = $(DOCKER) run --rm --init \
 GIT_COMMON_DIR := $(shell git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
 GIT_HISTORY := $(if $(GIT_COMMON_DIR),--volume "$(GIT_COMMON_DIR):$(GIT_COMMON_DIR):ro")
 
-.PHONY: image build test lint fmt deny scan itest fuzz bench shell cargo-cache
+.PHONY: image build notices test lint fmt deny scan itest fuzz bench shell cargo-cache
 
 image:
 	@$(DOCKER) image inspect $(DEV_IMAGE) >/dev/null 2>&1 \
@@ -77,6 +79,11 @@ cargo-cache:
 
 build: image cargo-cache
 	$(RUN) $(DEV_IMAGE) cargo build --workspace $(LOCKED)
+
+# The licences of the code the binary holds, as the files the packages
+# carry: the image and the release take the file from here.
+notices: image cargo-cache
+	$(RUN) $(DEV_IMAGE) scripts/notices.sh target/THIRD-PARTY-NOTICES
 
 # Twice: with the default features, and without the optional SQL rules.
 test: image cargo-cache

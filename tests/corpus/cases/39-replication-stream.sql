@@ -1,0 +1,6 @@
+-- label: hit
+-- describe: A logical replication stream of a change to the row, read with pg_recvlogical. The replication protocol is neither of the two others.
+-- needs: replication
+-- modes: simple
+-- setup: SELECT pg_create_logical_replication_slot(current_database() || '_stream', 'test_decoding') WHERE NOT EXISTS (SELECT FROM pg_replication_slots WHERE slot_name = current_database() || '_stream');
+-- setup: UPDATE bait SET n = n;

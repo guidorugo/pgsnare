@@ -100,7 +100,8 @@ pub enum ValidationError {
         /// The value that contains the other.
         container: ValueLocation,
         /// The spelling of the container in which the other value appears:
-        /// as configured, in hexadecimal, or in another letter case that its
+        /// as configured, in hexadecimal, as the sixteen bytes of a
+        /// canonical UUID, or in another letter case that its
         /// case-insensitive token accepts.
         container_form: PatternForm,
         /// The value that is contained.
@@ -144,6 +145,7 @@ impl fmt::Display for ValidationError {
             } => {
                 match container_form {
                     PatternForm::Hex => write!(f, "the hex form of {container}")?,
+                    PatternForm::UuidBinary => write!(f, "the binary form of {container}")?,
                     PatternForm::CaseInsensitive => {
                         write!(f, "{container}, in another letter case,")?;
                     }
@@ -152,6 +154,7 @@ impl fmt::Display for ValidationError {
                 f.write_str(" contains ")?;
                 match contained_form {
                     PatternForm::Hex => write!(f, "the hex form of {contained}"),
+                    PatternForm::UuidBinary => write!(f, "the binary form of {contained}"),
                     PatternForm::CaseInsensitive => {
                         write!(f, "{contained} in another letter case")
                     }
@@ -408,12 +411,21 @@ mod tests {
             ),
             (
                 ValidationError::Contains {
-                    container: a,
+                    container: a.clone(),
                     container_form: PatternForm::CaseInsensitive,
-                    contained: b,
+                    contained: b.clone(),
                     contained_form: PatternForm::Hex,
                 },
                 r#"values[0] of token "a", in another letter case, contains the hex form of values[2] of token "b""#,
+            ),
+            (
+                ValidationError::Contains {
+                    container: a,
+                    container_form: PatternForm::UuidBinary,
+                    contained: b,
+                    contained_form: PatternForm::UuidBinary,
+                },
+                r#"the binary form of values[0] of token "a" contains the binary form of values[2] of token "b""#,
             ),
         ];
         for (error, message) in cases {

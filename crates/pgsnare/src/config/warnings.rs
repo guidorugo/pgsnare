@@ -9,6 +9,7 @@
 
 use std::fmt;
 
+use pgsnare_core::detect::{uuid_bytes, varied_enough};
 use pgsnare_core::policy::{Action, ActionSet, OnError};
 
 use super::Config;
@@ -19,15 +20,15 @@ use super::tls::UpstreamTlsMode;
 
 /// A setting that is valid and gives up some protection.
 ///
-/// It is made of the place of the setting in the schema and a fixed text.
-/// It contains no text from the document.
+/// It is made of the place of the setting in the schema and a text. It names
+/// a token by its id only, never by the values it watches for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Warning {
     /// Where in the schema the setting is, such as `inspection.on_error`.
     pub path: String,
     /// What the setting gives up.
-    pub message: &'static str,
+    pub message: String,
 }
 
 impl fmt::Display for Warning {
@@ -43,6 +44,9 @@ impl Config {
     /// - A listener that does not verify the certificate of the database:
     ///   `upstream_tls.mode` is `prefer` or `require`.
     /// - `inspection.on_error` is `fail_open`.
+    /// - A token with a value that is a canonical UUID whose sixteen bytes
+    ///   hold too few distinct values to be searched for in a binary result
+    ///   or a binary COPY.
     /// - A webhook that sends events over plain HTTP, or that would accept
     ///   a plain `http` URL from its environment variable or file.
     /// - An admin or metrics listener that other machines can reach.
@@ -61,10 +65,10 @@ impl Config {
     pub fn warnings(&self) -> Vec<Warning> {
         let root = At::root();
         let mut warnings = Vec::new();
-        let mut warn = |at: At, message: &'static str| {
+        let mut warn = |at: At, message: &str| {
             warnings.push(Warning {
                 path: at.to_string(),
-                message,
+                message: message.to_owned(),
             });
         };
 
@@ -93,6 +97,25 @@ impl Config {
                 "fail_open lets a session go on without inspection when inspecting it fails: \
                  honeytokens then pass unseen",
             );
+        }
+
+        let tokens = At::root().field("tokens");
+        for token in &self.tokens {
+            // The id is safe to print: it is a label an operator chose. The
+            // values stay where they are, in the configuration.
+            let little_variety = token.values.iter().any(|value| {
+                uuid_bytes(value.expose().as_bytes()).is_some_and(|bytes| !varied_enough(&bytes))
+            });
+            if little_variety {
+                let id = token.id.as_str();
+                let message = format!(
+                    "the token `{id}` has a value whose sixteen bytes hold too few \
+                     distinct values to be searched for in a binary result or a binary \
+                     COPY, where unrelated sixteen-byte values would match it by chance: \
+                     use a random, generated UUID for that value"
+                );
+                warn(tokens.index(token.origin.index), &message);
+            }
         }
 
         let sinks = root.field("events").field("sinks");
@@ -248,6 +271,56 @@ events:
             ]
         );
         assert!(warnings(&format!("{BASE}inspection: {{ on_error: fail_closed }}\n")).is_empty());
+    }
+
+    #[test]
+    fn a_token_with_a_low_variety_uuid_is_a_warning() {
+        let with = |id: &str, value: &str| {
+            warnings(&format!(
+                "{BASE}tokens:\n  - id: {id}\n    values: [{value}]\n"
+            ))
+        };
+        let message = |id: &str| {
+            format!(
+                "tokens[0]: the token `{id}` has a value whose sixteen bytes hold too few \
+                 distinct values to be searched for in a binary result or a binary COPY, \
+                 where unrelated sixteen-byte values would match it by chance: use a random, \
+                 generated UUID for that value"
+            )
+        };
+        // The nil UUID, a value of one byte and a sequential counter hold too
+        // few distinct values to be searched for in sixteen bytes.
+        for (id, value) in [
+            ("nil", "00000000-0000-0000-0000-000000000000"),
+            ("max", "ffffffff-ffff-ffff-ffff-ffffffffffff"),
+            ("counter", "00000000-0000-0000-0000-000000000417"),
+            // Seven distinct values, the most below the line.
+            ("seven", "00000000-0102-0304-0506-060606060606"),
+        ] {
+            let found = with(id, value);
+            assert_eq!(found, [message(id)], "{value}");
+            // The warning names the token, never the value it watches for.
+            assert!(!found[0].contains(value), "{value}");
+            assert!(found[0].contains(&format!("`{id}`")), "{value}");
+        }
+        // Eight distinct values is the least that earns the binary form, and
+        // a generated UUID has all sixteen different.
+        for (id, value) in [
+            ("eight", "00000000-0102-0304-0506-070606060606"),
+            ("row", "f81d4fae-7dec-11d0-a765-00a0c91e6bf6"),
+        ] {
+            assert!(with(id, value).is_empty(), "{value}");
+        }
+        // A value that is not a canonical UUID has no sixteen bytes at all.
+        assert!(with("mail", "svc.backup.8f3k2q@mail.example").is_empty());
+        // One warning per token, however many of its values warn.
+        assert_eq!(
+            warnings(&format!(
+                "{BASE}tokens:\n  - id: counter\n    values: \
+                     [00000000-0000-0000-0000-000000000000, 00000000-0000-0000-0000-000000000417]\n"
+            )),
+            [message("counter")]
+        );
     }
 
     #[test]

@@ -18,8 +18,9 @@
 #             with the private key in FILE (its password in COSIGN_PASSWORD)
 #             and no transparency log
 #   INPUT     a directory with what deploy/tests/image/build.sh wrote on
-#             each architecture: pgsnare-image-ARCH.tar, pgsnare-ARCH and
-#             SHA256SUMS-ARCH, for amd64 and arm64
+#             each architecture: pgsnare-image-ARCH.tar, pgsnare-ARCH,
+#             THIRD-PARTY-NOTICES and SHA256SUMS-ARCH, for amd64 and
+#             arm64
 #   OUTPUT    a directory that is empty or does not exist: the files of the
 #             release are written to it
 #
@@ -34,6 +35,9 @@
 #
 #   pgsnare-V-linux-amd64.tar.gz       the binary and the licence
 #   pgsnare-V-linux-arm64.tar.gz
+#   pgsnare-V-THIRD-PARTY-NOTICES      the licence notices of the
+#                                      dependencies, the file the image
+#                                      holds
 #   pgsnare-V-crates.spdx.json         SBOM of the binaries: every crate of
 #                                      Cargo.lock
 #   pgsnare-V-image-amd64.spdx.json    SBOM of the image: the packages of
@@ -118,16 +122,18 @@ for arch in "${arches[@]}"; do
     esac
     sums="$input/SHA256SUMS-$arch"
     [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || die "the sum of the $arch build is not given as a SHA-256"
-    for file in "$sums" "$input/pgsnare-image-$arch.tar" "$input/pgsnare-$arch"; do
+    for file in "$sums" "$input/pgsnare-image-$arch.tar" "$input/pgsnare-$arch" \
+        "$input/THIRD-PARTY-NOTICES"; do
         [[ -f "$file" && ! -L "$file" ]] || die "$file: not in the input"
     done
     [[ "$(sum_of "$sums")" == "$expected" ]] \
         || die "SHA256SUMS-$arch is not the file the build reported; nothing was published"
-    # Exactly the two files, and both as the build left them.
-    [[ "$(wc -l < "$sums")" -eq 2 ]] \
+    # Exactly the three files, and all of them as the build left them.
+    [[ "$(wc -l < "$sums")" -eq 3 ]] \
         && grep -Eqx "[0-9a-f]{64}  pgsnare-image-$arch\.tar" "$sums" \
         && grep -Eqx "[0-9a-f]{64}  pgsnare-$arch" "$sums" \
-        || die "SHA256SUMS-$arch does not list the image archive and the binary, and only them"
+        && grep -Eqx "[0-9a-f]{64}  THIRD-PARTY-NOTICES" "$sums" \
+        || die "SHA256SUMS-$arch does not list the image archive, the binary and the notices, and only them"
     (cd "$input" && sha256sum --check --strict --quiet "SHA256SUMS-$arch") >&2 \
         || die "the $arch build does not match its sums; nothing was published"
     [[ "$(od --address-radix=n --format=x1 --read-bytes=4 -- "$input/pgsnare-$arch" | tr -d ' \n')" == 7f454c46 \
@@ -192,6 +198,13 @@ for arch in "${arches[@]}"; do
     grep -qx 'alpine-baselayout' "$work/packages" \
         || die "the SBOM of the $arch image does not list the packages of its base"
 done
+# --- The licence notices -------------------------------------------------------
+#
+# The file the image holds at /usr/share/doc/pgsnare/THIRD-PARTY-NOTICES,
+# which the build took from the image and checked against the sums.
+
+install --mode 0644 "$input/THIRD-PARTY-NOTICES" "$output/pgsnare-$version-THIRD-PARTY-NOTICES"
+
 say "wrote the archives and the SBOMs"
 
 # --- The image ----------------------------------------------------------------
