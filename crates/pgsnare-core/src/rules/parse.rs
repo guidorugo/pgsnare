@@ -17,6 +17,7 @@
 
 use core::fmt;
 
+use pg_query::protobuf::DiscardMode;
 use serde::ser::{self, Serialize};
 
 use super::analysis::{Analysis, RelationUse, StatementFlags};
@@ -157,6 +158,10 @@ struct Frame {
     is_from: bool,
     is_program: bool,
     has_filename: bool,
+    /// `DEALLOCATE ALL`.
+    is_all: bool,
+    /// `DISCARD`: what it discards, as the parser numbers it.
+    discards: i32,
 }
 
 impl Frame {
@@ -239,12 +244,9 @@ impl Walker {
                 .analysis
                 .add_flags(StatementFlags::OPAQUE_BODY.union(StatementFlags::STORES)),
             "ExecuteStmt" | "FetchStmt" => self.analysis.add_flags(StatementFlags::RUNS_STORED),
-            // `DISCARD ALL` sets every setting back, and deallocates every
-            // prepared statement. Every form of it is taken for that one.
-            "DiscardStmt" => self
-                .analysis
-                .add_flags(StatementFlags::SETTINGS.union(StatementFlags::PREPARES)),
-            "PrepareStmt" | "DeallocateStmt" => self.analysis.add_flags(StatementFlags::PREPARES),
+            // `DISCARD ALL` sets every setting back. Every form of it is
+            // taken for that one here.
+            "DiscardStmt" => self.analysis.add_flags(StatementFlags::SETTINGS),
             "ViewStmt" | "CreateTableAsStmt" | "IntoClause" | "RuleStmt" => {
                 self.analysis.add_flags(StatementFlags::STORES);
             }
@@ -265,6 +267,7 @@ impl Walker {
             ("AConst", "isnull") => top.is_null = value,
             ("CopyStmt", "is_from") => top.is_from = value,
             ("CopyStmt", "is_program") => top.is_program = value,
+            ("DeallocateStmt", "isall") => top.is_all = value,
             _ => {}
         }
     }
@@ -274,9 +277,18 @@ impl Walker {
         match (top.name, top.field) {
             ("String", "sval") | ("RangeVar", "schemaname") => value.clone_into(&mut top.first),
             ("RangeVar", "relname") => value.clone_into(&mut top.second),
-            ("VariableSetStmt", "name") => value.clone_into(&mut top.first),
+            ("VariableSetStmt" | "PrepareStmt" | "DeallocateStmt", "name") => {
+                value.clone_into(&mut top.first);
+            }
             ("CopyStmt", "filename") => top.has_filename = !value.is_empty(),
             _ => {}
+        }
+    }
+
+    fn number(&mut self, value: i32) {
+        let Some(top) = self.top() else { return };
+        if top.is("DiscardStmt", "target") {
+            top.discards = value;
         }
     }
 
@@ -349,6 +361,30 @@ impl Walker {
                 }
             }
             "RangeVar" => self.leave_relation(&frame),
+            "PrepareStmt" => self.analysis.add_statement_name(&clipped(frame.first)),
+            // `DEALLOCATE ALL` names no statement.
+            "DeallocateStmt" => {
+                if frame.is_all || frame.first.is_empty() {
+                    self.analysis.add_flags(StatementFlags::DEALLOCATES_ALL);
+                } else {
+                    self.analysis.add_statement_name(&clipped(frame.first));
+                }
+            }
+            // `DISCARD ALL` deallocates every prepared statement. The other
+            // forms leave them alone; a form not known here is taken for
+            // `ALL`.
+            "DiscardStmt" => {
+                if ![
+                    DiscardMode::DiscardPlans,
+                    DiscardMode::DiscardSequences,
+                    DiscardMode::DiscardTemp,
+                ]
+                .into_iter()
+                .any(|mode| mode as i32 == frame.discards)
+                {
+                    self.analysis.add_flags(StatementFlags::DEALLOCATES_ALL);
+                }
+            }
             "SelectStmt" => self.leave_select(frame),
             "CopyStmt" => {
                 let mut flags = if frame.is_from {
@@ -536,10 +572,15 @@ impl ser::Serializer for &mut Walker {
     type SerializeStructVariant = Self;
 
     ignore! {
-        serialize_i8: i8, serialize_i16: i16, serialize_i32: i32, serialize_i64: i64,
+        serialize_i8: i8, serialize_i16: i16, serialize_i64: i64,
         serialize_u8: u8, serialize_u16: u16, serialize_u32: u32, serialize_u64: u64,
         serialize_f32: f32, serialize_f64: f64, serialize_char: char,
         serialize_bytes: &[u8], serialize_unit_struct: &'static str,
+    }
+
+    fn serialize_i32(self, value: i32) -> Result<(), Stop> {
+        self.number(value);
+        Ok(())
     }
 
     fn serialize_bool(self, value: bool) -> Result<(), Stop> {

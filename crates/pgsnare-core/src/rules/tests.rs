@@ -675,39 +675,65 @@ fn a_statement_that_stores_a_query_or_code_says_so() {
 
 #[test]
 fn a_statement_that_prepares_or_removes_prepared_statements_says_so() {
-    for sql in [
-        "PREPARE s AS SELECT 1",
-        "PREPARE s (int) AS SELECT * FROM t WHERE a = $1",
-        "DEALLOCATE s",
-        "DEALLOCATE PREPARE s",
-        "DEALLOCATE ALL",
-        "DISCARD ALL",
-        "DISCARD PLANS",
-        // These leave prepared statements alone, and are taken for
-        // `DISCARD ALL` all the same.
-        "DISCARD TEMP",
-        "DISCARD SEQUENCES",
-        "SELECT 1; DEALLOCATE s; PREPARE s AS SELECT 2",
+    let all = StatementFlags::DEALLOCATES_ALL;
+    let named = StatementFlags::PREPARES;
+    for (sql, names, removes_all) in [
+        ("PREPARE s AS SELECT 1", &["s"][..], false),
+        (
+            "PREPARE S (int) AS SELECT * FROM t WHERE a = $1",
+            &["s"],
+            false,
+        ),
+        ("PREPARE \"S\" AS SELECT 1", &["S"], false),
+        ("DEALLOCATE s", &["s"], false),
+        ("DEALLOCATE PREPARE s", &["s"], false),
+        (
+            "SELECT 1; DEALLOCATE s; PREPARE t AS SELECT 2",
+            &["s", "t"],
+            false,
+        ),
+        ("DEALLOCATE s; PREPARE s AS SELECT 2", &["s"], false),
+        ("DEALLOCATE ALL", &[], true),
+        ("DEALLOCATE PREPARE ALL", &[], true),
+        ("DISCARD ALL", &[], true),
+        ("DISCARD ALL; PREPARE s AS SELECT 1", &["s"], true),
+        // These leave prepared statements alone.
+        ("DISCARD PLANS", &[], false),
+        ("DISCARD TEMP", &[], false),
+        ("DISCARD TEMPORARY", &[], false),
+        ("DISCARD SEQUENCES", &[], false),
+        ("SELECT 1", &[], false),
+        ("EXECUTE s", &[], false),
+        ("EXPLAIN EXECUTE s(1)", &[], false),
+        ("SELECT 'DEALLOCATE s'", &[], false),
+        ("DECLARE c CURSOR FOR SELECT 1", &[], false),
+        ("CLOSE c", &[], false),
+        ("RESET ALL", &[], false),
     ] {
-        assert!(
-            read(sql).flags().contains(StatementFlags::PREPARES),
-            "{sql}"
-        );
+        let analysis = read(sql);
+        let found: Vec<&str> = analysis
+            .statement_names()
+            .iter()
+            .map(|name| &**name)
+            .collect();
+        assert_eq!(found, names, "{sql}");
+        assert_eq!(analysis.flags().contains(named), !names.is_empty(), "{sql}");
+        assert_eq!(analysis.flags().contains(all), removes_all, "{sql}");
+        assert!(analysis.is_complete(), "{sql}");
     }
-    for sql in [
-        "SELECT 1",
-        "EXECUTE s",
-        "EXPLAIN EXECUTE s(1)",
-        "SELECT 'DEALLOCATE s'",
-        "DECLARE c CURSOR FOR SELECT 1",
-        "CLOSE c",
-        "RESET ALL",
-    ] {
-        assert!(
-            !read(sql).flags().contains(StatementFlags::PREPARES),
-            "{sql}"
-        );
-    }
+    // A name is cut where the database cuts it.
+    let long = "s".repeat(70);
+    let analysis = read(&format!("DEALLOCATE {long}"));
+    assert_eq!(&*analysis.statement_names()[0], &long[..63]);
+    // Past the most names an analysis keeps, the statement removes every
+    // prepared statement.
+    let many: Vec<String> = (0..=MAX_STATEMENT_NAMES)
+        .map(|index| format!("DEALLOCATE s{index}"))
+        .collect();
+    let analysis = read(&many.join("; "));
+    assert_eq!(analysis.statement_names().len(), MAX_STATEMENT_NAMES);
+    assert!(analysis.flags().contains(all.union(named)));
+    assert!(analysis.is_complete());
 }
 
 #[test]

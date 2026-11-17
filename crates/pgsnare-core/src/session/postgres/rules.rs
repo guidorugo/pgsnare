@@ -109,7 +109,7 @@
 //! | The parser threads were busy, did not answer in time, or one panicked | when the runtime answers |
 //! | The statement carries code as a string: `DO`, `CREATE FUNCTION`, `CREATE PROCEDURE` | when the runtime answers |
 //! | A `FunctionCall` message, in a session the rule about functions applies to | at once |
-//! | A `Bind` of a named statement, after SQL prepared, deallocated or discarded statements in the session | at once |
+//! | A `Bind` of a named statement that SQL may have changed since its `Parse` | at once |
 //!
 //! - `allow`: the statement goes on.
 //! - `alert`: the statement goes on, and a `parse_failure` event is raised.
@@ -141,15 +141,41 @@
 //! only, so after `DEALLOCATE s; PREPARE s AS ...` it still holds, for
 //! `s`, the text of the `Parse`, and the analysis of that text.
 //!
-//! So once the analysis of any statement of the session shows a
-//! `PREPARE`, a `DEALLOCATE` or a `DISCARD` (every form of each), no
-//! named statement of the session is trusted again: every later `Bind`
-//! of one is a statement without an analysis, of the reason `renamed`,
-//! even when a `Parse` has given the name a text since. From the first
-//! such `Bind` that goes on, every result of the session is held to the
-//! row threshold, and every `Execute` may change a setting. The unnamed
-//! statement goes on as before: SQL cannot make it. A `Bind` that arrives in parts shows no
-//! name, and counts as one of a named statement.
+//! So the hook notes which names SQL may have changed, and from when, see
+//! [`Changed`]:
+//!
+//! - An analysis that shows `PREPARE s` or `DEALLOCATE s` changes `s`.
+//!   `DEALLOCATE ALL` and `DISCARD ALL` change every name; `DISCARD
+//!   PLANS`, `TEMP` and `SEQUENCES` change none.
+//! - A statement without an analysis, of any reason, may hold a `PREPARE`
+//!   that is not seen: it changes every name. So do a `FunctionCall`
+//!   where the rule about functions applies, and a `Query` passed on while
+//!   no rule applies.
+//! - A `Query` counts when it is passed on. A statement stored with
+//!   `Parse` counts then, and again at each `Execute` that runs it. Once
+//!   the session has stored one that may change names, an `Execute` of a
+//!   statement the tracker does not know changes every name.
+//!
+//! A `Bind` of a changed name is a statement without an analysis, of the
+//! reason `renamed`, until a `Parse` of the name sent after the change has
+//! gone through: the server refuses a `Parse` of a name that exists, so
+//! the name then holds the text of that `Parse`. The tracker gives that
+//! text once the server has confirmed the `Parse`, and before that to a
+//! `Bind` sent behind it before the next `Sync`, which the server skips if
+//! the `Parse` fails. So a pooler that resets a connection with `DISCARD
+//! ALL` raises nothing for the next client, which prepares its own
+//! statements. A name whose text the tracker holds without an analysis
+//! raises nothing more: nothing was judged by that text. A `Bind` that
+//! arrives in parts or cannot be read shows no name, and counts as one of
+//! a changed name once any name has changed. From the first `renamed`
+//! `Bind` that goes on, every result of the session is held to the row
+//! threshold, and every `Execute` may change a setting. The unnamed
+//! statement goes on as before: SQL cannot make it.
+//!
+//! What is noted is bounded: one mark for every name, and at most
+//! `MAX_CHANGED_NAMES` marks of single names, past which every name counts
+//! as changed. A `PREPARE` that stored code runs, a function or a trigger,
+//! is not seen.
 //!
 //! The statement that prepares was judged when it arrived, with the
 //! statement it prepares, whatever else its analysis shows.
@@ -203,6 +229,7 @@
 //!
 //! [`Scanner`]: super::Scanner
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use pgsnare_proto::{Frame, backend, frontend};
@@ -217,7 +244,7 @@ use crate::rules::{
 use crate::session::{Direction, Effect, Output, StatementText};
 
 use super::scan::{Ledger, Place, Raised, exempts};
-use super::track::{Kept, Statement};
+use super::track::{Kept, MAX_NAME_BYTES, Statement};
 use super::{Context, InspectionError, Verdict};
 
 /// The statement whose analysis the session waits for.
@@ -233,6 +260,104 @@ struct Waiting {
     /// Whether the database runs the statement when it gets the message:
     /// a `Query`. A `Parse` only stores it.
     runs: bool,
+    /// The serial of the last text the tracker had read when the
+    /// statement was held: no text has been read since.
+    serial: u64,
+}
+
+/// The most names of prepared statements a session remembers as changed
+/// by SQL. Past it, every name counts as changed.
+pub(super) const MAX_CHANGED_NAMES: usize = 256;
+
+/// The name the server keeps a prepared statement under: it tells names
+/// apart by their first 63 bytes.
+fn server_name(name: &[u8]) -> &[u8] {
+    name.get(..MAX_NAME_BYTES).unwrap_or(name)
+}
+
+/// Whether running a statement of this outcome may make, remove or
+/// replace prepared statements: it prepares or deallocates with SQL, or
+/// has no analysis.
+fn changes_names(outcome: Option<&Result<Arc<Analysis>, ParseFailure>>) -> bool {
+    !matches!(
+        outcome,
+        Some(Ok(analysis)) if !analysis.flags().intersects(
+            StatementFlags::PREPARES
+                .union(StatementFlags::DEALLOCATES_ALL)
+                .union(StatementFlags::OPAQUE_BODY)
+        )
+    )
+}
+
+/// The prepared statements that SQL may have made, removed or replaced
+/// since the tracker read the text it holds for them.
+///
+/// A change is marked with the serial of the last text the tracker had
+/// read when the statement that makes it was let through, see
+/// [`Kept::serial`]. A text with a larger serial is that of a `Parse` sent
+/// after the change. The server refuses a `Parse` of a name that exists,
+/// so that text stands for the name: the tracker holds it once the server
+/// has confirmed the `Parse`, and before that only for messages sent
+/// since the last `Sync`, which the server skips if the `Parse` fails.
+#[derive(Default)]
+struct Changed {
+    /// Every name was changed at this mark.
+    all: Option<u64>,
+    /// Names changed later than `all`, each with its mark.
+    names: BTreeMap<Box<[u8]>, u64>,
+}
+
+impl Changed {
+    /// Whether no name was ever changed.
+    fn is_empty(&self) -> bool {
+        self.all.is_none() && self.names.is_empty()
+    }
+
+    /// Every name may have changed.
+    fn everything(&mut self, serial: u64) {
+        self.all = Some(serial);
+        self.names.clear();
+    }
+
+    /// The name may have changed. Past [`MAX_CHANGED_NAMES`] names, every
+    /// name counts as changed.
+    fn name(&mut self, name: &[u8], serial: u64) {
+        let name = server_name(name);
+        if self.names.len() >= MAX_CHANGED_NAMES && !self.names.contains_key(name) {
+            self.everything(serial);
+        } else {
+            self.names.insert(name.into(), serial);
+        }
+    }
+
+    /// A statement of this outcome runs: what it may change.
+    fn ran(&mut self, outcome: Option<&Result<Arc<Analysis>, ParseFailure>>, serial: u64) {
+        match outcome {
+            Some(Ok(analysis)) if !analysis.flags().contains(StatementFlags::OPAQUE_BODY) => {
+                if analysis.flags().contains(StatementFlags::DEALLOCATES_ALL) {
+                    self.everything(serial);
+                }
+                for name in analysis.statement_names() {
+                    self.name(name.as_bytes(), serial);
+                }
+            }
+            // Without an analysis, it may prepare anything.
+            _ => self.everything(serial),
+        }
+    }
+
+    /// Whether a `Bind` of the name can be judged by `statement`, which
+    /// the tracker holds for it: the name was not changed since the
+    /// tracker read the text, or the text has no analysis, so that nothing
+    /// was judged by it and it is a statement without an analysis already.
+    fn stands_for(&self, name: &[u8], statement: &Statement<'_>) -> bool {
+        let named = self.names.get(server_name(name)).copied();
+        let Some(mark) = named.max(self.all) else {
+            return true;
+        };
+        matches!(statement, Statement::Kept(kept)
+            if kept.serial() > mark || !matches!(kept.analysis(), Some(Ok(_))))
+    }
 }
 
 /// What is known of the two settings that decide how the database reads
@@ -490,14 +615,17 @@ pub(super) struct Hook {
     /// code that reaches a table of the row threshold. From then on every
     /// result is held to the threshold, whatever its statement names.
     wide: bool,
-    /// The analysis of a statement of the session showed an SQL
-    /// `PREPARE`, `DEALLOCATE` or `DISCARD`. From then on, what the
-    /// tracker holds for a named statement may not be what the database
-    /// runs under that name, and a `Bind` of one has no analysis.
-    renamed: bool,
-    /// A `Bind` of a named statement was passed on after `renamed`. A
-    /// portal may run a statement no analysis shows, so every `Execute`
-    /// from then on may change a setting.
+    /// The prepared statements whose text the tracker holds may not be
+    /// what the database runs under their names: a `Bind` of one has no
+    /// analysis.
+    changed: Changed,
+    /// A `Parse` of the session stored a statement that may change names
+    /// when it runs. An `Execute` of a statement the tracker does not know
+    /// may run it.
+    stores_changes: bool,
+    /// A `Bind` of a changed name was passed on. A portal may run a
+    /// statement no analysis shows, so every `Execute` from then on may
+    /// change a setting.
     bound_renamed: bool,
 }
 
@@ -699,13 +827,15 @@ impl Hook {
     }
 
     /// A whole message of the client that the scanner is about to pass on,
-    /// after it has been searched. Returns what becomes of it.
+    /// after it has been searched. `serial` is that of the last text the
+    /// tracker has read. Returns what becomes of the message.
     pub(super) fn client(
         &mut self,
         frame: Frame<'_>,
         place: &Place<'_>,
         ledger: &Ledger,
         client_can_be_told: bool,
+        serial: u64,
         out: &mut Output,
     ) -> Verdict {
         let tag = frame.tag();
@@ -724,11 +854,18 @@ impl Hook {
                 // The function it calls by number may be the one that
                 // changes a setting.
                 self.reading.may_have_changed();
-                return self.function_call(place, ledger, client_can_be_told, out);
+                return self.function_call(place, ledger, client_can_be_told, serial, out);
             }
             frontend::tag::EXECUTE => {
                 if self.bound_renamed || runs_unread(place.statement) {
                     self.reading.may_have_changed();
+                }
+                // A statement stored with `Parse` runs here, and what it
+                // changes counts from now.
+                match place.statement {
+                    Statement::Kept(kept) => self.changed.ran(kept.analysis(), serial),
+                    _ if self.stores_changes => self.changed.everything(serial),
+                    _ => {}
                 }
                 return Verdict::Forward;
             }
@@ -741,10 +878,9 @@ impl Hook {
         let context = place.context;
         let Some(rules) = rules_for(context) else {
             // Nobody reads the statement, so it may be one that changes a
-            // setting. Rules loaded later must not take it for granted.
-            if runs {
-                self.reading.may_have_changed();
-            }
+            // setting or a name. Rules loaded later must not take it for
+            // granted.
+            self.unread(runs, serial);
             return Verdict::Forward;
         };
         // The parser's form of the statement is what an event shows under
@@ -765,9 +901,7 @@ impl Hook {
         let sql = match held {
             Ok(sql) => sql,
             Err(reason) => {
-                if runs {
-                    self.reading.may_have_changed();
-                }
+                self.unread(runs, serial);
                 let actions = raise(reason, rules, place, ledger, out);
                 return if actions.contains(Action::Kill) {
                     block(context, client_can_be_told, out)
@@ -800,8 +934,21 @@ impl Hook {
             text,
             name: place.name,
             runs,
+            serial,
         });
         Verdict::Hold
+    }
+
+    /// A `Query` or `Parse` goes on without an analysis. Run, it may
+    /// change a setting, and make, remove or replace any prepared
+    /// statement.
+    fn unread(&mut self, runs: bool, serial: u64) {
+        if runs {
+            self.reading.may_have_changed();
+            self.changed.everything(serial);
+        } else {
+            self.stores_changes = true;
+        }
     }
 
     /// The rules that cannot judge a `FunctionCall` of the session,
@@ -817,12 +964,15 @@ impl Hook {
         place: &Place<'_>,
         ledger: &Ledger,
         client_can_be_told: bool,
+        serial: u64,
         out: &mut Output,
     ) -> Verdict {
         let context = place.context;
         let Some(rules) = Self::blind_to_calls(context) else {
             return Verdict::Forward;
         };
+        // A statement without an analysis.
+        self.changed.everything(serial);
         let actions = raise(ParseFailure::FunctionCall, rules, place, ledger, out);
         if actions.contains(Action::Kill) {
             block(context, client_can_be_told, out)
@@ -832,10 +982,10 @@ impl Hook {
         }
     }
 
-    /// A whole `Bind` of the client. Once the session has prepared,
-    /// deallocated or discarded statements with SQL, a `Bind` of a named
-    /// statement has no analysis, whatever the tracker holds for the name.
-    /// The unnamed statement is not affected: SQL cannot make it.
+    /// A whole `Bind` of the client. A `Bind` of a name that SQL may have
+    /// changed since the tracker read the text it holds for it has no
+    /// analysis, see [`Changed`]. The unnamed statement is not affected:
+    /// SQL cannot make it.
     fn bind(
         &mut self,
         frame: Frame<'_>,
@@ -844,12 +994,14 @@ impl Hook {
         client_can_be_told: bool,
         out: &mut Output,
     ) -> Verdict {
-        if !self.renamed {
+        if self.changed.is_empty() {
             return Verdict::Forward;
         }
-        // A `Bind` that cannot be read is taken for one of a named
-        // statement.
-        if frontend::Bind::from_frame(frame).is_ok_and(|bind| bind.statement().is_empty()) {
+        // A `Bind` that cannot be read is taken for one of a changed name.
+        if frontend::Bind::from_frame(frame).is_ok_and(|bind| {
+            bind.statement().is_empty()
+                || self.changed.stands_for(bind.statement(), place.statement)
+        }) {
             return Verdict::Forward;
         }
         self.bound_renamed = true;
@@ -874,14 +1026,15 @@ impl Hook {
 
     /// The header of a `Query`, `Parse` or `FunctionCall` of the client
     /// that arrives in parts: it cannot be held, so it has no analysis. So
-    /// has a `Bind` after SQL prepared statements, see [`Hook::bind`].
-    /// Returns whether the session must end before the message is passed
-    /// on.
+    /// has a `Bind` once SQL may have changed a name, see [`Hook::bind`].
+    /// `serial` is that of the last text the tracker has read. Returns
+    /// whether the session must end before the message is passed on.
     pub(super) fn client_chunked(
         &mut self,
         tag: u8,
         place: &Place<'_>,
         ledger: &Ledger,
+        serial: u64,
         out: &mut Output,
     ) -> bool {
         self.reading.passed(tag);
@@ -895,15 +1048,23 @@ impl Hook {
         }
         let (reason, rules) = match tag {
             frontend::tag::QUERY | frontend::tag::PARSE => {
+                if tag == frontend::tag::QUERY {
+                    self.changed.everything(serial);
+                } else {
+                    self.stores_changes = true;
+                }
                 (ParseFailure::Streamed, rules_for(place.context))
             }
-            frontend::tag::FUNCTION_CALL => (
-                ParseFailure::FunctionCall,
-                Self::blind_to_calls(place.context),
-            ),
-            // The name is in a part not seen here: it counts as one of a
-            // named statement.
-            frontend::tag::BIND if self.renamed => {
+            frontend::tag::FUNCTION_CALL => {
+                let rules = Self::blind_to_calls(place.context);
+                if rules.is_some() {
+                    self.changed.everything(serial);
+                }
+                (ParseFailure::FunctionCall, rules)
+            }
+            // The name is in a part not seen here: it counts as a changed
+            // one.
+            frontend::tag::BIND if !self.changed.is_empty() => {
                 self.bound_renamed = true;
                 (ParseFailure::Renamed, rules_for(place.context))
             }
@@ -934,10 +1095,6 @@ impl Hook {
         let Some(waiting) = self.waiting.take_if(|waiting| waiting.id == id) else {
             return Ok(None);
         };
-        // The flags of an analysis hold even when one of its lists is full.
-        if matches!(&outcome, Ok(analysis) if analysis.flags().contains(StatementFlags::PREPARES)) {
-            self.renamed = true;
-        }
         // An analysis with a full list does not tell everything the
         // statement touches: it is no analysis.
         let outcome = outcome.and_then(|analysis| {
@@ -947,6 +1104,13 @@ impl Hook {
                 Err(ParseFailure::Incomplete)
             }
         });
+        // What the statement may change of the names counts from now: a
+        // `Query` runs it, and a stored one is taken to run at once too.
+        // It counts again when an `Execute` runs it.
+        self.changed.ran(Some(&outcome), waiting.serial);
+        if !waiting.runs && changes_names(Some(&outcome)) {
+            self.stores_changes = true;
+        }
         waiting.text.analysed(outcome.clone());
         if let Ok(analysis) = &outcome {
             waiting

@@ -70,8 +70,8 @@ mod thread;
 mod tests;
 
 pub use analysis::{
-    Analysis, Function, MAX_FUNCTIONS, MAX_KINDS, MAX_RELATIONS, Relation, RelationUse,
-    StatementFlags,
+    Analysis, Function, MAX_FUNCTIONS, MAX_KINDS, MAX_RELATIONS, MAX_STATEMENT_NAMES, Relation,
+    RelationUse, StatementFlags,
 };
 pub use name::{InvalidName, MAX_IDENTIFIER_BYTES, QualifiedName};
 pub use parse::analyse;

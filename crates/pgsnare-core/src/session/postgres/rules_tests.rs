@@ -79,6 +79,7 @@ pub(super) mod with_rules {
     };
     use crate::session::{Direction, Leg, Output, Report};
 
+    use super::super::rules::MAX_CHANGED_NAMES;
     use super::super::session::MAX_BEHIND;
     use super::super::track::{Statement, Tracker};
     use super::*;
@@ -876,51 +877,228 @@ pub(super) mod with_rules {
         }
     }
 
-    #[test]
-    fn after_discard_all_a_named_statement_has_no_analysis() {
-        let sql = "SELECT 2";
-        let mut harness = session(policy(OnParseFailure::Alert));
-        analysed(
-            &mut harness,
-            &join(&[&parse("s2", sql), &sync()]),
-            sql,
-            &parsed(),
-        );
-        analysed(
-            &mut harness,
-            &query("DISCARD ALL"),
-            "DISCARD ALL",
-            &completed(&["DISCARD ALL"]),
-        );
-        assert!(failures(&harness).is_empty());
-
-        harness.client(&join(&[&bind("p", "s2"), &execute("p"), &sync()]));
-        assert_eq!(
-            failures(&harness),
-            [(ParseFailure::Renamed, ActionSet::ALERT)]
-        );
-        assert_eq!(failure_events(&harness).len(), 1);
-        harness.server(&join(&[
+    /// The answer of the server to a `Bind`, an `Execute` of one row and a
+    /// `Sync`.
+    fn ran() -> Vec<u8> {
+        join(&[
             &frame(b'2', b""),
             &frame(b'C', b"SELECT 1\0"),
             &frame(b'Z', b"I"),
-        ]));
+        ])
+    }
 
-        // A new `Parse` of the name is analysed, and the name is still
-        // not trusted.
-        harness.effects.clear();
+    /// Prepares `name` with a `Parse` of `sql` and a `Sync`, which the
+    /// server confirms.
+    fn prepared(harness: &mut Harness, name: &str, sql: &str) {
         analysed(
-            &mut harness,
-            &join(&[&parse("s2", sql), &sync()]),
+            harness,
+            &join(&[&parse(name, sql), &sync()]),
             sql,
             &parsed(),
         );
+    }
+
+    /// Runs `sql` as a `Query`, which the server completes.
+    fn ran_sql(harness: &mut Harness, sql: &str, tags: &[&str]) {
+        analysed(harness, &query(sql), sql, &completed(tags));
+    }
+
+    /// Binds and runs the statement `name`, and returns the parse failures
+    /// that raised.
+    fn run(harness: &mut Harness, name: &str) -> Vec<(ParseFailure, ActionSet)> {
+        harness.effects.clear();
+        harness.client(&join(&[&bind("", name), &execute(""), &sync()]));
+        assert!(asked(harness).is_empty(), "{name}");
+        let raised = failures(harness);
+        harness.server(&ran());
+        raised
+    }
+
+    const RENAMED: [(ParseFailure, ActionSet); 1] = [(ParseFailure::Renamed, ActionSet::ALERT)];
+
+    #[test]
+    fn a_name_prepared_with_sql_has_no_analysis_until_a_parse_of_it_is_confirmed() {
+        let mut harness = session(policy(OnParseFailure::Alert));
+        prepared(&mut harness, "other", "SELECT 1");
+        ran_sql(&mut harness, "PREPARE s AS SELECT 2", &["PREPARE"]);
         assert!(failures(&harness).is_empty());
-        harness.client(&join(&[&bind("", "s2"), &execute(""), &sync()]));
-        assert_eq!(
-            failures(&harness),
-            [(ParseFailure::Renamed, ActionSet::ALERT)]
+
+        // The tracker holds no text for the name, and the database has
+        // the one of the `PREPARE`.
+        assert_eq!(run(&mut harness, "s"), RENAMED);
+        assert_eq!(failure_events(&harness).len(), 1);
+        // Another name is not affected.
+        assert!(run(&mut harness, "other").is_empty());
+
+        // A `Parse` that the server refuses, because the name exists,
+        // changes nothing.
+        harness.effects.clear();
+        harness.client(&join(&[&parse("s", "SELECT 3"), &sync()]));
+        let requests = asked(&mut harness);
+        answer(&mut harness, requests[0].0, Ok(analysis("SELECT 3")));
+        harness.server(&join(&[
+            &frame(b'E', b"SERROR\0C42P05\0\0"),
+            &frame(b'Z', b"I"),
+        ]));
+        assert_eq!(run(&mut harness, "s"), RENAMED);
+
+        // Once a `Parse` of the name is confirmed, the name holds its text.
+        ran_sql(&mut harness, "DEALLOCATE s", &["DEALLOCATE"]);
+        prepared(&mut harness, "s", "SELECT 4");
+        assert!(run(&mut harness, "s").is_empty());
+        assert!(run(&mut harness, "other").is_empty());
+    }
+
+    #[test]
+    fn a_reset_with_discard_all_does_not_make_the_next_named_statements_unanalysed() {
+        // A pooler resets the connection with `DISCARD ALL` and hands it
+        // to the next client, which prepares its own named statements.
+        for pipelined in [false, true] {
+            let mut harness = session(policy(OnParseFailure::Block));
+            prepared(&mut harness, "s1", "SELECT 1");
+            assert!(run(&mut harness, "s1").is_empty());
+            ran_sql(&mut harness, "DISCARD ALL", &["DISCARD ALL"]);
+            assert!(failures(&harness).is_empty());
+
+            let sql = "SELECT pg_sleep(1)";
+            harness.effects.clear();
+            if pipelined {
+                // `Parse`, `Bind` and `Execute` in one go: the `Bind` runs
+                // only if the `Parse` succeeds.
+                let rest = join(&[&bind("", "s1"), &execute(""), &sync()]);
+                harness.client(&join(&[&parse("s1", sql), &rest]));
+                let requests = asked(&mut harness);
+                assert_eq!(requests.len(), 1);
+                answer(&mut harness, requests[0].0, Ok(analysis(sql)));
+                assert!(harness.to_server.ends_with(&rest));
+                harness.server(&join(&[&frame(b'1', b""), &ran()]));
+            } else {
+                prepared(&mut harness, "s1", sql);
+                assert!(run(&mut harness, "s1").is_empty());
+            }
+            // The rule judged the statement, no parse failure was raised,
+            // and the session goes on.
+            assert!(failures(&harness).is_empty(), "{pipelined}");
+            assert!(!harness.session.is_closed(), "{pipelined}");
+            prepared(&mut harness, "s2", "SELECT 2");
+            for name in ["s1", "s2", "s1"] {
+                assert!(run(&mut harness, name).is_empty(), "{pipelined} {name}");
+            }
+            assert!(!harness.session.is_closed(), "{pipelined}");
+        }
+    }
+
+    #[test]
+    fn discard_all_and_deallocate_all_forget_every_name_and_other_discards_none() {
+        for (sql, tag, forgets) in [
+            ("DISCARD ALL", "DISCARD ALL", true),
+            ("DEALLOCATE ALL", "DEALLOCATE ALL", true),
+            ("DEALLOCATE PREPARE ALL", "DEALLOCATE ALL", true),
+            ("DISCARD PLANS", "DISCARD PLANS", false),
+            ("DISCARD TEMP", "DISCARD TEMP", false),
+            ("DISCARD SEQUENCES", "DISCARD SEQUENCES", false),
+        ] {
+            let mut harness = session(policy(OnParseFailure::Alert));
+            prepared(&mut harness, "s1", "SELECT 1");
+            prepared(&mut harness, "s2", "SELECT 2");
+            ran_sql(&mut harness, sql, &[tag]);
+            for name in ["s1", "s2"] {
+                // The server would refuse the `Bind` of a name it forgot;
+                // the old text is not taken for what runs all the same.
+                let expected: &[_] = if forgets { &RENAMED } else { &[] };
+                assert_eq!(run(&mut harness, name), expected, "{sql} {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn deallocate_forgets_one_name_until_it_is_parsed_again() {
+        let mut harness = session(policy(OnParseFailure::Alert));
+        prepared(&mut harness, "s", "SELECT 1");
+        prepared(&mut harness, "t", "SELECT 2");
+        ran_sql(&mut harness, "DEALLOCATE s", &["DEALLOCATE"]);
+        assert_eq!(run(&mut harness, "s"), RENAMED);
+        assert!(run(&mut harness, "t").is_empty());
+        // The server cut the name at 63 bytes, as SQL does.
+        let long = format!("t{}", "x".repeat(62));
+        prepared(&mut harness, &long, "SELECT 3");
+        ran_sql(
+            &mut harness,
+            &format!("DEALLOCATE {long}yyy"),
+            &["DEALLOCATE"],
         );
+        assert_eq!(run(&mut harness, &long), RENAMED);
+        prepared(&mut harness, "s", "SELECT 4");
+        assert!(run(&mut harness, "s").is_empty());
+    }
+
+    #[test]
+    fn a_statement_without_an_analysis_makes_older_names_unanalysed() {
+        for (sql, reason) in [
+            ("SELEC 1", ParseFailure::Rejected),
+            ("DO $$ BEGIN END $$", ParseFailure::OpaqueBody),
+        ] {
+            let mut harness = session(policy(OnParseFailure::Alert));
+            prepared(&mut harness, "old", "SELECT 1");
+            harness.client(&query(sql));
+            let requests = asked(&mut harness);
+            let outcome = if reason == ParseFailure::Rejected {
+                Err(reason)
+            } else {
+                Ok(analysis(sql))
+            };
+            answer(&mut harness, requests[0].0, outcome);
+            assert_eq!(failures(&harness), [(reason, ActionSet::ALERT)], "{sql}");
+            harness.server(&completed(&["DO"]));
+
+            // It may have prepared anything.
+            assert_eq!(run(&mut harness, "old"), RENAMED, "{sql}");
+            prepared(&mut harness, "new", "SELECT 2");
+            assert!(run(&mut harness, "new").is_empty(), "{sql}");
+            assert_eq!(run(&mut harness, "old"), RENAMED, "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_stored_statement_changes_names_when_it_runs() {
+        let mut harness = session(policy(OnParseFailure::Alert));
+        prepared(&mut harness, "forget", "DEALLOCATE s");
+        // Prepared after the `DEALLOCATE` was read, and before it runs.
+        prepared(&mut harness, "s", "SELECT 1");
+        assert!(run(&mut harness, "s").is_empty());
+        // It runs, and the name is forgotten.
+        harness.client(&join(&[&bind("", "forget"), &execute(""), &sync()]));
+        harness.server(&join(&[
+            &frame(b'2', b""),
+            &frame(b'C', b"DEALLOCATE\0"),
+            &frame(b'Z', b"I"),
+        ]));
+        assert_eq!(run(&mut harness, "s"), RENAMED);
+        prepared(&mut harness, "s", "SELECT 2");
+        assert!(run(&mut harness, "s").is_empty());
+    }
+
+    #[test]
+    fn past_the_most_changed_names_every_name_is_unanalysed() {
+        let mut harness = session(policy(OnParseFailure::Alert));
+        prepared(&mut harness, "keep", "SELECT 1");
+        for index in 0..MAX_CHANGED_NAMES {
+            ran_sql(
+                &mut harness,
+                &format!("DEALLOCATE n{index}"),
+                &["DEALLOCATE"],
+            );
+        }
+        assert!(run(&mut harness, "keep").is_empty());
+        assert_eq!(run(&mut harness, "n0"), RENAMED);
+        // A name already among them changes nothing.
+        ran_sql(&mut harness, "DEALLOCATE n0", &["DEALLOCATE"]);
+        assert!(run(&mut harness, "keep").is_empty());
+        // One more: every name counts as changed.
+        ran_sql(&mut harness, "DEALLOCATE one_more", &["DEALLOCATE"]);
+        assert_eq!(run(&mut harness, "keep"), RENAMED);
+        prepared(&mut harness, "keep", "SELECT 2");
+        assert!(run(&mut harness, "keep").is_empty());
     }
 
     #[test]

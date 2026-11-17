@@ -16,6 +16,10 @@ pub const MAX_FUNCTIONS: usize = 256;
 /// The most kinds of statement an analysis names.
 pub const MAX_KINDS: usize = 64;
 
+/// The most names of prepared statements an analysis keeps. A statement
+/// that names more counts as one that removes every prepared statement.
+pub const MAX_STATEMENT_NAMES: usize = 64;
+
 /// The longest name an analysis keeps. PostgreSQL cuts a name at 63 bytes
 /// while it reads the statement, so a longer one means something is wrong
 /// and the analysis is incomplete.
@@ -88,11 +92,16 @@ impl StatementFlags {
     /// `CREATE PROCEDURE`. A later statement reaches the same rows by that
     /// name.
     pub const STORES: Self = Self(128);
-    /// A statement that makes or removes prepared statements by SQL:
-    /// `PREPARE`, `DEALLOCATE`, `DISCARD`. Such a statement shares its
-    /// names with the statements of the protocol, so a name a `Parse` gave
-    /// a text may stand for another text from then on.
+    /// A statement that makes or removes a prepared statement by its name,
+    /// with SQL: `PREPARE name`, `DEALLOCATE name`. The names are in
+    /// [`Analysis::statement_names`]. A prepared statement of SQL shares
+    /// its name with those of the protocol, so a name a `Parse` gave a text
+    /// may stand for another text from then on.
     pub const PREPARES: Self = Self(256);
+    /// A statement that removes every prepared statement: `DEALLOCATE ALL`,
+    /// `DISCARD ALL`. `DISCARD PLANS`, `TEMP` and `SEQUENCES` leave them
+    /// alone.
+    pub const DEALLOCATES_ALL: Self = Self(512);
 
     /// Whether every flag in `other` is set here too.
     #[must_use]
@@ -188,6 +197,8 @@ pub struct Analysis {
     kinds: Vec<&'static str>,
     relations: Vec<Relation>,
     functions: Vec<Function>,
+    /// The prepared statements `PREPARE` and `DEALLOCATE` name.
+    statement_names: Vec<Box<str>>,
     flags: StatementFlags,
     complete: bool,
     /// Whether the normalised text and the fingerprint were asked for.
@@ -203,6 +214,7 @@ impl Analysis {
             kinds: Vec::new(),
             relations: Vec::new(),
             functions: Vec::new(),
+            statement_names: Vec::new(),
             flags: StatementFlags::NONE,
             complete: true,
             normalise_tried: false,
@@ -235,6 +247,14 @@ impl Analysis {
     #[must_use]
     pub fn functions(&self) -> &[Function] {
         &self.functions
+    }
+
+    /// The prepared statements that `PREPARE` makes and `DEALLOCATE`
+    /// removes, each once, as the database names them: an unquoted name in
+    /// lower case, cut to 63 bytes.
+    #[must_use]
+    pub fn statement_names(&self) -> &[Box<str>] {
+        &self.statement_names
     }
 
     /// The flags of all statements together.
@@ -316,6 +336,14 @@ impl Analysis {
                 .saturating_add(name(&function.name))
                 .saturating_add(optional(&function.schema));
         }
+        bytes = bytes.saturating_add(
+            self.statement_names
+                .capacity()
+                .saturating_mul(size_of::<Box<str>>()),
+        );
+        for statement in &self.statement_names {
+            bytes = bytes.saturating_add(name(statement));
+        }
         bytes.saturating_add(optional(&self.normalised))
     }
 
@@ -389,6 +417,21 @@ impl Analysis {
         });
     }
 
+    /// Notes a prepared statement that `PREPARE` makes or `DEALLOCATE`
+    /// removes. Past [`MAX_STATEMENT_NAMES`], the statement counts as one
+    /// that removes every prepared statement.
+    pub(super) fn add_statement_name(&mut self, name: &str) {
+        self.add_flags(StatementFlags::PREPARES);
+        if self.statement_names.iter().any(|known| &**known == name) {
+            return;
+        }
+        if self.statement_names.len() >= MAX_STATEMENT_NAMES {
+            self.add_flags(StatementFlags::DEALLOCATES_ALL);
+            return;
+        }
+        self.statement_names.push(Box::from(name));
+    }
+
     pub(super) fn set_normalised(
         &mut self,
         normalised: Option<Box<str>>,
@@ -403,6 +446,7 @@ impl Analysis {
         self.kinds.shrink_to_fit();
         self.relations.shrink_to_fit();
         self.functions.shrink_to_fit();
+        self.statement_names.shrink_to_fit();
     }
 }
 
@@ -428,6 +472,7 @@ impl fmt::Debug for Analysis {
             .field("kinds", &self.kinds.len())
             .field("relations", &self.relations.len())
             .field("functions", &self.functions.len())
+            .field("statement_names", &self.statement_names.len())
             .field("flags", &self.flags)
             .field("complete", &self.complete)
             .field("normalised", &self.normalised.is_some())
