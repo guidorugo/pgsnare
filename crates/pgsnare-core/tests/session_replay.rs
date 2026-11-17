@@ -10,6 +10,12 @@
 //! way through it. These tests check that, and they check what the session
 //! logic rewrites against what real servers answered.
 //!
+//! The interleaving is any that a real connection can have: a client sends
+//! nothing but its login messages before the server has accepted its
+//! login, so the rest of its stream waits for the server's
+//! `AuthenticationOk`. A client that does not wait has its session ended,
+//! which is checked too.
+//!
 //! `crates/pgsnare-proto/tests/fixtures/README.md` describes the captures.
 //! Every value in them is synthetic.
 
@@ -67,6 +73,81 @@ fn packet_len(bytes: &[u8]) -> usize {
 /// The length of the message with a type byte at the front of `bytes`.
 fn frame_len(bytes: &[u8]) -> usize {
     1 + usize::try_from(u32::from_be_bytes(bytes[1..5].try_into().unwrap())).unwrap()
+}
+
+/// How many bytes at the front of a client stream, after the startup
+/// message, are login messages.
+fn login_messages_len(client: &[u8]) -> usize {
+    let mut len = 0;
+    while client.get(len) == Some(&b'p') {
+        len += frame_len(&client[len..]);
+    }
+    len
+}
+
+/// How many bytes at the front of a server stream end with its
+/// `AuthenticationOk`: all of them, for a login that is not accepted.
+fn accepting_len(server: &[u8]) -> usize {
+    let mut len = 0;
+    while len < server.len() {
+        let end = len + frame_len(&server[len..]);
+        if server[len..end] == [b'R', 0, 0, 0, 8, 0, 0, 0, 0] {
+            return end;
+        }
+        len = end;
+    }
+    server.len()
+}
+
+/// What is left of the two streams of a session after its startup
+/// message, taken in pieces in an order a real connection can have.
+struct Streams<'a> {
+    client: &'a [u8],
+    server: &'a [u8],
+    /// What is left of the client's login messages.
+    login: usize,
+    /// What is left of the server stream up to its `AuthenticationOk`.
+    accepting: usize,
+}
+
+impl<'a> Streams<'a> {
+    fn new(client: &'a [u8], server: &'a [u8]) -> Self {
+        Self {
+            client,
+            server,
+            login: login_messages_len(client),
+            accepting: accepting_len(server),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.client.is_empty() && self.server.is_empty()
+    }
+
+    /// Takes the next piece, of at most `size` bytes: from the client when
+    /// `client_turn` says so and the client has something it may send,
+    /// and from the server otherwise.
+    fn next(&mut self, client_turn: bool, size: usize) -> (Direction, &'a [u8]) {
+        // Until the server has accepted the login, the client may send
+        // only its login messages. Once the server stream is used up, the
+        // login has been accepted or has failed, and nothing waits.
+        let ready = if self.accepting == 0 {
+            self.client.len()
+        } else {
+            self.login
+        };
+        if (client_turn && ready > 0) || self.server.is_empty() {
+            let (piece, later) = self.client.split_at(size.clamp(1, ready));
+            self.client = later;
+            self.login = self.login.saturating_sub(piece.len());
+            (Direction::FromClient, piece)
+        } else {
+            let (piece, later) = self.server.split_at(size.clamp(1, self.server.len()));
+            self.server = later;
+            self.accepting = self.accepting.saturating_sub(piece.len());
+            (Direction::FromServer, piece)
+        }
+    }
 }
 
 fn policy(max_buffered_frame: usize) -> PolicySnapshot {
@@ -143,24 +224,12 @@ impl Replay {
 
     /// Feeds both streams to their ends, in pieces of the given sizes,
     /// taking turns as `client_first` says.
-    fn feed<'a>(
-        &mut self,
-        mut client: &'a [u8],
-        mut server: &'a [u8],
-        sizes: &[usize],
-        client_first: bool,
-    ) {
+    fn feed(&mut self, client: &[u8], server: &[u8], sizes: &[usize], client_first: bool) {
+        let mut streams = Streams::new(client, server);
         let mut sizes = sizes.iter().copied().cycle();
         let mut client_turn = client_first;
-        while !client.is_empty() || !server.is_empty() {
-            let (stream, from) = if (client_turn && !client.is_empty()) || server.is_empty() {
-                (&mut client, Direction::FromClient)
-            } else {
-                (&mut server, Direction::FromServer)
-            };
-            let size = sizes.next().unwrap().clamp(1, stream.len());
-            let (piece, later) = stream.split_at(size);
-            *stream = later;
+        while !streams.is_empty() {
+            let (from, piece) = streams.next(client_turn, sizes.next().unwrap());
             self.bytes(from, piece);
             client_turn = !client_turn;
         }
@@ -207,6 +276,46 @@ fn every_captured_session_passes_unchanged_however_it_is_cut() {
     // Nine scenarios, five captures, twenty ways each. One scenario does
     // not exist for every capture.
     assert!(replayed >= 5 * 8 * 20, "{replayed} replays");
+}
+
+#[test]
+fn a_captured_client_that_does_not_wait_for_its_login_ends_its_session() {
+    let mut refused = 0;
+    for capture in CAPTURES {
+        for scenario in SESSIONS {
+            if !has(capture, &format!("{scenario}.client.bin")) {
+                continue;
+            }
+            let client = read(capture, &format!("{scenario}.client.bin"));
+            let mut replay = Replay::new(TlsPolicy::Disabled, 1024 * 1024);
+            let rest = replay.start(&client, false);
+            let login = login_messages_len(rest);
+            if login == rest.len() {
+                // Nothing but the login, as in a login that fails.
+                continue;
+            }
+            // Everything the client sent, before the server has said a
+            // word: the login messages go on, nothing behind them does.
+            let mut out = Output::new();
+            let error = replay
+                .session
+                .on_bytes(Direction::FromClient, rest, &replay.policy, &mut out)
+                .unwrap_err();
+            let what = format!("{capture}/{scenario}");
+            assert_eq!(
+                error.reason(),
+                "the client sent a message other than a login message before the login finished",
+                "{what}"
+            );
+            assert!(out.to_server == rest[..login], "{what}");
+            assert!(out.to_client.is_empty(), "{what}");
+            assert!(replay.session.is_closed(), "{what}");
+            refused += 1;
+        }
+    }
+    // Every scenario but the failed login, in every capture. One scenario
+    // does not exist for every capture.
+    assert!(refused >= 5 * 7, "{refused} sessions");
 }
 
 #[test]
@@ -428,8 +537,8 @@ fn a_copy_is_followed_through_a_captured_session() {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
-    /// Any way of cutting and interleaving a captured session gives each
-    /// side what the other sent.
+    /// Any way of cutting a captured session, interleaved in any order a
+    /// real connection can have, gives each side what the other sent.
     #[test]
     fn a_captured_session_passes_unchanged_under_any_cut(
         capture in proptest::sample::select(CAPTURES.to_vec()),
@@ -440,19 +549,13 @@ proptest! {
         let client = read(capture, &format!("{scenario}.client.bin"));
         let server = read(capture, &format!("{scenario}.server.bin"));
         let mut replay = Replay::new(TlsPolicy::Disabled, max_buffered_frame);
-        let mut client_rest = replay.start(&client, false);
-        let mut server_rest = server.as_slice();
+        let rest = replay.start(&client, false);
+        let mut streams = Streams::new(rest, &server);
 
         let mut cuts = cuts.into_iter().cycle();
-        while !client_rest.is_empty() || !server_rest.is_empty() {
+        while !streams.is_empty() {
             let (from_client, size) = cuts.next().unwrap();
-            let (stream, from) = if (from_client && !client_rest.is_empty()) || server_rest.is_empty() {
-                (&mut client_rest, Direction::FromClient)
-            } else {
-                (&mut server_rest, Direction::FromServer)
-            };
-            let (piece, later) = stream.split_at(size.min(stream.len()));
-            *stream = later;
+            let (from, piece) = streams.next(from_client, size);
             replay.bytes(from, piece);
         }
         prop_assert!(replay.to_server == client);

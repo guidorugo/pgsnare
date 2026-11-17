@@ -190,7 +190,7 @@ sequenceDiagram
 
 1. **Classify the first bytes.** A new connection starts with one of: a TLS handshake (direct TLS), `SSLRequest`, `GSSENCRequest`, `CancelRequest` or `StartupMessage`.
 2. **Connect upstream.** On `StartupMessage`, pgsnare scans its parameters, connects to the database with TLS as configured, and forwards the startup message.
-3. **Relay the login.** Authentication messages pass through unchanged in both directions. pgsnare records the cancel key the server issues.
+3. **Relay the login.** Authentication messages pass through unchanged in both directions. pgsnare records the cancel key the server issues. During the login the proxy passes on only login messages from the client and ends a session that sends anything else.
 4. **Steady state.** For each read: split into frames, scan, consult the policy, then forward, withhold or inject, and hand any effects to the runtime.
 
 ## 6. Wire protocol

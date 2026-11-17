@@ -1097,6 +1097,124 @@ fn a_login_that_cannot_be_followed_ends_the_session_whatever_the_policy() {
     assert_eq!(harness.take_to_server(), largest);
 }
 
+/// Takes a session to the point where the startup message has been passed
+/// on and the login has begun.
+fn mid_login(on_error: OnError) -> Harness {
+    let mut harness = Harness::new(TlsPolicy::Disabled).with_policy(on_error, 1024 * 1024);
+    harness.client(&plain_startup()).unwrap();
+    harness
+        .report(Report::BackendConnected { tls: false })
+        .unwrap();
+    harness.take_to_server();
+    harness.take_effects();
+    harness.recorder.script().seen.clear();
+    harness
+}
+
+const NOT_A_LOGIN_MESSAGE: &str =
+    "the client sent a message other than a login message before the login finished";
+
+#[test]
+fn a_client_message_other_than_a_login_message_ends_the_login_whatever_the_policy() {
+    let password = frame(b'p', b"secret\0");
+    let statements = [
+        query("SELECT 1"),
+        frame(b'P', b"\0SELECT 1\0\0\0"),
+        frame(b'S', b""),
+    ];
+    for on_error in [OnError::FailClosed, OnError::FailOpen] {
+        for statement in &statements {
+            // Behind the password message, in the same read: the password
+            // message is passed on, the statement is not.
+            let mut harness = mid_login(on_error);
+            let together = [password.as_slice(), statement].concat();
+            assert_eq!(
+                harness.client(&together).unwrap_err().reason(),
+                NOT_A_LOGIN_MESSAGE
+            );
+            assert_eq!(harness.take_to_server(), password);
+            assert!(harness.take_to_client().is_empty());
+            assert!(harness.take_effects().is_empty());
+            assert!(harness.recorder.seen().is_empty());
+            assert!(harness.session.is_closed());
+            assert!(!harness.session.is_tunnel());
+
+            // On its own, before any password message.
+            let mut harness = mid_login(on_error);
+            assert_eq!(
+                harness.client(statement).unwrap_err().reason(),
+                NOT_A_LOGIN_MESSAGE
+            );
+            assert!(harness.take_to_server().is_empty());
+            assert!(harness.recorder.seen().is_empty());
+            assert!(harness.session.is_closed());
+            assert!(!harness.session.is_tunnel());
+
+            // Sent with the startup message, and kept while the database
+            // was being reached: the startup message is passed on, the
+            // statement is not.
+            let mut harness = Harness::new(TlsPolicy::Disabled).with_policy(on_error, 1024 * 1024);
+            harness
+                .client(&[plain_startup().as_slice(), statement].concat())
+                .unwrap();
+            assert!(harness.take_to_server().is_empty());
+            assert_eq!(
+                harness
+                    .report(Report::BackendConnected { tls: false })
+                    .unwrap_err()
+                    .reason(),
+                NOT_A_LOGIN_MESSAGE
+            );
+            assert_eq!(harness.take_to_server(), plain_startup());
+            assert!(harness.session.is_closed());
+            assert!(!harness.session.is_tunnel());
+        }
+    }
+}
+
+#[test]
+fn a_statement_after_the_login_is_passed_on_and_inspected() {
+    let mut harness = mid_login(OnError::FailClosed);
+    let password = frame(b'p', b"secret\0");
+    harness.client(&password).unwrap();
+    assert_eq!(harness.take_to_server(), password);
+
+    let welcome = [authentication_ok(), ready_for_query()].concat();
+    harness.server(&welcome).unwrap();
+    assert_eq!(harness.take_to_client(), welcome);
+    assert_eq!(harness.take_effects(), [Effect::LoginFinished]);
+    assert!(harness.session.is_established());
+
+    let ask = query("SELECT 1");
+    harness.client(&ask).unwrap();
+    assert_eq!(harness.take_to_server(), ask);
+    // The inspector sees the statement and none of the login.
+    let seen = harness.recorder.seen();
+    assert!(seen.contains(&Seen::Frame(Direction::FromClient, b'Q', ask.len(), false)));
+    assert!(
+        !seen
+            .iter()
+            .any(|seen| matches!(seen, Seen::Frame(Direction::FromClient, b'p', ..)))
+    );
+}
+
+#[test]
+fn a_client_may_end_its_session_during_the_login() {
+    let terminate = frame(b'X', b"");
+    // Alone, and behind a password message.
+    for sent in [
+        terminate.clone(),
+        [frame(b'p', b"secret\0"), terminate].concat(),
+    ] {
+        let mut harness = mid_login(OnError::FailClosed);
+        harness.client(&sent).unwrap();
+        assert_eq!(harness.take_to_server(), sent);
+        assert!(harness.take_to_client().is_empty());
+        assert!(harness.take_effects().is_empty());
+        assert!(harness.recorder.seen().is_empty());
+    }
+}
+
 #[test]
 fn the_database_must_not_speak_before_it_is_asked() {
     let mut harness = Harness::new(TlsPolicy::Disabled);
