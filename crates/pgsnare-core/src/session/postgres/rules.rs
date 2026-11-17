@@ -154,7 +154,9 @@
 //! - A `Query` counts when it is passed on. A statement stored with
 //!   `Parse` counts then, and again at each `Execute` that runs it. Once
 //!   the session has stored one that may change names, an `Execute` of a
-//!   statement the tracker does not know changes every name.
+//!   statement the tracker does not know changes every name, and so does
+//!   an SQL `EXECUTE` that runs, whether a `Query` or an `Execute` runs
+//!   it: what it runs may be that stored statement.
 //!
 //! A `Bind` of a changed name is a statement without an analysis, of the
 //! reason `renamed`, until a `Parse` of the name sent after the change has
@@ -621,7 +623,7 @@ pub(super) struct Hook {
     changed: Changed,
     /// A `Parse` of the session stored a statement that may change names
     /// when it runs. An `Execute` of a statement the tracker does not know
-    /// may run it.
+    /// may run it, and so may an SQL `EXECUTE`.
     stores_changes: bool,
     /// A `Bind` of a changed name was passed on. A portal may run a
     /// statement no analysis shows, so every `Execute` from then on may
@@ -863,7 +865,7 @@ impl Hook {
                 // A statement stored with `Parse` runs here, and what it
                 // changes counts from now.
                 match place.statement {
-                    Statement::Kept(kept) => self.changed.ran(kept.analysis(), serial),
+                    Statement::Kept(kept) => self.ran(kept.analysis(), serial),
                     _ if self.stores_changes => self.changed.everything(serial),
                     _ => {}
                 }
@@ -937,6 +939,21 @@ impl Hook {
             serial,
         });
         Verdict::Hold
+    }
+
+    /// A statement of this outcome runs, now and not only stored: what it
+    /// may change of the names. One that runs a stored statement, an SQL
+    /// `EXECUTE`, runs what its analysis does not show. Once a `Parse` of
+    /// the session stored a statement that may change names, that may be
+    /// the one, and every name may change.
+    fn ran(&mut self, outcome: Option<&Result<Arc<Analysis>, ParseFailure>>, serial: u64) {
+        self.changed.ran(outcome, serial);
+        if self.stores_changes
+            && matches!(outcome, Some(Ok(analysis))
+                if analysis.flags().contains(StatementFlags::RUNS_STORED))
+        {
+            self.changed.everything(serial);
+        }
     }
 
     /// A `Query` or `Parse` goes on without an analysis. Run, it may
@@ -1106,8 +1123,13 @@ impl Hook {
         });
         // What the statement may change of the names counts from now: a
         // `Query` runs it, and a stored one is taken to run at once too.
-        // It counts again when an `Execute` runs it.
-        self.changed.ran(Some(&outcome), waiting.serial);
+        // It counts again when an `Execute` runs it. What it runs of the
+        // stored ones counts only when it runs.
+        if waiting.runs {
+            self.ran(Some(&outcome), waiting.serial);
+        } else {
+            self.changed.ran(Some(&outcome), waiting.serial);
+        }
         if !waiting.runs && changes_names(Some(&outcome)) {
             self.stores_changes = true;
         }

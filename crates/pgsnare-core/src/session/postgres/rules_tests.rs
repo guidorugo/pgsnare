@@ -1079,6 +1079,42 @@ pub(super) mod with_rules {
     }
 
     #[test]
+    fn a_stored_statement_run_by_sql_execute_changes_every_name() {
+        // `EXECUTE` runs what it names, a statement stored with `Parse`
+        // included: one that changes names, which the analysis of the
+        // `EXECUTE` does not show.
+        let mut harness = session(policy(OnParseFailure::Alert));
+        prepared(&mut harness, "t", "DEALLOCATE s");
+        prepared(&mut harness, "u", "PREPARE s AS SELECT pg_sleep(1)");
+        // Confirmed after both were read: the name holds its text.
+        prepared(&mut harness, "s", "SELECT 1");
+        assert!(run(&mut harness, "s").is_empty());
+        ran_sql(&mut harness, "EXECUTE t", &["DEALLOCATE"]);
+        ran_sql(&mut harness, "EXECUTE u", &["PREPARE"]);
+        // The database holds the `PREPARE` under `s` now.
+        assert_eq!(run(&mut harness, "s"), RENAMED);
+        prepared(&mut harness, "other", "SELECT 2");
+        assert!(run(&mut harness, "other").is_empty());
+
+        // The same when the `EXECUTE` itself was stored with `Parse`.
+        let mut harness = session(policy(OnParseFailure::Alert));
+        prepared(&mut harness, "t", "DEALLOCATE s");
+        prepared(&mut harness, "e", "EXECUTE t");
+        prepared(&mut harness, "s", "SELECT 1");
+        assert!(run(&mut harness, "s").is_empty());
+        assert!(run(&mut harness, "e").is_empty());
+        assert_eq!(run(&mut harness, "s"), RENAMED);
+
+        // A session that stored nothing that changes names: what SQL
+        // prepared cannot change a name, so its `EXECUTE` changes none.
+        let mut harness = session(policy(OnParseFailure::Alert));
+        prepared(&mut harness, "s", "SELECT 1");
+        ran_sql(&mut harness, "PREPARE q AS SELECT 2", &["PREPARE"]);
+        ran_sql(&mut harness, "EXECUTE q", &["SELECT 1"]);
+        assert!(run(&mut harness, "s").is_empty());
+    }
+
+    #[test]
     fn past_the_most_changed_names_every_name_is_unanalysed() {
         let mut harness = session(policy(OnParseFailure::Alert));
         prepared(&mut harness, "keep", "SELECT 1");
