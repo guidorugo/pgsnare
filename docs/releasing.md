@@ -18,7 +18,7 @@ This is the procedure for the owner of the repository. A release is made by the 
 | `check` | read | The tag is `v` and a version, equals the version in `Cargo.toml`, and names a commit on `main` |
 | `build` | read | Builds the image and the binary on each architecture, from nothing |
 | `image-test`, `image-scan` | read | The same tests as on every change, on what was just built |
-| `publish` | write, in the environment `release` | Checks what `build` made against the sums it reported, then runs [`deploy/release/publish.sh`](../deploy/release/publish.sh): archives, SBOMs, the image, the chart, the manifests, the sums and the signatures. Then records the build provenance and creates the GitHub release as a draft |
+| `publish` | write, in the environment `release` | Checks what `build` made against the sums it reported, then runs [`deploy/release/publish.sh`](../deploy/release/publish.sh): archives, SBOMs, the image, the chart, the manifests, the sums and the signatures. Each archive holds the binary, the licence and the `THIRD-PARTY-NOTICES` file. Then records the build provenance and creates the GitHub release as a draft |
 | `verify` | read | Runs [`deploy/release/verify.sh`](../deploy/release/verify.sh) as a user would, against the image and the chart in the registry and against the files that `publish` handed on inside the workflow. It does not read the files attached to the draft: step 6 below does |
 
 The job that can write compiles nothing and builds no image.

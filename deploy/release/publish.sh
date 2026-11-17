@@ -19,8 +19,10 @@
 #             and no transparency log
 #   INPUT     a directory with what deploy/tests/image/build.sh wrote on
 #             each architecture: pgsnare-image-ARCH.tar, pgsnare-ARCH,
-#             THIRD-PARTY-NOTICES and SHA256SUMS-ARCH, for amd64 and
-#             arm64
+#             THIRD-PARTY-NOTICES-ARCH and SHA256SUMS-ARCH, for amd64 and
+#             arm64. The notices of the two builds must be the same file:
+#             an archive may not hold the notices of the other
+#             architecture.
 #   OUTPUT    a directory that is empty or does not exist: the files of the
 #             release are written to it
 #
@@ -33,11 +35,12 @@
 #
 # What it writes to OUTPUT, for the version V:
 #
-#   pgsnare-V-linux-amd64.tar.gz       the binary and the licence
-#   pgsnare-V-linux-arm64.tar.gz
+#   pgsnare-V-linux-amd64.tar.gz       the binary, the licence and the
+#   pgsnare-V-linux-arm64.tar.gz       licence notices, next to each other
 #   pgsnare-V-THIRD-PARTY-NOTICES      the licence notices of the
 #                                      dependencies, the file the image
-#                                      holds
+#                                      holds and the one the archives
+#                                      carry
 #   pgsnare-V-crates.spdx.json         SBOM of the binaries: every crate of
 #                                      Cargo.lock
 #   pgsnare-V-image-amd64.spdx.json    SBOM of the image: the packages of
@@ -123,7 +126,7 @@ for arch in "${arches[@]}"; do
     sums="$input/SHA256SUMS-$arch"
     [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || die "the sum of the $arch build is not given as a SHA-256"
     for file in "$sums" "$input/pgsnare-image-$arch.tar" "$input/pgsnare-$arch" \
-        "$input/THIRD-PARTY-NOTICES"; do
+        "$input/THIRD-PARTY-NOTICES-$arch"; do
         [[ -f "$file" && ! -L "$file" ]] || die "$file: not in the input"
     done
     [[ "$(sum_of "$sums")" == "$expected" ]] \
@@ -132,7 +135,7 @@ for arch in "${arches[@]}"; do
     [[ "$(wc -l < "$sums")" -eq 3 ]] \
         && grep -Eqx "[0-9a-f]{64}  pgsnare-image-$arch\.tar" "$sums" \
         && grep -Eqx "[0-9a-f]{64}  pgsnare-$arch" "$sums" \
-        && grep -Eqx "[0-9a-f]{64}  THIRD-PARTY-NOTICES" "$sums" \
+        && grep -Eqx "[0-9a-f]{64}  THIRD-PARTY-NOTICES-$arch" "$sums" \
         || die "SHA256SUMS-$arch does not list the image archive, the binary and the notices, and only them"
     (cd "$input" && sha256sum --check --strict --quiet "SHA256SUMS-$arch") >&2 \
         || die "the $arch build does not match its sums; nothing was published"
@@ -141,6 +144,11 @@ for arch in "${arches[@]}"; do
         || die "pgsnare-$arch is not a binary for $arch"
     binary_sum[$arch]="$(sum_of "$input/pgsnare-$arch")"
 done
+# The two builds name their notices after the architecture, so that one
+# never overwrites the other. They must hold the same content: the
+# release attaches one notices file, and each archive carries it.
+cmp -s "$input/THIRD-PARTY-NOTICES-amd64" "$input/THIRD-PARTY-NOTICES-arm64" \
+    || die "the licence notices of the two builds differ; nothing was published"
 say "the builds of both architectures match the sums that were reported"
 
 # --- Nothing of this version is in the registry yet ---------------------------
@@ -164,6 +172,7 @@ for arch in "${arches[@]}"; do
     mkdir -p "$work/archive/$name"
     install --mode 0755 "$input/pgsnare-$arch" "$work/archive/$name/pgsnare"
     install --mode 0644 "$root/LICENSE" "$work/archive/$name/LICENSE"
+    install --mode 0644 "$input/THIRD-PARTY-NOTICES-$arch" "$work/archive/$name/THIRD-PARTY-NOTICES"
     tar --create --file - --directory "$work/archive" --format=ustar --sort=name \
         --owner=0 --group=0 --numeric-owner --mtime='@0' -- "$name" \
         | gzip --no-name --best > "$output/$name.tar.gz"
@@ -201,9 +210,10 @@ done
 # --- The licence notices -------------------------------------------------------
 #
 # The file the image holds at /usr/share/doc/pgsnare/THIRD-PARTY-NOTICES,
-# which the build took from the image and checked against the sums.
+# which the build took from the image and checked against the sums. The
+# two builds' copies were compared above, so either serves.
 
-install --mode 0644 "$input/THIRD-PARTY-NOTICES" "$output/pgsnare-$version-THIRD-PARTY-NOTICES"
+install --mode 0644 "$input/THIRD-PARTY-NOTICES-amd64" "$output/pgsnare-$version-THIRD-PARTY-NOTICES"
 
 say "wrote the archives and the SBOMs"
 
