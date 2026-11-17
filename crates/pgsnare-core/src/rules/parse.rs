@@ -247,7 +247,9 @@ impl Walker {
             // `DISCARD ALL` sets every setting back. Every form of it is
             // taken for that one here.
             "DiscardStmt" => self.analysis.add_flags(StatementFlags::SETTINGS),
-            "ViewStmt" | "CreateTableAsStmt" | "IntoClause" | "RuleStmt" => {
+            // A cursor of SQL is a portal: an `Execute` of the protocol
+            // reads it under its name.
+            "ViewStmt" | "CreateTableAsStmt" | "IntoClause" | "RuleStmt" | "DeclareCursorStmt" => {
                 self.analysis.add_flags(StatementFlags::STORES);
             }
             _ => {}

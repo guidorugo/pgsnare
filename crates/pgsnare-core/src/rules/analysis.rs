@@ -88,9 +88,9 @@ impl StatementFlags {
     pub const SETTINGS: Self = Self(64);
     /// A statement that stores a query or code under a name of its own:
     /// `CREATE VIEW`, `CREATE TABLE ... AS`, `SELECT ... INTO`,
-    /// `CREATE MATERIALIZED VIEW`, `CREATE RULE`, and `CREATE FUNCTION` or
-    /// `CREATE PROCEDURE`. A later statement reaches the same rows by that
-    /// name.
+    /// `CREATE MATERIALIZED VIEW`, `CREATE RULE`, `CREATE FUNCTION` or
+    /// `CREATE PROCEDURE`, and `DECLARE ... CURSOR`, whose name is that of
+    /// a portal. A later statement reaches the same rows by that name.
     pub const STORES: Self = Self(128);
     /// A statement that makes or removes a prepared statement by its name,
     /// with SQL: `PREPARE name`, `DEALLOCATE name`. The names are in

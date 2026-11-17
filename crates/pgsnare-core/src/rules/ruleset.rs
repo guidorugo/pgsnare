@@ -310,7 +310,8 @@ impl RuleSet {
 
     /// Whether a statement stores a query or code, under a name of its
     /// own, that can reach a table of the row threshold: it makes a view,
-    /// a table from a query, a rule or a function, and either names a
+    /// a table from a query, a rule or a function, or declares a cursor,
+    /// which is a portal a protocol `Execute` reads, and either names a
     /// listed table or carries code the analysis does not show. Results
     /// read by that name later do not name the table.
     #[must_use]

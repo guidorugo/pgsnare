@@ -651,6 +651,17 @@ fn a_statement_that_stores_a_query_or_code_says_so() {
             true,
         ),
         ("DO $$ BEGIN PERFORM 1; END $$", false, true),
+        // A cursor is a portal, which a protocol `Execute` reads by name.
+        (
+            "DECLARE p CURSOR FOR SELECT * FROM users WHERE id > 0",
+            true,
+            true,
+        ),
+        (
+            "DECLARE p CURSOR WITH HOLD FOR SELECT * FROM orders",
+            true,
+            false,
+        ),
         ("SELECT * FROM users WHERE id > 0", false, false),
         ("CREATE TABLE t (LIKE users)", false, false),
         (

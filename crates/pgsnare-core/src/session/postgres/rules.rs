@@ -57,10 +57,13 @@
 //!   tracker does not know, may read any table: their results are held to
 //!   the threshold whenever the rule applies to the session.
 //! - A statement can store a query under a name of its own: a view, a
-//!   table made from a query, a rule, a function. Once the session has
-//!   passed on such a statement that names a listed table, or a statement
-//!   that carries code, or any statement without an analysis, every later
-//!   result of the session is held to the threshold, whatever it names.
+//!   table made from a query, a rule, a function, a cursor. A cursor of
+//!   SQL is a portal, which an `Execute` reads by name, while the tracker
+//!   may still hold the statement of an older `Bind` for it. Once the
+//!   session has passed on such a statement that names a listed table, or
+//!   a statement that carries code, or any statement without an analysis,
+//!   every later result of the session is held to the threshold, whatever
+//!   it names.
 //!   What was stored before the session, or by another one, is not known
 //!   here: a view over a listed table must be listed itself.
 //! - A result is everything a `Query` returns, over all statements of its
