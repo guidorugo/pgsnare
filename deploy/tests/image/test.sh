@@ -372,6 +372,36 @@ if notices_line 'PostgreSQL Database Management System'; then
 else
     fail "the notices of the image hold no line of the copyright of the PostgreSQL code of the rules"
 fi
+if notices_line '  file: upb-LICENSE'; then
+    echo "image-test: ok: the notices hold the licence of the upb code of the rules"
+else
+    fail "the notices of the image hold no heading for the licence of the upb code of the rules"
+fi
+if notices_line 'Copyright 2008 Google Inc.  All rights reserved.'; then
+    echo "image-test: ok: the notices hold the text of the licence of the upb code of the rules"
+else
+    fail "the notices of the image hold no line of the licence of the upb code of the rules"
+fi
+if notices_line '  file: utf8_range-LICENSE'; then
+    echo "image-test: ok: the notices hold the licence of the utf8_range code of the rules"
+else
+    fail "the notices of the image hold no heading for the licence of the utf8_range code of the rules"
+fi
+if notices_line 'Copyright (c) 2019 Yibo Cai'; then
+    echo "image-test: ok: the notices hold the text of the licence of the utf8_range code of the rules"
+else
+    fail "the notices of the image hold no line of the licence of the utf8_range code of the rules"
+fi
+if notices_line '  file: xxHash-LICENSE'; then
+    echo "image-test: ok: the notices hold the licence of the xxhash code of the rules"
+else
+    fail "the notices of the image hold no heading for the licence of the xxhash code of the rules"
+fi
+if notices_line 'Copyright (c) 2012-2020 Yann Collet'; then
+    echo "image-test: ok: the notices hold the text of the licence of the xxhash code of the rules"
+else
+    fail "the notices of the image hold no line of the licence of the xxhash code of the rules"
+fi
 
 echo "image-test: the binary must need no interpreter and no library"
 "$docker" cp --follow-link "$container:/usr/local/bin/pgsnare" "$work/pgsnare" >/dev/null

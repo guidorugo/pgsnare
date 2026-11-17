@@ -24,9 +24,11 @@
 #
 # The crates of this repository are left out: the licence of the
 # repository goes with them. A package that carries no such file is
-# listed with the name of the licence its manifest gives. A package
-# whose source directory is not there ends the script with an error, and
-# so does a command of a pipeline that fails. Nothing is written from
+# listed with the name of the licence its manifest gives, and the script
+# ends with an error unless the package is named in the allow-list in
+# the script, one line each, with the reason. A package whose source
+# directory is not there ends the script with an error, and so does a
+# command of a pipeline that fails. Nothing is written from
 # memory: only files are copied, byte for byte. The result is
 # deterministic: the packages are sorted by name and version, and the
 # files of a package by path.
@@ -259,12 +261,24 @@ extra_files_of() {
     case "$1" in
         pg_query)
             printf '%s\n' \
-                pg_query.rs-LICENSE libpg_query-LICENSE postgresql-COPYRIGHT
+                pg_query.rs-LICENSE libpg_query-LICENSE postgresql-COPYRIGHT \
+                upb-LICENSE utf8_range-LICENSE xxHash-LICENSE
             ;;
         aws-lc-sys)
             printf '%s\n' \
                 s2n-bignum-imported-LICENSE jitterentropy-library-LICENSE \
                 googletest-LICENSE wycheproof_testvectors-LICENSE
+            ;;
+    esac
+}
+
+# A package for which the script finds no licence file at all: the script
+# ends with an error, unless the package is named here, one line each,
+# with the reason.
+no_licence_file() {
+    case "$1" in
+        pg_query)
+            printf '%s\n' "the crate ships no licence file; licence: MIT"
             ;;
     esac
 }
@@ -302,6 +316,13 @@ mkdir -p -- "$(dirname -- "$out")"
                 copy_file "$file"
             done < "$work/files"
         else
+            # The script finds no licence file for the package at all: it
+            # ends with an error, unless the package is named in the
+            # allow-list, one line each, with the reason.
+            if [[ -z "$(no_licence_file "$name")" ]]; then
+                echo "notices: no licence file for $name $version, and the package is not in the allow-list" >&2
+                exit 1
+            fi
             echo "  No licence file in the package; licence: $license"
         fi
         # The licence files of the code the crate bundles that the

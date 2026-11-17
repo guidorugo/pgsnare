@@ -177,6 +177,12 @@ passes "the release holds the licence notices of the dependencies" \
         grep -qF "Copyright (c) 2015, Lukas Fittl <lukas@fittl.com>" "$1"
         grep -qF "  file: postgresql-COPYRIGHT" "$1"
         grep -qF "PostgreSQL Database Management System" "$1"
+        grep -qF "  file: upb-LICENSE" "$1"
+        grep -qF "Copyright 2008 Google Inc.  All rights reserved." "$1"
+        grep -qF "  file: utf8_range-LICENSE" "$1"
+        grep -qF "Copyright (c) 2019 Yibo Cai" "$1"
+        grep -qF "  file: xxHash-LICENSE" "$1"
+        grep -qF "Copyright (c) 2012-2020 Yann Collet" "$1"
         cmp -s "$1" "$2"' \
     - "$out/pgsnare-$version-THIRD-PARTY-NOTICES" "$input/THIRD-PARTY-NOTICES"
 passes "the SBOM of the binaries is an SPDX document that lists a crate of the lock file" \
