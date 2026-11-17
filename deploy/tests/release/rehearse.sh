@@ -125,11 +125,23 @@ refuses "is not the file the build reported" "an input that the build did not re
     env BUILD_SUMS_AMD64="$(printf '%064d' 0)" "$publish" "$version" "$registry" "key=$key" "$input" "$work/never"
 
 mkdir "$work/altered-input"
-cp "$input"/SHA256SUMS-* "$input"/pgsnare-* "$input"/THIRD-PARTY-NOTICES "$work/altered-input/"
+cp "$input"/SHA256SUMS-* "$input"/pgsnare-* "$input"/THIRD-PARTY-NOTICES-* "$work/altered-input/"
 change_byte "$work/altered-input/pgsnare-arm64" 4096
 refuses "does not match its sums" "an input with a changed byte in a binary" \
     "$publish" "$version" "$registry" "key=$key" "$work/altered-input" "$work/never"
 rm -rf "$work/altered-input"
+
+# The two builds hold different notices, each matching its own sums: the
+# sums cannot catch it, only the comparison of the two can.
+mkdir "$work/two-notices"
+cp "$input"/SHA256SUMS-* "$input"/pgsnare-* "$input"/THIRD-PARTY-NOTICES-* "$work/two-notices/"
+change_byte "$work/two-notices/THIRD-PARTY-NOTICES-arm64" 1
+sed --in-place "s/^[0-9a-f]\{64\}  THIRD-PARTY-NOTICES-arm64\$/$(sha256sum -- "$work/two-notices/THIRD-PARTY-NOTICES-arm64" | cut -d' ' -f1)  THIRD-PARTY-NOTICES-arm64/" \
+    "$work/two-notices/SHA256SUMS-arm64"
+refuses "the licence notices of the two builds differ" "an input whose two builds hold different notices" \
+    env BUILD_SUMS_ARM64="$(sha256sum -- "$work/two-notices/SHA256SUMS-arm64" | cut -d' ' -f1)" \
+    "$publish" "$version" "$registry" "key=$key" "$work/two-notices" "$work/never"
+rm -rf "$work/two-notices"
 
 passes "none of the refused inputs left anything in the registry" \
     bash -c '! crane digest "$1" && ! crane digest "$2" && ! crane digest "$3"' \
@@ -157,12 +169,13 @@ chart_reference="$(reference chart)"
 
 for arch in amd64 arm64; do
     name="pgsnare-$version-linux-$arch"
-    passes "the $arch archive holds the binary of the build and the licence, and nothing else" \
+    passes "the $arch archive holds the binary of the build, the licence and the notices, and nothing else" \
         bash -c 'set -euo pipefail
             tar --extract --gzip --to-stdout --file "$1" "$2/pgsnare" | cmp - "$3"
             tar --extract --gzip --to-stdout --file "$1" "$2/LICENSE" | cmp - "$4"
-            [[ "$(tar --list --gzip --file "$1" | wc -l)" -eq 3 ]]' \
-        - "$out/$name.tar.gz" "$name" "$input/pgsnare-$arch" "$root/LICENSE"
+            tar --extract --gzip --to-stdout --file "$1" "$2/THIRD-PARTY-NOTICES" | cmp - "$5"
+            [[ "$(tar --list --gzip --file "$1" | wc -l)" -eq 4 ]]' \
+        - "$out/$name.tar.gz" "$name" "$input/pgsnare-$arch" "$root/LICENSE" "$out/pgsnare-$version-THIRD-PARTY-NOTICES"
     passes "the SBOM of the $arch image is an SPDX document that lists the base" \
         bash -c 'grep -q "\"spdxVersion\":\"SPDX-" "$1" && grep -q "\"name\":\"alpine-baselayout\"" "$1"' \
         - "$out/pgsnare-$version-image-$arch.spdx.json"
@@ -184,7 +197,7 @@ passes "the release holds the licence notices of the dependencies" \
         grep -qF "  file: xxHash-LICENSE" "$1"
         grep -qF "Copyright (c) 2012-2020 Yann Collet" "$1"
         cmp -s "$1" "$2"' \
-    - "$out/pgsnare-$version-THIRD-PARTY-NOTICES" "$input/THIRD-PARTY-NOTICES"
+    - "$out/pgsnare-$version-THIRD-PARTY-NOTICES" "$input/THIRD-PARTY-NOTICES-amd64"
 passes "the SBOM of the binaries is an SPDX document that lists a crate of the lock file" \
     bash -c 'grep -q "\"spdxVersion\":\"SPDX-" "$1" && grep -q "\"name\":\"rustls\"" "$1"' \
     - "$out/pgsnare-$version-crates.spdx.json"

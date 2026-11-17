@@ -47,6 +47,11 @@ impl Config {
     /// - A token with a value that is a canonical UUID whose sixteen bytes
     ///   hold too few distinct values to be searched for in a binary result
     ///   or a binary COPY.
+    /// - A token with a value that PostgreSQL reads as a UUID but does not
+    ///   print as written, because it prints a UUID in lower case and as
+    ///   8-4-4-4-12 only: a value with upper-case digits (unless the token
+    ///   is `case_insensitive`), in braces, or with hyphens elsewhere or
+    ///   none at all.
     /// - A webhook that sends events over plain HTTP, or that would accept
     ///   a plain `http` URL from its environment variable or file.
     /// - An admin or metrics listener that other machines can reach.
@@ -113,6 +118,20 @@ impl Config {
                      distinct values to be searched for in a binary result or a binary \
                      COPY, where unrelated sixteen-byte values would match it by chance: \
                      use a random, generated UUID for that value"
+                );
+                warn(tokens.index(token.origin.index), &message);
+            }
+            let another_form = token
+                .values
+                .iter()
+                .any(|value| a_uuid_in_another_form(value.expose(), token.case_insensitive));
+            if another_form {
+                let id = token.id.as_str();
+                let message = format!(
+                    "the token `{id}` has a value that is a UUID not in the form \
+                     PostgreSQL prints, lower-case 8-4-4-4-12: it has upper-case digits, \
+                     braces, or its hyphens elsewhere or not at all, so a `uuid` column \
+                     never shows the value as written: write the value in that form"
                 );
                 warn(tokens.index(token.origin.index), &message);
             }
@@ -192,6 +211,49 @@ impl Config {
 
         warnings
     }
+}
+
+/// Whether PostgreSQL reads a value as a UUID: in braces or not, the
+/// 32 hex digits in either case, with a hyphen allowed after any group of
+/// four digits but the last.
+fn postgres_reads_as_uuid(value: &str) -> bool {
+    let digits = match value.strip_prefix('{') {
+        Some(inner) => inner.strip_suffix('}'),
+        None => Some(value),
+    };
+    let Some(digits) = digits else {
+        return false;
+    };
+    let mut rest = digits.as_bytes();
+    for pair in 0..16 {
+        let Some((two, after)) = rest.split_first_chunk::<2>() else {
+            return false;
+        };
+        if !two.iter().all(u8::is_ascii_hexdigit) {
+            return false;
+        }
+        rest = after;
+        if pair % 2 == 1 && pair < 15 {
+            rest = rest.strip_prefix(b"-").unwrap_or(rest);
+        }
+    }
+    rest.is_empty()
+}
+
+/// Whether a value is a UUID that PostgreSQL accepts but does not print
+/// as written: it prints lower-case 8-4-4-4-12 only. Upper-case digits in
+/// that form are left alone for a token that ignores the case.
+///
+/// The value as written is then in no text result of a `uuid` column,
+/// and in no binary one either unless it is 8-4-4-4-12: the pattern
+/// [`uuid_bytes`] takes is made from that form alone.
+fn a_uuid_in_another_form(value: &str, case_insensitive: bool) -> bool {
+    if !postgres_reads_as_uuid(value) {
+        return false;
+    }
+    let printed_form = uuid_bytes(value.as_bytes()).is_some();
+    let lower_case = !value.bytes().any(|byte| byte.is_ascii_uppercase());
+    !(printed_form && (lower_case || case_insensitive))
 }
 
 #[cfg(test)]
@@ -320,6 +382,78 @@ events:
                      [00000000-0000-0000-0000-000000000000, 00000000-0000-0000-0000-000000000417]\n"
             )),
             [message("counter")]
+        );
+    }
+
+    #[test]
+    fn a_uuid_token_not_in_its_canonical_form_is_a_warning() {
+        let with = |id: &str, value: &str, case_insensitive: bool| {
+            warnings(&format!(
+                "{BASE}tokens:\n  - id: {id}\n    values: [\"{value}\"]\n    \
+                 case_insensitive: {case_insensitive}\n"
+            ))
+        };
+        let message = |id: &str| {
+            format!(
+                "tokens[0]: the token `{id}` has a value that is a UUID not in the form \
+                 PostgreSQL prints, lower-case 8-4-4-4-12: it has upper-case digits, braces, \
+                 or its hyphens elsewhere or not at all, so a `uuid` column never shows the \
+                 value as written: write the value in that form"
+            )
+        };
+        // Every form PostgreSQL reads besides the one it prints, as a
+        // PostgreSQL 18 server read them.
+        for (id, value) in [
+            ("upper", "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11"),
+            ("one-upper", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380A11"),
+            ("no-hyphens", "a0eebc999c0b4ef8bb6d6bb9bd380a11"),
+            ("braces", "{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}"),
+            ("braces-no-hyphens", "{a0eebc999c0b4ef8bb6d6bb9bd380a11}"),
+            ("every-four", "a0ee-bc99-9c0b-4ef8-bb6d-6bb9-bd38-0a11"),
+            ("braces-elsewhere", "{a0eebc99-9c0b4ef8-bb6d6bb9-bd380a11}"),
+            ("some-hyphens", "a0eebc99-9c0b4ef8bb6d6bb9bd380a11"),
+            ("first-only", "a0ee-bc999c0b4ef8bb6d6bb9bd380a11"),
+        ] {
+            for case_insensitive in [false, true] {
+                // Upper case alone matters not to a token that ignores the
+                // case.
+                if case_insensitive && matches!(id, "upper" | "one-upper") {
+                    assert!(with(id, value, true).is_empty(), "{value}");
+                    continue;
+                }
+                let found = with(id, value, case_insensitive);
+                assert_eq!(found, [message(id)], "{value}");
+                // The warning names the token, never the value it watches
+                // for.
+                assert!(!found[0].contains(value), "{value}");
+                assert!(found[0].contains(&format!("`{id}`")), "{value}");
+            }
+        }
+        // The form PostgreSQL prints warns not, and neither does a value
+        // PostgreSQL does not read as a UUID: such a value is no `uuid`.
+        for (id, value) in [
+            ("canonical", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"),
+            ("urn", "urn:uuid:a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"),
+            ("odd-hyphen", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1-1"),
+            ("third-hyphen", "a0e-ebc99-9c0b-4ef8-bb6d-6bb9bd380a11"),
+            ("two-hyphens", "a0eebc99--9c0b-4ef8-bb6d-6bb9bd380a11"),
+            ("last-hyphen", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11-"),
+            ("one-brace", "{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"),
+            ("short", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1"),
+            ("long", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a110"),
+            ("not-hex", "g0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"),
+        ] {
+            assert!(with(id, value, false).is_empty(), "{value}");
+        }
+        // A value that is not a UUID in any form warns not.
+        assert!(with("mail", "svc.backup.8f3k2q@mail.example", false).is_empty());
+        // One warning per token, however many of its values warn.
+        assert_eq!(
+            warnings(&format!(
+                "{BASE}tokens:\n  - id: forms\n    values: \
+                      [a0eebc999c0b4ef8bb6d6bb9bd380a11, \"{{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}}\"]\n"
+            )),
+            [message("forms")]
         );
     }
 

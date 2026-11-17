@@ -125,6 +125,10 @@ pub(super) struct Kept {
     /// there.
     #[cfg(feature = "rules")]
     parsed: OnceLock<Option<Query>>,
+    /// Where the text comes in the order the tracker read the texts of
+    /// its session, from 1; 0 for a text no tracker holds.
+    #[cfg(feature = "rules")]
+    serial: u64,
 }
 
 #[cfg(test)]
@@ -137,7 +141,7 @@ thread_local! {
 }
 
 impl Kept {
-    fn new(text: &[u8], used: Arc<AtomicUsize>) -> Self {
+    fn new(text: &[u8], used: Arc<AtomicUsize>, #[cfg(feature = "rules")] serial: u64) -> Self {
         Self {
             bytes: text.into(),
             used,
@@ -150,6 +154,8 @@ impl Kept {
             threshold: OnceLock::new(),
             #[cfg(feature = "rules")]
             parsed: OnceLock::new(),
+            #[cfg(feature = "rules")]
+            serial,
         }
     }
 
@@ -157,7 +163,15 @@ impl Kept {
     /// its analysis and that the tracker had no room for.
     #[cfg(feature = "rules")]
     pub(super) fn uncounted(text: &[u8]) -> Arc<Self> {
-        Arc::new(Self::new(text, Arc::new(AtomicUsize::new(text.len()))))
+        Arc::new(Self::new(text, Arc::new(AtomicUsize::new(text.len())), 0))
+    }
+
+    /// Where the text comes in the order the tracker read the texts of its
+    /// session, from 1: a text read later has a larger number. 0 for a
+    /// text no tracker holds.
+    #[cfg(feature = "rules")]
+    pub(super) const fn serial(&self) -> u64 {
+        self.serial
     }
 
     /// Keeps the answer of the parser with the text. The first answer
@@ -417,6 +431,9 @@ pub(super) struct Tracker {
     query_rows: Rows,
     /// The bytes of statement text held.
     used: Arc<AtomicUsize>,
+    /// How many texts the tracker has kept: the serial of the last one.
+    #[cfg(feature = "rules")]
+    kept: u64,
     /// The server skips what the client sends until a `Sync` that has not
     /// been sent yet.
     skipping: bool,
@@ -454,6 +471,13 @@ impl Tracker {
             self.portals.len(),
             self.text_bytes(),
         ]
+    }
+
+    /// The serial of the last text kept, see [`Kept::serial`]: a text kept
+    /// from now on has a larger one.
+    #[cfg(feature = "rules")]
+    pub(super) const fn last_serial(&self) -> u64 {
+        self.kept
     }
 
     /// Whether the tracker has lost its place.
@@ -589,7 +613,7 @@ impl Tracker {
     /// Reads a message of the client: the entry it leaves in the queue,
     /// if any, and the statement it belongs to.
     fn read<'a>(
-        &self,
+        &mut self,
         frame: Frame<'a>,
         in_copy: bool,
     ) -> Result<(Option<Pending>, Statement<'a>), Unexpected> {
@@ -717,12 +741,21 @@ impl Tracker {
     }
 
     /// Keeps a statement text, if it fits.
-    fn keep(&self, text: &[u8]) -> Text {
+    fn keep(&mut self, text: &[u8]) -> Text {
         if text.len() > MAX_TEXT_BYTES.saturating_sub(self.text_bytes()) {
             return None;
         }
         self.used.fetch_add(text.len(), Ordering::Relaxed);
-        Some(Arc::new(Kept::new(text, Arc::clone(&self.used))))
+        #[cfg(feature = "rules")]
+        {
+            self.kept = self.kept.saturating_add(1);
+        }
+        Some(Arc::new(Kept::new(
+            text,
+            Arc::clone(&self.used),
+            #[cfg(feature = "rules")]
+            self.kept,
+        )))
     }
 
     /// The statement that runs a COPY the server has announced.

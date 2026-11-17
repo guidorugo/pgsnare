@@ -111,6 +111,10 @@ pub enum ParseFailure {
     /// A `FunctionCall` message: it names the function by a number, which
     /// no rule can tie to a name.
     FunctionCall,
+    /// A `Bind` of a named prepared statement, after the session prepared,
+    /// deallocated or discarded statements with SQL: what the protocol
+    /// stored under the name may not be what the database runs under it.
+    Renamed,
 }
 
 impl ParseFailure {
@@ -132,6 +136,7 @@ impl ParseFailure {
             Self::TimedOut => "timed_out",
             Self::OpaqueBody => "opaque_body",
             Self::FunctionCall => "function_call",
+            Self::Renamed => "renamed",
         }
     }
 }
@@ -530,6 +535,7 @@ mod tests {
             (ParseFailure::TimedOut, "timed_out"),
             (ParseFailure::OpaqueBody, "opaque_body"),
             (ParseFailure::FunctionCall, "function_call"),
+            (ParseFailure::Renamed, "renamed"),
         ] {
             assert_eq!(failure.name(), name);
             assert_eq!(failure.to_string(), name);

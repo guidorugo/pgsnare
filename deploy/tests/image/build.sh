@@ -10,9 +10,11 @@
 #
 #   pgsnare-image-ARCH.tar   the image, as `docker save` writes it
 #   pgsnare-ARCH             the binary that the `binary` stage exports
-#   THIRD-PARTY-NOTICES      the licence notices the image holds, taken
-#                            from the image, the same for both
-#                            architectures
+#   THIRD-PARTY-NOTICES-ARCH the licence notices the image holds, taken
+#                            from the image, the same content for both
+#                            architectures; the name carries the
+#                            architecture so that one build never
+#                            overwrites the file of the other
 #   SHA256SUMS-ARCH          the sums of all of the above
 #
 # ARCHITECTURE, when given, must be the architecture of this machine: the
@@ -72,9 +74,9 @@ echo "build: the notices for $arch"
 container="$("$docker" create "$tag")"
 "$docker" cp --follow-link "$container:/usr/share/doc/pgsnare/THIRD-PARTY-NOTICES" "$work/notices" >/dev/null
 "$docker" rm "$container" >/dev/null
-install --mode 0644 "$work/notices" "$out/THIRD-PARTY-NOTICES"
+install --mode 0644 "$work/notices" "$out/THIRD-PARTY-NOTICES-$arch"
 
 "$docker" save --output "$out/pgsnare-image-$arch.tar" "$tag"
 install --mode 0755 "$work/binary/pgsnare" "$out/pgsnare-$arch"
-(cd "$out" && sha256sum "pgsnare-image-$arch.tar" "pgsnare-$arch" THIRD-PARTY-NOTICES > "SHA256SUMS-$arch")
+(cd "$out" && sha256sum "pgsnare-image-$arch.tar" "pgsnare-$arch" "THIRD-PARTY-NOTICES-$arch" > "SHA256SUMS-$arch")
 sed 's/^/build: /' "$out/SHA256SUMS-$arch"

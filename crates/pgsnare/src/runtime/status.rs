@@ -134,7 +134,7 @@ const ACTION_COUNT: usize = 4;
 
 /// The reasons a statement had no analysis that are counted apart, and one
 /// more for a reason this build does not know.
-const PARSE_FAILURE_REASON_COUNT: usize = 15;
+const PARSE_FAILURE_REASON_COUNT: usize = 16;
 
 /// The names of [`Counters::parse_failure_reasons`], in its order: the
 /// names the session logic gives its reasons, and `other`. The list is
@@ -154,6 +154,7 @@ const PARSE_FAILURE_REASON_NAMES: [&str; PARSE_FAILURE_REASON_COUNT] = [
     "timed_out",
     "opaque_body",
     "function_call",
+    "renamed",
     "other",
 ];
 
@@ -254,7 +255,7 @@ pub struct Counters {
     pub parse_failures: u64,
     /// The same statements by the reason there was no analysis, in the
     /// order of [`Counters::PARSE_FAILURE_REASONS`].
-    pub parse_failure_reasons: [u64; 15],
+    pub parse_failure_reasons: [u64; 16],
     /// Reloads that were refused, so that the policy stayed as it was.
     pub reload_failures: u64,
     /// What the parser threads of the SQL rules have done. All zero in a
@@ -307,7 +308,7 @@ impl Counters {
 
     /// The names of the reasons in [`Counters::parse_failure_reasons`].
     /// The last one stands for every reason this build does not know.
-    pub const PARSE_FAILURE_REASONS: [&'static str; 15] = PARSE_FAILURE_REASON_NAMES;
+    pub const PARSE_FAILURE_REASONS: [&'static str; 16] = PARSE_FAILURE_REASON_NAMES;
 
     /// How many statements had no analysis for the reason of this name.
     /// A name that is not in [`Counters::PARSE_FAILURE_REASONS`] has none.
@@ -1123,6 +1124,7 @@ mod tests {
             ParseFailure::TimedOut,
             ParseFailure::OpaqueBody,
             ParseFailure::FunctionCall,
+            ParseFailure::Renamed,
         ];
         let status = Status::new();
         for reason in reasons {

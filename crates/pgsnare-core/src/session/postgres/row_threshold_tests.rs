@@ -439,3 +439,37 @@ fn after_a_statement_that_was_passed_on_unread_every_result_is_held_to_the_thres
     harness.server(&rows(0, 4));
     assert_eq!(threshold_hits(&harness).len(), 1);
 }
+
+#[test]
+fn a_cursor_declared_in_sql_under_the_name_of_a_portal_is_held_to_the_threshold() {
+    let mut harness = session(policy(threshold(3, ALERT)));
+    run(&mut harness, "BEGIN");
+    harness.server(&join(&[&complete("BEGIN"), &ready(b'T')]));
+    // A portal of a statement that reads no listed table, which the
+    // tracker keeps while the transaction is open.
+    judge(&mut harness, &parse("s", "SELECT 1"), "SELECT 1");
+    harness.client(&join(&[&bind("p", "s"), &sync()]));
+    harness.server(&join(&[
+        &frame(backend::tag::PARSE_COMPLETE, b""),
+        &frame(backend::tag::BIND_COMPLETE, b""),
+        &ready(b'T'),
+    ]));
+    // SQL closes the portal and declares a cursor under its name: the
+    // cursor is the portal now.
+    run(
+        &mut harness,
+        "CLOSE p; DECLARE p CURSOR FOR SELECT * FROM users",
+    );
+    harness.server(&join(&[
+        &complete("CLOSE CURSOR"),
+        &complete("DECLARE CURSOR"),
+        &ready(b'T'),
+    ]));
+    assert!(threshold_hits(&harness).is_empty());
+
+    harness.client(&join(&[&execute_some("p", 0), &sync()]));
+    harness.server(&rows(0, 3));
+    assert!(threshold_hits(&harness).is_empty());
+    harness.server(&rows(3, 1));
+    assert_eq!(threshold_hits(&harness).len(), 1);
+}

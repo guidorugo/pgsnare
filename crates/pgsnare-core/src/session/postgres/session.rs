@@ -793,6 +793,21 @@ impl PostgresSession {
         let mut rewritten: Option<Vec<u8>> = None;
         let mut accepted = false;
 
+        // While the login is in progress the client sends nothing but an
+        // authentication response and Terminate. A statement it slips in
+        // would run once the login is done, without the inspector having
+        // seen it.
+        if from == Direction::FromClient
+            && !matches!(
+                frame.tag(),
+                frontend::tag::AUTHENTICATION_RESPONSE | frontend::tag::TERMINATE
+            )
+        {
+            return Err(Fault::new(
+                "the client sent a message other than a login message before the login finished",
+            ));
+        }
+
         if from == Direction::FromServer {
             match frame.tag() {
                 backend::tag::NEGOTIATE_PROTOCOL_VERSION => {

@@ -1158,8 +1158,14 @@ impl Inspector for Scanner {
         // passed on, do the rules ask about its statement.
         #[cfg(feature = "rules")]
         let verdict = if verdict == Verdict::Forward && direction == Direction::FromClient {
-            self.rules
-                .client(frame, &place, &self.ledger, client_can_be_told, out)
+            self.rules.client(
+                frame,
+                &place,
+                &self.ledger,
+                client_can_be_told,
+                self.tracker.last_serial(),
+                out,
+            )
         } else {
             verdict
         };
@@ -1206,7 +1212,13 @@ impl Inspector for Scanner {
         // A statement that arrives in parts cannot be held for the rules.
         #[cfg(feature = "rules")]
         let blocked = match direction {
-            Direction::FromClient => self.rules.client_chunked(tag, &place, &self.ledger, out),
+            Direction::FromClient => self.rules.client_chunked(
+                tag,
+                &place,
+                &self.ledger,
+                self.tracker.last_serial(),
+                out,
+            ),
             Direction::FromServer => {
                 self.rules.server_chunked(tag);
                 false

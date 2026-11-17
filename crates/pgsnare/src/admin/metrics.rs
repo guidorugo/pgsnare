@@ -716,7 +716,7 @@ pub(crate) mod tests {
                 Some(0.0)
             );
         }
-        assert_eq!(Counters::PARSE_FAILURE_REASONS.len(), 15);
+        assert_eq!(Counters::PARSE_FAILURE_REASONS.len(), 16);
         for reason in Counters::PARSE_FAILURE_REASONS {
             assert_eq!(
                 value(
