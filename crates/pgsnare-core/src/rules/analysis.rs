@@ -88,6 +88,11 @@ impl StatementFlags {
     /// `CREATE PROCEDURE`. A later statement reaches the same rows by that
     /// name.
     pub const STORES: Self = Self(128);
+    /// A statement that makes or removes prepared statements by SQL:
+    /// `PREPARE`, `DEALLOCATE`, `DISCARD`. Such a statement shares its
+    /// names with the statements of the protocol, so a name a `Parse` gave
+    /// a text may stand for another text from then on.
+    pub const PREPARES: Self = Self(256);
 
     /// Whether every flag in `other` is set here too.
     #[must_use]

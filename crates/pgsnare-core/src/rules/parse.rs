@@ -239,8 +239,12 @@ impl Walker {
                 .analysis
                 .add_flags(StatementFlags::OPAQUE_BODY.union(StatementFlags::STORES)),
             "ExecuteStmt" | "FetchStmt" => self.analysis.add_flags(StatementFlags::RUNS_STORED),
-            // `DISCARD ALL` sets every setting back.
-            "DiscardStmt" => self.analysis.add_flags(StatementFlags::SETTINGS),
+            // `DISCARD ALL` sets every setting back, and deallocates every
+            // prepared statement. Every form of it is taken for that one.
+            "DiscardStmt" => self
+                .analysis
+                .add_flags(StatementFlags::SETTINGS.union(StatementFlags::PREPARES)),
+            "PrepareStmt" | "DeallocateStmt" => self.analysis.add_flags(StatementFlags::PREPARES),
             "ViewStmt" | "CreateTableAsStmt" | "IntoClause" | "RuleStmt" => {
                 self.analysis.add_flags(StatementFlags::STORES);
             }

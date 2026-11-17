@@ -674,6 +674,43 @@ fn a_statement_that_stores_a_query_or_code_says_so() {
 }
 
 #[test]
+fn a_statement_that_prepares_or_removes_prepared_statements_says_so() {
+    for sql in [
+        "PREPARE s AS SELECT 1",
+        "PREPARE s (int) AS SELECT * FROM t WHERE a = $1",
+        "DEALLOCATE s",
+        "DEALLOCATE PREPARE s",
+        "DEALLOCATE ALL",
+        "DISCARD ALL",
+        "DISCARD PLANS",
+        // These leave prepared statements alone, and are taken for
+        // `DISCARD ALL` all the same.
+        "DISCARD TEMP",
+        "DISCARD SEQUENCES",
+        "SELECT 1; DEALLOCATE s; PREPARE s AS SELECT 2",
+    ] {
+        assert!(
+            read(sql).flags().contains(StatementFlags::PREPARES),
+            "{sql}"
+        );
+    }
+    for sql in [
+        "SELECT 1",
+        "EXECUTE s",
+        "EXPLAIN EXECUTE s(1)",
+        "SELECT 'DEALLOCATE s'",
+        "DECLARE c CURSOR FOR SELECT 1",
+        "CLOSE c",
+        "RESET ALL",
+    ] {
+        assert!(
+            !read(sql).flags().contains(StatementFlags::PREPARES),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn the_flags_tell_what_else_a_statement_does() {
     let flags = |sql: &str| read(sql).flags();
     assert_eq!(flags("SELECT 1"), StatementFlags::NONE);

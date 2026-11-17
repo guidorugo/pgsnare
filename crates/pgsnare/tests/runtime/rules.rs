@@ -238,7 +238,7 @@ async fn a_statement_is_analysed_before_it_reaches_the_database() {
 
     let counters = proxy.status.counters();
     assert_eq!(counters.parse_failures, 0);
-    assert_eq!(counters.parse_failure_reasons, [0; 15]);
+    assert_eq!(counters.parse_failure_reasons, [0; 16]);
     // The counters of the parser threads are shown with the others.
     let parser = counters.parser;
     assert_eq!(

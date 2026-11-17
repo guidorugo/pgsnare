@@ -792,6 +792,194 @@ pub(super) mod with_rules {
     }
 
     // -----------------------------------------------------------------------
+    // Statements prepared with SQL
+    // -----------------------------------------------------------------------
+
+    fn rule_hit_count(harness: &Harness) -> usize {
+        harness
+            .effects
+            .iter()
+            .filter(|effect| matches!(effect, Effect::RuleHit { .. }))
+            .count()
+    }
+
+    /// Sends `messages`, which carry the statement `sql`, and answers with
+    /// what the parser makes of it; then the server answers with `reply`.
+    fn analysed(harness: &mut Harness, messages: &[u8], sql: &str, reply: &[u8]) {
+        harness.client(messages);
+        let requests = asked(harness);
+        assert_eq!(requests.len(), 1, "{sql}");
+        assert_eq!(requests[0].1, sql.as_bytes(), "{sql}");
+        answer(harness, requests[0].0, Ok(analysis(sql)));
+        harness.server(reply);
+    }
+
+    /// The answer of the server to a `Parse` and a `Sync`.
+    fn parsed() -> Vec<u8> {
+        join(&[&frame(b'1', b""), &frame(b'Z', b"I")])
+    }
+
+    /// The answer of the server to a `Query` of these commands.
+    fn completed(tags: &[&str]) -> Vec<u8> {
+        let mut reply = Vec::new();
+        for tag in tags {
+            reply.extend(frame(b'C', &join(&[tag.as_bytes(), b"\0"])));
+        }
+        reply.extend(frame(b'Z', b"I"));
+        reply
+    }
+
+    #[test]
+    fn a_named_statement_replaced_with_sql_is_not_judged_by_its_old_text() {
+        let harmless = "SELECT 1";
+        let replaced = "DEALLOCATE s; PREPARE s AS SELECT pg_sleep(1)";
+        let run = join(&[&bind("", "s"), &execute(""), &sync()]);
+        for on_failure in POLICIES {
+            let mut harness = session(policy(on_failure));
+            analysed(
+                &mut harness,
+                &join(&[&parse("s", harmless), &sync()]),
+                harmless,
+                &parsed(),
+            );
+            assert_eq!(rule_hit_count(&harness), 0);
+            // The rule judges the text that prepares the statement.
+            analysed(
+                &mut harness,
+                &query(replaced),
+                replaced,
+                &completed(&["DEALLOCATE", "PREPARE"]),
+            );
+            assert_eq!(rule_hit_count(&harness), 1, "{on_failure:?}");
+            assert!(failures(&harness).is_empty());
+
+            // The name no longer stands for the text of the `Parse`.
+            let before = harness.to_server.clone();
+            harness.to_client.clear();
+            harness.effects.clear();
+            harness.client(&run);
+            assert!(asked(&mut harness).is_empty());
+            assert_failed(
+                &harness,
+                on_failure,
+                ParseFailure::Renamed,
+                "Bind",
+                &before,
+                &join(&[&before, &run]),
+            );
+            assert_eq!(rule_hit_count(&harness), 0);
+            // The event does not show the text the name had.
+            for event in failure_events(&harness) {
+                let query = event.query.as_ref().unwrap();
+                assert!(!query.known, "{on_failure:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn after_discard_all_a_named_statement_has_no_analysis() {
+        let sql = "SELECT 2";
+        let mut harness = session(policy(OnParseFailure::Alert));
+        analysed(
+            &mut harness,
+            &join(&[&parse("s2", sql), &sync()]),
+            sql,
+            &parsed(),
+        );
+        analysed(
+            &mut harness,
+            &query("DISCARD ALL"),
+            "DISCARD ALL",
+            &completed(&["DISCARD ALL"]),
+        );
+        assert!(failures(&harness).is_empty());
+
+        harness.client(&join(&[&bind("p", "s2"), &execute("p"), &sync()]));
+        assert_eq!(
+            failures(&harness),
+            [(ParseFailure::Renamed, ActionSet::ALERT)]
+        );
+        assert_eq!(failure_events(&harness).len(), 1);
+        harness.server(&join(&[
+            &frame(b'2', b""),
+            &frame(b'C', b"SELECT 1\0"),
+            &frame(b'Z', b"I"),
+        ]));
+
+        // A new `Parse` of the name is analysed, and the name is still
+        // not trusted.
+        harness.effects.clear();
+        analysed(
+            &mut harness,
+            &join(&[&parse("s2", sql), &sync()]),
+            sql,
+            &parsed(),
+        );
+        assert!(failures(&harness).is_empty());
+        harness.client(&join(&[&bind("", "s2"), &execute(""), &sync()]));
+        assert_eq!(
+            failures(&harness),
+            [(ParseFailure::Renamed, ActionSet::ALERT)]
+        );
+    }
+
+    #[test]
+    fn a_named_bind_that_arrives_in_parts_after_sql_prepared_has_no_analysis() {
+        let value = vec![b'a'; LIMIT];
+        let length = i32::try_from(value.len()).unwrap().to_be_bytes();
+        let large = frame(
+            b'B',
+            &join(&[b"\0s\0", &[0, 0, 0, 1], &length, &value, &[0, 0]]),
+        );
+        let mut harness = session(policy(OnParseFailure::Block));
+        analysed(
+            &mut harness,
+            &query("DEALLOCATE ALL"),
+            "DEALLOCATE ALL",
+            &completed(&["DEALLOCATE ALL"]),
+        );
+        let before = harness.to_server.clone();
+        harness.effects.clear();
+        harness.client(&large);
+        assert_eq!(failures(&harness), [(ParseFailure::Renamed, blocked())]);
+        assert!(harness.session.is_closed());
+        assert_eq!(harness.to_server, before);
+    }
+
+    #[test]
+    fn the_unnamed_statement_is_analysed_as_before_after_sql_prepared() {
+        let sql = "SELECT pg_sleep(1)";
+        let mut harness = session(policy(OnParseFailure::Block));
+        analysed(
+            &mut harness,
+            &query("DEALLOCATE ALL"),
+            "DEALLOCATE ALL",
+            &completed(&["DEALLOCATE ALL"]),
+        );
+        let rest = join(&[&bind("", ""), &execute(""), &sync()]);
+        harness.client(&join(&[&parse("", sql), &rest]));
+        let requests = asked(&mut harness);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1, sql.as_bytes());
+        answer(&mut harness, requests[0].0, Ok(analysis(sql)));
+        // The rule judges the statement, and nothing else is raised.
+        assert_eq!(rule_hit_count(&harness), 1);
+        assert!(failures(&harness).is_empty());
+        assert!(!harness.session.is_closed());
+        assert!(
+            harness
+                .to_server
+                .ends_with(&join(&[&parse("", sql), &rest]))
+        );
+
+        // Its `Execute` changes no setting: a statement sent before the
+        // server answers is analysed.
+        harness.client(&query("SELECT 3"));
+        assert_eq!(asked(&mut harness).len(), 1);
+        assert!(failures(&harness).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
     // Honeytokens are found whatever the parser does
     // -----------------------------------------------------------------------
 

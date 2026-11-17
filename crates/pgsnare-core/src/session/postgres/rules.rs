@@ -109,6 +109,7 @@
 //! | The parser threads were busy, did not answer in time, or one panicked | when the runtime answers |
 //! | The statement carries code as a string: `DO`, `CREATE FUNCTION`, `CREATE PROCEDURE` | when the runtime answers |
 //! | A `FunctionCall` message, in a session the rule about functions applies to | at once |
+//! | A `Bind` of a named statement, after SQL prepared, deallocated or discarded statements in the session | at once |
 //!
 //! - `allow`: the statement goes on.
 //! - `alert`: the statement goes on, and a `parse_failure` event is raised.
@@ -132,6 +133,26 @@
 //! A `FunctionCall` message names its function by the number the database
 //! gave it, which no rule can compare with a name. Where the rule about
 //! functions applies, the message is a statement without an analysis.
+//!
+//! # A statement prepared with SQL
+//!
+//! A statement prepared with a `Parse` and one prepared with the SQL
+//! `PREPARE` share one set of names. The tracker follows the protocol
+//! only, so after `DEALLOCATE s; PREPARE s AS ...` it still holds, for
+//! `s`, the text of the `Parse`, and the analysis of that text.
+//!
+//! So once the analysis of any statement of the session shows a
+//! `PREPARE`, a `DEALLOCATE` or a `DISCARD` (every form of each), no
+//! named statement of the session is trusted again: every later `Bind`
+//! of one is a statement without an analysis, of the reason `renamed`,
+//! even when a `Parse` has given the name a text since. From the first
+//! such `Bind` that goes on, every result of the session is held to the
+//! row threshold, and every `Execute` may change a setting. The unnamed
+//! statement goes on as before: SQL cannot make it. A `Bind` that arrives in parts shows no
+//! name, and counts as one of a named statement.
+//!
+//! The statement that prepares was judged when it arrived, with the
+//! statement it prepares, whatever else its analysis shows.
 //!
 //! # What the database reads
 //!
@@ -469,6 +490,15 @@ pub(super) struct Hook {
     /// code that reaches a table of the row threshold. From then on every
     /// result is held to the threshold, whatever its statement names.
     wide: bool,
+    /// The analysis of a statement of the session showed an SQL
+    /// `PREPARE`, `DEALLOCATE` or `DISCARD`. From then on, what the
+    /// tracker holds for a named statement may not be what the database
+    /// runs under that name, and a `Bind` of one has no analysis.
+    renamed: bool,
+    /// A `Bind` of a named statement was passed on after `renamed`. A
+    /// portal may run a statement no analysis shows, so every `Execute`
+    /// from then on may change a setting.
+    bound_renamed: bool,
 }
 
 /// Who the statements of a session come from.
@@ -697,11 +727,12 @@ impl Hook {
                 return self.function_call(place, ledger, client_can_be_told, out);
             }
             frontend::tag::EXECUTE => {
-                if runs_unread(place.statement) {
+                if self.bound_renamed || runs_unread(place.statement) {
                     self.reading.may_have_changed();
                 }
                 return Verdict::Forward;
             }
+            frontend::tag::BIND => return self.bind(frame, place, ledger, client_can_be_told, out),
             _ => return Verdict::Forward,
         };
         // A `Query` runs its statement now. A `Parse` stores it, and the
@@ -801,8 +832,49 @@ impl Hook {
         }
     }
 
+    /// A whole `Bind` of the client. Once the session has prepared,
+    /// deallocated or discarded statements with SQL, a `Bind` of a named
+    /// statement has no analysis, whatever the tracker holds for the name.
+    /// The unnamed statement is not affected: SQL cannot make it.
+    fn bind(
+        &mut self,
+        frame: Frame<'_>,
+        place: &Place<'_>,
+        ledger: &Ledger,
+        client_can_be_told: bool,
+        out: &mut Output,
+    ) -> Verdict {
+        if !self.renamed {
+            return Verdict::Forward;
+        }
+        // A `Bind` that cannot be read is taken for one of a named
+        // statement.
+        if frontend::Bind::from_frame(frame).is_ok_and(|bind| bind.statement().is_empty()) {
+            return Verdict::Forward;
+        }
+        self.bound_renamed = true;
+        let context = place.context;
+        let Some(rules) = rules_for(context) else {
+            return Verdict::Forward;
+        };
+        // The text the tracker holds for the name may not be the one that
+        // runs, so the event does not show it.
+        let unknown = Place {
+            statement: &Statement::Unknown,
+            ..*place
+        };
+        let actions = raise(ParseFailure::Renamed, rules, &unknown, ledger, out);
+        if actions.contains(Action::Kill) {
+            block(context, client_can_be_told, out)
+        } else {
+            self.wide = true;
+            Verdict::Forward
+        }
+    }
+
     /// The header of a `Query`, `Parse` or `FunctionCall` of the client
-    /// that arrives in parts: it cannot be held, so it has no analysis.
+    /// that arrives in parts: it cannot be held, so it has no analysis. So
+    /// has a `Bind` after SQL prepared statements, see [`Hook::bind`].
     /// Returns whether the session must end before the message is passed
     /// on.
     pub(super) fn client_chunked(
@@ -829,6 +901,12 @@ impl Hook {
                 ParseFailure::FunctionCall,
                 Self::blind_to_calls(place.context),
             ),
+            // The name is in a part not seen here: it counts as one of a
+            // named statement.
+            frontend::tag::BIND if self.renamed => {
+                self.bound_renamed = true;
+                (ParseFailure::Renamed, rules_for(place.context))
+            }
             _ => return false,
         };
         let Some(rules) = rules else {
@@ -856,6 +934,10 @@ impl Hook {
         let Some(waiting) = self.waiting.take_if(|waiting| waiting.id == id) else {
             return Ok(None);
         };
+        // The flags of an analysis hold even when one of its lists is full.
+        if matches!(&outcome, Ok(analysis) if analysis.flags().contains(StatementFlags::PREPARES)) {
+            self.renamed = true;
+        }
         // An analysis with a full list does not tell everything the
         // statement touches: it is no analysis.
         let outcome = outcome.and_then(|analysis| {
