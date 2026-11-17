@@ -677,6 +677,72 @@ fn a_value_is_found_just_below_and_just_above_the_limit_for_held_messages() {
 }
 
 // ---------------------------------------------------------------------------
+// The binary form of a UUID
+// ---------------------------------------------------------------------------
+
+const UUID_ID: &str = "row-uuid";
+const UUID: &str = "f81d4fae-7dec-11d0-a765-00a0c91e6bf6";
+const UUID_BYTES: [u8; 16] = [
+    0xf8, 0x1d, 0x4f, 0xae, 0x7d, 0xec, 0x11, 0xd0, 0xa7, 0x65, 0x00, 0xa0, 0xc9, 0x1e, 0x6b, 0xf6,
+];
+const NIL_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+/// A session that has logged in as `app`, under the given policy.
+fn established_under(policy: PolicySnapshot) -> Harness {
+    let mut harness = Harness::logged_in(
+        policy,
+        &[
+            (b"user", b"app"),
+            (b"database", b"shop"),
+            (b"application_name", b"psql"),
+        ],
+    );
+    assert!(harness.hits().is_empty());
+    harness
+}
+
+#[test]
+fn a_uuid_token_is_found_in_the_binary_form_of_a_bind_parameter() {
+    let mut harness = established_under(policy_of(1, &[(UUID_ID, UUID, false)], LIMIT));
+    let message = bind(1, &UUID_BYTES);
+    harness.client(&message);
+    assert_eq!(harness.to_server, message);
+    assert_eq!(harness.hits(), [hit(UUID_ID, FromClient, "Bind")]);
+}
+
+#[test]
+fn a_uuid_token_is_found_when_its_sixteen_bytes_are_split_across_two_copy_data() {
+    let (first, second) = UUID_BYTES.split_at(8);
+    let mut harness = established_under(policy_of(1, &[(UUID_ID, UUID, false)], LIMIT));
+    // COPY ... FROM STDIN (FORMAT binary): one column of sixteen bytes.
+    harness.server(&frame(b'G', &[0, 0, 0]));
+    harness.client(&copy_data(&join(&[&[0, 1], &[0, 0, 0, 16], first])));
+    assert!(harness.hits().is_empty());
+    harness.client(&copy_data(second));
+    assert_eq!(harness.hits(), [hit(UUID_ID, FromClient, "CopyData")]);
+}
+
+#[test]
+fn a_uuid_token_with_little_variety_raises_no_hit_in_its_sixteen_bytes() {
+    let mut harness = established_under(policy_of(1, &[(UUID_ID, NIL_UUID, false)], LIMIT));
+    // The nil UUID's sixteen bytes are all NUL: ordinary in binary traffic.
+    let message = bind(1, &[0; 16]);
+    harness.client(&message);
+    assert_eq!(harness.to_server, message);
+    assert!(harness.hits().is_empty());
+    // Neither the copy data of a binary copy, split across two messages.
+    let (first, second) = [0; 16].split_at(8);
+    harness.server(&frame(b'G', &[0, 0, 0]));
+    harness.client(&copy_data(first));
+    assert!(harness.hits().is_empty());
+    harness.client(&copy_data(second));
+    assert!(harness.hits().is_empty());
+    // The text form is still looked for.
+    harness.client(&frame(b'Q', format!("SELECT '{NIL_UUID}'\0").as_bytes()));
+    assert_eq!(harness.hits(), [hit(UUID_ID, FromClient, "Query")]);
+}
+
+// ---------------------------------------------------------------------------
 // The policy in force
 // ---------------------------------------------------------------------------
 
