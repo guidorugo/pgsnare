@@ -47,6 +47,12 @@ impl Config {
     /// - A token with a value that is a canonical UUID whose sixteen bytes
     ///   hold too few distinct values to be searched for in a binary result
     ///   or a binary COPY.
+    /// - A token with a value that is a UUID in a form other than its
+    ///   canonical 8-4-4-4-12: the sixteen hex digits without hyphens,
+    ///   the hyphenless or the canonical form in braces, or either of
+    ///   the two with the prefix `urn:uuid:`. PostgreSQL accepts such a
+    ///   value but prints the canonical form, which the token does not
+    ///   watch for in text or in its sixteen bytes.
     /// - A webhook that sends events over plain HTTP, or that would accept
     ///   a plain `http` URL from its environment variable or file.
     /// - An admin or metrics listener that other machines can reach.
@@ -113,6 +119,21 @@ impl Config {
                      distinct values to be searched for in a binary result or a binary \
                      COPY, where unrelated sixteen-byte values would match it by chance: \
                      use a random, generated UUID for that value"
+                );
+                warn(tokens.index(token.origin.index), &message);
+            }
+            let another_form = token
+                .values
+                .iter()
+                .any(|value| a_uuid_in_another_form(value.expose()));
+            if another_form {
+                let id = token.id.as_str();
+                let message = format!(
+                    "the token `{id}` has a value that is a UUID written without its \
+                     hyphens, in braces, or with a `urn:uuid:` prefix, and PostgreSQL \
+                     prints such a value in its canonical form, where the token is \
+                     found neither as text nor as its sixteen bytes: write the value in \
+                     the canonical form 8-4-4-4-12"
                 );
                 warn(tokens.index(token.origin.index), &message);
             }
@@ -192,6 +213,26 @@ impl Config {
 
         warnings
     }
+}
+
+/// Whether a value is a UUID in one of the forms PostgreSQL accepts
+/// besides its canonical 8-4-4-4-12: the sixteen hex digits without
+/// hyphens, the hyphenless or the canonical form in braces, and either
+/// of the two with the prefix `urn:uuid:`.
+///
+/// In all other forms PostgreSQL prints the canonical form, which the
+/// value as written does not hold, so the token is found neither as text
+/// nor as its sixteen bytes, the pattern [`uuid_bytes`] takes from the
+/// canonical form alone.
+fn a_uuid_in_another_form(value: &str) -> bool {
+    let hex32 = |text: &str| text.len() == 32 && text.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let uuid_text = |text: &str| hex32(text) || uuid_bytes(text.as_bytes()).is_some();
+    let braced = value
+        .strip_prefix('{')
+        .and_then(|text| text.strip_suffix('}'))
+        .is_some_and(uuid_text);
+    let urn = value.strip_prefix("urn:uuid:").is_some_and(uuid_text);
+    hex32(value) || braced || urn
 }
 
 #[cfg(test)]
@@ -320,6 +361,53 @@ events:
                      [00000000-0000-0000-0000-000000000000, 00000000-0000-0000-0000-000000000417]\n"
             )),
             [message("counter")]
+        );
+    }
+
+    #[test]
+    fn a_uuid_token_not_in_its_canonical_form_is_a_warning() {
+        let with = |id: &str, value: &str| {
+            warnings(&format!(
+                "{BASE}tokens:\n  - id: {id}\n    values: [\"{value}\"]\n"
+            ))
+        };
+        let message = |id: &str| {
+            format!(
+                "tokens[0]: the token `{id}` has a value that is a UUID written without its \
+                  hyphens, in braces, or with a `urn:uuid:` prefix, and PostgreSQL prints \
+                  such a value in its canonical form, where the token is found neither as \
+                  text nor as its sixteen bytes: write the value in the canonical form \
+                  8-4-4-4-12"
+            )
+        };
+        // The three forms PostgreSQL accepts besides the canonical one.
+        for (id, value) in [
+            ("no-hyphens", "f81d4fae7dec11d0a76500a0c91e6bf6"),
+            ("braces", "{f81d4fae-7dec-11d0-a765-00a0c91e6bf6}"),
+            ("urn", "urn:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bf6"),
+        ] {
+            let found = with(id, value);
+            assert_eq!(found, [message(id)], "{value}");
+            // The warning names the token, never the value it watches for.
+            assert!(!found[0].contains(value), "{value}");
+            assert!(found[0].contains(&format!("`{id}`")), "{value}");
+        }
+        // The canonical form, in either letter case, warns not.
+        for (id, value) in [
+            ("canonical", "f81d4fae-7dec-11d0-a765-00a0c91e6bf6"),
+            ("upper", "F81D4FAE-7DEC-11D0-A765-00A0C91E6BF6"),
+        ] {
+            assert!(with(id, value).is_empty(), "{value}");
+        }
+        // A value that is not a UUID in any form warns not.
+        assert!(with("mail", "svc.backup.8f3k2q@mail.example").is_empty());
+        // One warning per token, however many of its values warn.
+        assert_eq!(
+            warnings(&format!(
+                "{BASE}tokens:\n  - id: forms\n    values: \
+                      [f81d4fae7dec11d0a76500a0c91e6bf6, \"{{f81d4fae-7dec-11d0-a765-00a0c91e6bf6}}\"]\n"
+            )),
+            [message("forms")]
         );
     }
 
