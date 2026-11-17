@@ -629,6 +629,28 @@ mod tests {
     }
 
     #[test]
+    fn a_seed_of_a_captured_login_in_turns_gets_past_the_login() {
+        // The client waits for `AuthenticationOk` before its statement, as
+        // a real one does; one that does not has its session ended.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/seeds/session/capture-auth-md5-in-turns"
+        );
+        let data = std::fs::read(path).unwrap();
+        let setting = super::Setting::new(data[0], data[1]);
+        let steps = super::cuts(&super::CAPTURES[setting.capture.unwrap()], &data[2..]);
+        let run = super::play(setting, &steps, false);
+        assert_eq!(run.record.error, None);
+        let statement = b"Q\0\0\0\x0dSELECT 1\0";
+        assert!(
+            run.record
+                .to_server
+                .windows(statement.len())
+                .any(|bytes| bytes == statement)
+        );
+    }
+
+    #[test]
     fn a_seed_with_rules_holds_statements() {
         for name in ["rules-simple", "rules-extended", "rules-copy-in-turns"] {
             let path = format!("{}/seeds/session/{name}", env!("CARGO_MANIFEST_DIR"));
