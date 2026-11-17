@@ -2,7 +2,7 @@
 
 pgsnare sits between your applications and one PostgreSQL server. This guide covers the three ways to run it, and the TLS setup that each of them needs. For a first try, start with the [quickstart](quickstart.md).
 
-**No release exists yet.** No image and no chart is published. Until the first release, build the image from [`deploy/Dockerfile`](../deploy/Dockerfile), push it to a registry you control and name it by digest. How a release will be built and checked is in [Verifying a release](verifying-a-release.md) and [Releasing](releasing.md). Everything below that names `ghcr.io/guidorugo` describes where the first release is meant to be published; it is not there today.
+Releases are published on the [releases page](https://github.com/guidorugo/pgsnare/releases): the image as `ghcr.io/guidorugo/pgsnare` and the chart as `ghcr.io/guidorugo/charts/pgsnare`. Name the image by the digest the release lists, and check it first as [Verifying a release](verifying-a-release.md) says. You can also build the image yourself from [`deploy/Dockerfile`](../deploy/Dockerfile).
 
 ## Before you start
 

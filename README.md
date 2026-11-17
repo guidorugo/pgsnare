@@ -3,7 +3,7 @@
 A PostgreSQL proxy that catches data theft with honeytokens.
 
 > [!IMPORTANT]
-> pgsnare is under construction. It finds honeytokens and answers them, and the repository holds a container image definition, a Helm chart, a Compose example and the release procedure, but **no version has been released**: there is no published image, chart or binary yet, and the release procedure has never run for real. The integration tests run `alert`, `kill`, `tarpit`, `fake_data` and a hit delivered to a webhook against PostgreSQL 15 to 18, a reload against PostgreSQL 15, and a detection corpus of 73 cases against each version. Do not rely on pgsnare to protect production data yet.
+> pgsnare is under construction. It finds honeytokens and answers them, and the repository holds a container image definition, a Helm chart, a Compose example and the release procedure, and it is released as an early version: signed binaries, a container image and a chart are on the [releases page](https://github.com/guidorugo/pgsnare/releases) and in the GitHub Container Registry. The integration tests run `alert`, `kill`, `tarpit`, `fake_data` and a hit delivered to a webhook against PostgreSQL 15 to 18, a reload against PostgreSQL 15, and a detection corpus of 73 cases against each version. Do not rely on pgsnare to protect production data yet.
 > [Status and roadmap](#status-and-roadmap) shows what exists today. The design is described in [docs/high-level-design.md](docs/high-level-design.md). To try it, follow the [quickstart](docs/quickstart.md).
 
 ## What it is
@@ -182,7 +182,7 @@ Because pgsnare relays logins instead of terminating them, the TLS setup has to 
 
 **The image.** One static binary on an Alpine base pinned by digest, run by user `65532`, with a health check that calls `pgsnare healthcheck`. It is built for x86_64 and aarch64, with the default features, so it holds the [SQL rules](#sql-rules). **The base has a shell and a package manager**: that is the owner's choice of base. What confines the process is that it is not root, holds no capability and has a read-only root filesystem when started as the chart and the examples start it.
 
-**Releases.** None exists yet. A release will be built only by CI, from a version tag that equals the version in `Cargo.toml` and points at a commit on `main`: the binaries and the image for both architectures, and the chart as an OCI artefact in the GitHub Container Registry (`ghcr.io/guidorugo`), with plain manifests rendered from the chart, checksums, SBOMs, signatures and build provenance. The release procedure is rehearsed on every change against a registry inside the CI runner, with a signing key made for the run; keyless signing, provenance and the real registry have not run. See [Verifying a release](docs/verifying-a-release.md) for how a release will be checked, and [Releasing](docs/releasing.md) for the owner's procedure. The first version is 0.0.1.
+**Releases.** See the [releases page](https://github.com/guidorugo/pgsnare/releases). A release is built only by CI, from a version tag that equals the version in `Cargo.toml` and points at a commit on `main`: the binaries and the image for both architectures, and the chart as an OCI artefact in the GitHub Container Registry (`ghcr.io/guidorugo`), with plain manifests rendered from the chart, checksums, SBOMs, signatures and build provenance. The release procedure is also rehearsed on every change against a registry inside the CI runner, with a signing key made for the run. See [Verifying a release](docs/verifying-a-release.md) for how to check a release, and [Releasing](docs/releasing.md) for the owner's procedure. The first version was 0.0.1.
 
 **Guides.**
 
@@ -206,7 +206,7 @@ Because pgsnare relays logins instead of terminating them, the TLS setup has to 
 
 ## Status and roadmap
 
-pgsnare cannot be relied on yet: it detects and responds, but no version has been released. What exists today:
+pgsnare is an early release: it detects and responds, and has not yet run in production anywhere. What exists today:
 
 - **Relay.** `pgsnare run` puts a proxy between clients and a database: TLS on both legs, logins, simple and extended queries, COPY, replication, notifications, function calls and cancellation, for protocol 3.0 and 3.2. Tests compare what a client sees from PostgreSQL 15 to 18 directly and through pgsnare, in every supported TLS setup.
 - **Detection.** Every message, in both directions, is scanned for honeytoken values before it is forwarded, and so are the startup parameters and the user name at login. A value split across reads, across the chunks of a large message or across `CopyData` messages is found. A hit becomes a `token_hit` event that names the token, the session and the statement.
@@ -232,7 +232,7 @@ The steps to the first release:
 | 2. Detect and alert | Honeytokens, events and sinks. The first usable version | Built: detection, events, sinks, health and metrics. `tarpit` and `fake_data` now run against PostgreSQL 15 to 18, reload against PostgreSQL 15 |
 | 3. Respond | Kill, tarpit, fake data and exemptions | Built: the responses run against PostgreSQL 15 to 18 |
 | 4. SQL rules | Optional checks on the statements themselves | Built, behind the `rules` build feature. The `functions` rule with `kill` and the `catalog_enumeration` rule run against PostgreSQL 15 to 18 |
-| 5. Prove and ship | Detection corpus, fuzzing, benchmarks, container image, Helm chart and documentation | Image, chart, examples, release procedure and guides built; the first release (0.0.1) is not made. The detection corpus runs in the integration tests; the nightly long fuzzing and the nightly benchmark have not run. Not built: a 24-hour soak, a memory test with 10,000 idle connections, the regression suite of PostgreSQL through the proxy, a matrix of client libraries, and a benchmark on a reference machine (the figures a nightly benchmark would give come from shared runners) |
+| 5. Prove and ship | Detection corpus, fuzzing, benchmarks, container image, Helm chart and documentation | Image, chart, examples, release procedure and guides built; released since 0.0.1. The detection corpus runs in the integration tests; the nightly long fuzzing and the nightly benchmark have not run. Not built: a 24-hour soak, a memory test with 10,000 idle connections, the regression suite of PostgreSQL through the proxy, a matrix of client libraries, and a benchmark on a reference machine (the figures a nightly benchmark would give come from shared runners) |
 
 Progress is tracked in [the pgsnare epic](https://github.com/guidorugo/pgsnare/issues/2).
 
