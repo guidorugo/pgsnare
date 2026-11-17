@@ -102,6 +102,10 @@ updates:
     cooldown:
       default-days: 7
     ignore:
+      # A new minor version of Python (3.15 to 3.16) is taken by hand, so
+      # that a pre-release is never proposed.
+      - dependency-name: "python"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: "postgres"
         update-types: ["version-update:semver-major"]
       - dependency-name: "kindest/node"
@@ -116,6 +120,10 @@ updates:
     cooldown:
       default-days: 7
     ignore:
+      # A new minor version of Python (3.15 to 3.16) is taken by hand, so
+      # that a pre-release is never proposed.
+      - dependency-name: "python"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: "postgres"
         update-types: ["version-update:semver-major"]
 
