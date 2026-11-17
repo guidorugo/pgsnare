@@ -15,9 +15,9 @@
 //!
 //! - **Honeytoken values**, in every form the matcher finds them in: as
 //!   written, as lowercase hexadecimal digits, as the sixteen bytes of a
-//!   value that is a canonical UUID and, for a token that asks for it, in
-//!   any letter case. The patterns are the matcher's own, so what detection
-//!   finds, redaction removes.
+//!   value that is a canonical UUID of enough byte variety and, for a
+//!   token that asks for it, in any letter case. The patterns are the
+//!   matcher's own, so what detection finds, redaction removes.
 //! - **The beginning of a honeytoken value where a text was cut.** A name
 //!   that is too long for an event is cut and marked, and the cut can fall
 //!   inside a value. What is left of the value is removed with the rest.
@@ -52,7 +52,7 @@ use std::ops::Range;
 use std::sync::{Arc, PoisonError, RwLock};
 
 use aho_corasick::AhoCorasick;
-use pgsnare_core::detect::{BuildError, Matcher, TokenSpec, uuid_bytes};
+use pgsnare_core::detect::{BuildError, Matcher, TokenSpec, uuid_bytes, varied_enough};
 use pgsnare_core::event::{EventBody, TRUNCATION_MARK};
 
 mod fingerprint;
@@ -371,8 +371,10 @@ impl RedactorBuilder {
                 }
                 cut_exact.push(hexadecimal(raw));
                 // The sixteen bytes of a canonical UUID, one of the
-                // matcher's patterns.
-                if let Some(sixteen) = uuid_bytes(raw) {
+                // matcher's patterns, when the bytes carry enough variety
+                // for the matcher to compile them: below it, the matcher
+                // does not search them, and neither does the redactor.
+                if let Some(sixteen) = uuid_bytes(raw).filter(|bytes| varied_enough(bytes)) {
                     cut_exact.push(sixteen);
                 }
             }

@@ -116,6 +116,40 @@ fn the_sixteen_bytes_of_a_uuid_value_are_removed_too() {
     );
 }
 
+/// A redactor that knows a value written as a UUID with little variety.
+/// The matcher compiles no binary pattern for it, and neither does the
+/// redactor.
+fn nil_redactor() -> Redactor {
+    Redactor::builder()
+        .token("nil-uuid", ["00000000-0000-0000-0000-000000000000"], false)
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn the_sixteen_bytes_of_a_uuid_with_little_variety_are_not_removed() {
+    let uuid = "00000000-0000-0000-0000-000000000000";
+    let redactor = nil_redactor();
+    let sixteen = "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+    // The matcher compiles no binary pattern for a UUID with little
+    // variety, and neither does the redactor: a text that holds the
+    // sixteen zero bytes stays as it is.
+    assert!(matches!(redactor.text(sixteen), Cow::Borrowed(same) if same == sixteen));
+    assert_eq!(
+        redactor.text(&format!("x{sixteen}y")),
+        format!("x{sixteen}y")
+    );
+    // The same at a cut: zero bytes at the end of a cut text are not the
+    // beginning of one of the matcher's patterns.
+    let cut = format!("x{sixteen}{TRUNCATION_MARK}");
+    assert!(matches!(redactor.text(&cut), Cow::Borrowed(same) if same == cut));
+    // What the matcher still finds goes: the text of the value and its
+    // hexadecimal digits.
+    assert_eq!(redactor.text(uuid), REDACTED);
+    let hex = String::from_utf8(hexadecimal(uuid.as_bytes())).unwrap();
+    assert_eq!(redactor.text(&format!("\\x{hex}")), "\\x[redacted]");
+}
+
 #[test]
 fn values_that_touch_or_follow_each_other_are_removed_together() {
     let redactor = redactor();
