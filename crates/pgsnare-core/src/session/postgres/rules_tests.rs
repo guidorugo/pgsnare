@@ -1115,6 +1115,62 @@ pub(super) mod with_rules {
     }
 
     #[test]
+    fn a_function_call_or_a_query_in_parts_makes_older_names_unanalysed() {
+        let call = frame(b'F', &[0, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+        let message = oversized();
+        let (header, body) = message.split_at(5);
+        for parts in [vec![call.as_slice()], vec![header, body]] {
+            let mut harness = session(policy(OnParseFailure::Alert));
+            prepared(&mut harness, "old", "SELECT 1");
+            harness.effects.clear();
+            for part in &parts {
+                harness.client(part);
+            }
+            assert!(asked(&mut harness).is_empty());
+            assert_eq!(failures(&harness).len(), 1);
+            harness.server(&completed(&["SELECT 1"]));
+            // Either may run anything, a `PREPARE old` included.
+            assert_eq!(run(&mut harness, "old"), RENAMED);
+            prepared(&mut harness, "new", "SELECT 2");
+            assert!(run(&mut harness, "new").is_empty());
+        }
+    }
+
+    #[test]
+    fn an_execute_of_an_unknown_portal_makes_names_unanalysed_once_a_change_is_stored() {
+        for stored in [true, false] {
+            let mut harness = session(policy(OnParseFailure::Alert));
+            if stored {
+                prepared(&mut harness, "forget", "DEALLOCATE s");
+            }
+            prepared(&mut harness, "s", "SELECT 1");
+            assert!(run(&mut harness, "s").is_empty(), "{stored}");
+            // A portal the tracker never saw bound: it may run `forget`.
+            harness.client(&join(&[&execute("elsewhere"), &sync()]));
+            harness.server(&join(&[&frame(b'C', b"DEALLOCATE\0"), &frame(b'Z', b"I")]));
+            let expected: &[_] = if stored { &RENAMED } else { &[] };
+            assert_eq!(run(&mut harness, "s"), expected, "{stored}");
+        }
+    }
+
+    #[test]
+    fn a_bind_in_a_later_batch_than_an_unconfirmed_parse_has_no_analysis() {
+        let mut harness = session(policy(OnParseFailure::Alert));
+        ran_sql(&mut harness, "DEALLOCATE s", &["DEALLOCATE"]);
+        // The `Parse` of the name after the change, which the server has
+        // not confirmed yet: it may still refuse it.
+        harness.client(&join(&[&parse("s", "SELECT 1"), &sync()]));
+        let requests = asked(&mut harness);
+        answer(&mut harness, requests[0].0, Ok(analysis("SELECT 1")));
+        harness.effects.clear();
+        harness.client(&join(&[&bind("", "s"), &execute(""), &sync()]));
+        assert_eq!(failures(&harness), RENAMED);
+        // Once confirmed, the name holds its text.
+        harness.server(&join(&[&parsed(), &ran()]));
+        assert!(run(&mut harness, "s").is_empty());
+    }
+
+    #[test]
     fn past_the_most_changed_names_every_name_is_unanalysed() {
         let mut harness = session(policy(OnParseFailure::Alert));
         prepared(&mut harness, "keep", "SELECT 1");
