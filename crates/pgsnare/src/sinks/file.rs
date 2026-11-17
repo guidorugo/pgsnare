@@ -81,8 +81,8 @@ impl FileError {
                 "the file belongs to another user, and events are not written to it"
             }
             Self::OpenToOthers => {
-                "the file can be read, written or executed by users other than its owner, and \
-                 events are not written to it"
+                "the file is open to more than its owner and readers of its group, and events \
+                 are not written to it"
             }
             Self::Linked => "the file has more than one name, and events are not written to it",
         }

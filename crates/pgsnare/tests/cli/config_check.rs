@@ -621,8 +621,8 @@ fn the_file_of_a_file_sink_is_checked_and_never_created() {
     assert_eq!(
         lines(&fixture, &run, "error: "),
         [
-            "events.sinks[1] (file): <dir>/open.jsonl: the file can be read or written by \
-             others than its owner, and events are not written to it"
+            "events.sinks[1] (file): <dir>/open.jsonl: the file is open to more than its owner \
+             and readers of its group, and events are not written to it"
         ]
     );
     run_refuses_it_too(&fixture);
