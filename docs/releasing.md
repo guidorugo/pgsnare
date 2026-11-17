@@ -2,7 +2,7 @@
 
 This is the procedure for the owner of the repository. A release is made by the workflow [`.github/workflows/release.yml`](../.github/workflows/release.yml) and by nothing else: nobody builds or signs one on a machine of their own.
 
-**No release has been made yet.** Everything the workflow does after its build is rehearsed in CI on every change, with a registry inside the runner and a key made for the run (job `release-rehearsal` of the `deploy` workflow). What cannot be rehearsed, and is therefore not verified until the first release candidate: signing with the identity of the workflow, the entry in the public transparency log, the build provenance, pushing to the GitHub Container Registry, and creating the draft of the GitHub release.
+The first release, 0.0.1, ran this procedure in full: signing with the identity of the workflow, the entry in the public transparency log, the build provenance, the push to the GitHub Container Registry and the draft of the GitHub release, each checked afterwards as [Verifying a release](verifying-a-release.md) says. Everything the workflow does after its build is also rehearsed in CI on every change, with a registry inside the runner and a key made for the run (job `release-rehearsal` of the `deploy` workflow).
 
 ## Once, before the first release
 

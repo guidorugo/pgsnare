@@ -7,7 +7,7 @@ The commands below are the ones the smoke test [`examples/compose/smoke.sh`](../
 ## What you need
 
 - Docker with Compose v2.
-- The pgsnare image, named by digest. **No release has been published yet**, so there is no public image to pull. Until there is, build the image from [`deploy/Dockerfile`](../deploy/Dockerfile) and push it to a registry you control, then name it by the digest that registry reports. The example refuses an image given by tag.
+- The pgsnare image, named by digest. Take the digest of the image from the latest release on the [releases page](https://github.com/guidorugo/pgsnare/releases) (the line `image` of its digest list), or build the image from [`deploy/Dockerfile`](../deploy/Dockerfile), push it to a registry you control and name it by the digest that registry reports. The example refuses an image given by tag.
 
 ```sh
 cd examples/compose

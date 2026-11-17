@@ -2,7 +2,7 @@
 
 A release of pgsnare is signed, so that you can check, before you run it, that what you downloaded is what the release workflow of this repository built from a tagged commit. This page says what a release holds and how to check it, by hand or with [`deploy/release/verify.sh`](../deploy/release/verify.sh), which does the same and nothing else.
 
-**No release has been published yet.** The steps below have been run in CI on every change against a rehearsal: the release scripts publish to a registry inside the CI runner and sign with a key made for that run, and `verify.sh` then accepts the result and refuses altered copies of it. What a rehearsal cannot show is the signature of a real release, which is tied to the identity of the workflow instead of a key. Until the first release candidate has been published and verified, treat the commands for that as written from the documentation of the tools and not yet run.
+The steps below were run by hand on release 0.0.1, and every one passed. They also run in CI on every change against a rehearsal: the release scripts publish to a registry inside the CI runner and sign with a key made for that run, and `verify.sh` then accepts the result and refuses altered copies of it.
 
 ## What a release holds
 
