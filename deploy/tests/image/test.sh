@@ -21,9 +21,12 @@
 #      but the home directory of the user belongs to anyone but root,
 #      nothing outside a sticky directory can be written by everybody, no
 #      package manager cache is left, and the CA certificates are there.
-#      (The base has a shell and a package manager: the owner chose it. The
-#      process cannot use them to install anything: it is not root, holds no
-#      capability and has a read-only root filesystem.)
+#      The package manager is gone: there is no /sbin/apk and no file of
+#      its library, of OpenSSL or of zlib, and the database of installed
+#      packages is still there and lists none of apk-tools, libapk,
+#      libssl3, libcrypto3, ssl_client and zlib. (The base has a shell: the
+#      owner chose it. The process is not root, holds no capability and has
+#      a read-only root filesystem.)
 #   3. The binary asks for no interpreter and no shared library.
 #   4. With a read-only root filesystem, without capabilities and with
 #      `no-new-privileges`, the container finds a PostgreSQL container by
@@ -146,6 +149,14 @@ listing() {
         > "$work/$2.list"
 }
 
+# installed NAME: writes the names of the packages that the database of
+# installed packages in $work/NAME.tar lists to $work/NAME.packages, one on
+# each line. The file is empty when there is no such database.
+installed() {
+    { tar --extract --to-stdout --file "$work/$1.tar" lib/apk/db/installed 2>/dev/null || true; } \
+        | sed -n 's/^P://p' > "$work/$1.packages"
+}
+
 # The lines of a list are "MODE OWNER SIZE NAME". MODE is the ten characters
 # of `ls -l`: the type, then three for the owner, the group and everybody
 # else; the fourth, the seventh and the tenth hold x, s or S, x, s or S, and
@@ -197,6 +208,31 @@ no_package_cache() {
         | { grep -E '^(var/cache/apk|var/cache/apt|var/lib/apt/lists)/' || true; } | sed -n '1,5p')"
     if [[ -n "$found" ]]; then
         echo "the image keeps a package manager cache:"
+        echo "$found" | sed 's/^/    /'
+        return 1
+    fi
+}
+
+# no_package_manager NAME: the package manager and the libraries only it
+# used are gone, files and packages, and the database of installed packages
+# is kept, so that a scanner and an SBOM still see what the image holds.
+no_package_manager() {
+    local found
+    found="$(list_names <"$work/$1.list" \
+        | { grep -E '^((usr/)?s?bin/apk|(usr/)?lib/lib(apk|ssl|crypto|z)\.so[.0-9]*|usr/bin/ssl_client)$' || true; } \
+        | sed -n '1,5p')"
+    if [[ -n "$found" ]]; then
+        echo "the image holds the package manager or the libraries only it uses:"
+        echo "$found" | sed 's/^/    /'
+        return 1
+    fi
+    if ! grep -qE '^-[^ ]+ 0/0 [1-9][0-9]* lib/apk/db/installed$' "$work/$1.list" || ! [[ -s "$work/$1.packages" ]]; then
+        echo "the image has no database of installed packages: a scanner and an SBOM would not see what it holds"
+        return 1
+    fi
+    found="$({ grep -xE 'apk-tools|libapk|libssl3|libcrypto3|ssl_client|zlib' "$work/$1.packages" || true; } | sed -n '1,6p')"
+    if [[ -n "$found" ]]; then
+        echo "the database of installed packages lists packages that must be gone:"
         echo "$found" | sed 's/^/    /'
         return 1
     fi
@@ -290,8 +326,10 @@ must_reject "entry point and health check are pgsnare" starts_pgsnare "$referenc
 echo "image-test: the files of the image"
 listing "$image" image
 container="$listed"
+installed image
 listing "$reference" reference
 reference_container="$listed"
+installed reference
 grep -qE '^-[^ ]+ [^ ]+ [1-9][0-9]* usr/local/bin/pgsnare$' "$work/image.list" \
     || fail "the image does not hold /usr/local/bin/pgsnare"
 must_pass "pgsnare is a file of root that nobody can write" pgsnare_is_sealed image
@@ -303,6 +341,8 @@ must_pass "only root owns files, apart from the home directory" only_root_owns i
 must_pass "nothing but a sticky directory can be written by everybody" not_writable_by_all image
 must_pass "no package manager cache is left" no_package_cache image
 must_pass "the CA certificates are there" has_certificates image
+must_pass "the package manager is gone, and the database of installed packages is kept" no_package_manager image
+must_reject "the package manager is gone, and the database of installed packages is kept" no_package_manager reference
 
 # The checks that the PostgreSQL image does not fail by itself are shown to
 # fail on a list made up for the purpose.
@@ -314,7 +354,10 @@ cat >"$work/made-up.list" <<'LIST'
 drwxrwxrwx 0/0 0 var/anything/
 -rw-r--r-- 0/0 100 var/cache/apk/APKINDEX.tar.gz
 -rw-r--r-- 0/0 100 var/lib/apt/lists/index
+-rwxr-xr-x 0/0 100 sbin/apk
+-rw-r--r-- 0/0 100 lib/apk/db/installed
 LIST
+printf 'busybox\nca-certificates-bundle\n' >"$work/made-up.packages"
 must_reject "pgsnare is a file of root that nobody can write" pgsnare_is_sealed made-up
 must_reject "the licence notices and the licence of the repository are there" has_notices made-up
 must_reject "no file has the setuid or the setgid bit" no_setuid made-up
@@ -322,6 +365,17 @@ must_reject "only root owns files, apart from the home directory" only_root_owns
 must_reject "nothing but a sticky directory can be written by everybody" not_writable_by_all made-up
 must_reject "no package manager cache is left" no_package_cache made-up
 must_reject "the CA certificates are there" has_certificates made-up
+must_reject "the package manager is gone, and the database of installed packages is kept" no_package_manager made-up
+# The files are gone but the database still lists a package, and the other
+# way round.
+for library in libssl3 libcrypto3 ssl_client apk-tools; do
+    printf '%s\n' '-rw-r--r-- 0/0 100 lib/apk/db/installed' >"$work/listed-$library.list"
+    printf 'busybox\n%s\n' "$library" >"$work/listed-$library.packages"
+    must_reject "the package manager is gone ($library in the database)" no_package_manager "listed-$library"
+done
+printf '%s\n' '-rw-r--r-- 0/0 100 lib/apk/db/installed' '-rwxr-xr-x 0/0 100 usr/lib/libssl.so.3' >"$work/file-left.list"
+printf 'busybox\n' >"$work/file-left.packages"
+must_reject "the package manager is gone (a file of OpenSSL left)" no_package_manager file-left
 # A sticky directory and the home directory are allowed.
 cat >"$work/allowed.list" <<'LIST'
 drwxrwxrwt 0/0 0 tmp/

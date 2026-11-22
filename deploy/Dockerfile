@@ -109,10 +109,11 @@ COPY --from=build /out/pgsnare /pgsnare
 # --- The image ----------------------------------------------------------------
 #
 # The base holds CA certificates and the files that name users. It also holds
-# a shell (busybox) and the package manager (apk): that is the owner's choice
-# of this base. Nothing installs a package at run time: the process is not
-# root, holds no capability and has a read-only root filesystem when started
-# as the chart and the examples start it.
+# a shell (busybox): that is the owner's choice of this base. The package
+# manager of the base, and the libraries only it uses, are removed below.
+# Nothing installs a package at run time: the process is not root, holds no
+# capability and has a read-only root filesystem when started as the chart
+# and the examples start it.
 FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS image
 
 LABEL org.opencontainers.image.title="pgsnare" \
@@ -120,17 +121,27 @@ LABEL org.opencontainers.image.title="pgsnare" \
       org.opencontainers.image.source="https://github.com/guidorugo/pgsnare" \
       org.opencontainers.image.licenses="Apache-2.0"
 
-# The scan of the image fails on a critical finding in the zlib of the pinned
-# base (fixed in zlib 1.4-r0, which the base does not carry yet). pgsnare is
-# static and does not use this library, but the scan sees the package. Upgrade
-# that one package while the image is built, from the signed package index of
-# the distribution, and keep no cache. The version is named exactly, so the
-# same commit gives the same package on any day; when the distribution
-# replaces that version the build stops, and it is time to raise the base
-# digest above to one that carries a fixed zlib and to remove this step.
-# This is the only package touched, and nothing is installed or upgraded
-# when the image runs.
-RUN apk add --no-cache --upgrade 'zlib=1.4-r0'
+# pgsnare is static, with its own TLS library, and needs from the base only
+# the CA certificates and the files that name users. Remove the package
+# manager (apk-tools, with its library libapk) and the libraries that only
+# it uses: OpenSSL (libssl3, libcrypto3, and ssl_client, the TLS helper of
+# busybox, which comes with libssl3) and zlib. They carry most of the
+# advisories that the scan of the image finds in the base, and nothing in
+# the image needs them once the image is built.
+#
+# The CA certificates came in as a dependency of apk-tools, so they are
+# first named on their own, with the version the base holds, from the
+# installed package: otherwise removing apk-tools would remove them too.
+# When the base digest above is raised to one with other certificates, the
+# build stops here, and the version is raised with it. The database of
+# installed packages (/lib/apk/db) is kept, so a scanner and an SBOM still
+# see what the image holds. No cache is kept.
+RUN set -eu; \
+    apk add --no-cache 'ca-certificates-bundle=20261020-r0'; \
+    apk del --no-cache apk-tools libapk libssl3 libcrypto3 ssl_client zlib; \
+    test ! -e /sbin/apk; \
+    test -s /etc/ssl/certs/ca-certificates.crt; \
+    test -s /lib/apk/db/installed
 
 # The user and the home directory that the image names. Added while the image
 # is built, and not at run time. No package is installed: the CA certificates

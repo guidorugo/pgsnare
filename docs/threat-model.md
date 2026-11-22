@@ -71,7 +71,7 @@ These are stated in the README and the design document and are repeated here, so
 - **Admin and metrics** speak plain HTTP and ask for no login. They are safe on loopback and nowhere else without a NetworkPolicy that names the readers.
 - **Replicas are independent.** Deduplication windows and the tarpit cap apply to each replica.
 - **A lost event.** A full queue loses events and counts them. A sink that is down costs events, never traffic.
-- **The image has a shell and a package manager** (the owner's choice of the Alpine base). The confinement of the process, not the absence of tools, is what protects it.
+- **The image has a shell** (the owner's choice of the Alpine base). Its package manager, and the libraries only it used, are removed when the image is built. The confinement of the process, not the absence of tools, is what protects it.
 - **The NetworkPolicy of the chart** protects only on a network plugin that enforces it; the chart cannot check that.
 
 **Not supported**

@@ -14,7 +14,7 @@ Releases are published on the [releases page](https://github.com/guidorugo/pgsna
 ## What the image holds
 
 - One static binary, `/usr/local/bin/pgsnare`, owned by root and not writable. It is built with the default features, so it contains the SQL rules and accepts a configuration with a `rules` section. The Helm chart cannot set rules yet (see its limits below).
-- An Alpine base, pinned by digest, with the CA certificates and the files that name users. **The base has a shell (busybox) and a package manager.** That is the owner's choice of base. Nothing installs a package at run time: the process is not root, has no capability and has a read-only root filesystem when started as below.
+- An Alpine base, pinned by digest, with the CA certificates and the files that name users. **The image has a shell (busybox), and no package manager.** The shell is the owner's choice of base. The package manager of the base (apk), and the libraries only it used (OpenSSL and zlib), are removed when the image is built; pgsnare is static, with its own TLS library, and needs none of them. The database of installed packages is kept, so a scanner or an SBOM tool still sees what the image holds. The process is not root, has no capability and has a read-only root filesystem when started as below.
 - User and group `65532`, named by number so that Kubernetes can check it is not root.
 - The entry point `pgsnare`, and the default command `run --config /etc/pgsnare/pgsnare.yaml`.
 - A health check, `pgsnare healthcheck`. It asks the admin listener on `127.0.0.1:9641`, reads no file, and takes two seconds at most. If your configuration moves the admin listener, the image's check no longer finds it.
