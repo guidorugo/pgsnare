@@ -17,7 +17,7 @@ pgsnare sees only what passes through it.
 
 - Run as a non-root user, with every capability dropped, a read-only root filesystem and `no-new-privileges`. The image's user is `65532`, and the chart and the examples start it this way.
 - Name the image by digest, never by tag. Verify a release before you run it ([Verifying a release](verifying-a-release.md)).
-- The image's base has a shell and a package manager. That was the owner's choice of base. What keeps them harmless is the confinement above: the process cannot write to its filesystem, cannot gain privileges and is not root. Do not weaken it, for example by mounting a writable volume over a binary directory or running the container as root.
+- The image has a shell (busybox). That was the owner's choice of base. The package manager of the base and the libraries only it used (OpenSSL and zlib) are removed when the image is built, so nothing in the image can install a package. What keeps the shell harmless is the confinement above: the process cannot write to its filesystem, cannot gain privileges and is not root. Do not weaken it, for example by mounting a writable volume over a binary directory or running the container as root.
 - Give the pod or container requests and limits. pgsnare starts as many worker threads as the CPU limit allows.
 - In Kubernetes, mount no service-account token. The chart does not.
 
