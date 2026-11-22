@@ -120,17 +120,20 @@ LABEL org.opencontainers.image.title="pgsnare" \
       org.opencontainers.image.source="https://github.com/guidorugo/pgsnare" \
       org.opencontainers.image.licenses="Apache-2.0"
 
-# The scan of the image fails on a critical finding in the zlib of the pinned
-# base (fixed in zlib 1.4-r0, which the base does not carry yet). pgsnare is
-# static and does not use this library, but the scan sees the package. Upgrade
-# that one package while the image is built, from the signed package index of
-# the distribution, and keep no cache. The version is named exactly, so the
-# same commit gives the same package on any day; when the distribution
-# replaces that version the build stops, and it is time to raise the base
-# digest above to one that carries a fixed zlib and to remove this step.
-# This is the only package touched, and nothing is installed or upgraded
-# when the image runs.
-RUN apk add --no-cache --upgrade 'zlib=1.4-r0'
+# The scan of the image fails on findings in packages of the pinned base that
+# the distribution has fixed since: a critical one in zlib (fixed in zlib
+# 1.4-r0) and high ones in OpenSSL (fixed in libcrypto3 and libssl3
+# 3.5.9-r1). The base above is the newest Alpine 3.24 release, and it does
+# not carry them yet. pgsnare is static, with its own TLS library, and uses
+# none of these libraries, but the scan sees the packages. Upgrade those
+# packages while the image is built, from the signed package index of the
+# distribution, and keep no cache. The versions are named exactly, so the
+# same commit gives the same packages on any day; when the distribution
+# replaces one of them the build stops, and it is time to raise the base
+# digest above to one that carries the fixed versions and to remove this
+# step. These are the only packages touched, and nothing is installed or
+# upgraded when the image runs.
+RUN apk add --no-cache --upgrade 'zlib=1.4-r0' 'libcrypto3=3.5.9-r1' 'libssl3=3.5.9-r1'
 
 # The user and the home directory that the image names. Added while the image
 # is built, and not at run time. No package is installed: the CA certificates
