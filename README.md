@@ -196,7 +196,6 @@ Because pgsnare relays logins instead of terminating them, the TLS setup has to 
 
 - **Look for alternatives to detect a honeytoken used as a password.** Login messages are not scanned today (see [What it will not catch](#what-it-will-not-catch)).
 - SQL rules in the Helm chart, which cannot set them yet.
-- The first release, and with it the checks that cannot run before: keyless signing, provenance and publishing to the registry.
 - TLS on both legs in the cluster tests, other Kubernetes versions and other network plugins.
 
 ## Security
@@ -232,7 +231,7 @@ The steps to the first release:
 | 2. Detect and alert | Honeytokens, events and sinks. The first usable version | Built: detection, events, sinks, health and metrics. `tarpit` and `fake_data` now run against PostgreSQL 15 to 18, reload against PostgreSQL 15 |
 | 3. Respond | Kill, tarpit, fake data and exemptions | Built: the responses run against PostgreSQL 15 to 18 |
 | 4. SQL rules | Optional checks on the statements themselves | Built, behind the `rules` build feature. The `functions` rule with `kill` and the `catalog_enumeration` rule run against PostgreSQL 15 to 18 |
-| 5. Prove and ship | Detection corpus, fuzzing, benchmarks, container image, Helm chart and documentation | Image, chart, examples, release procedure and guides built; released since 0.0.1. The detection corpus runs in the integration tests; the nightly long fuzzing and the nightly benchmark have not run. Not built: a 24-hour soak, a memory test with 10,000 idle connections, the regression suite of PostgreSQL through the proxy, a matrix of client libraries, and a benchmark on a reference machine (the figures a nightly benchmark would give come from shared runners) |
+| 5. Prove and ship | Detection corpus, fuzzing, benchmarks, container image, Helm chart and documentation | Image, chart, examples, release procedure and guides built; released since 0.0.1. The detection corpus runs in the integration tests; the nightly long fuzzing and the nightly benchmark run every night. Not built: a 24-hour soak, a memory test with 10,000 idle connections, the regression suite of PostgreSQL through the proxy, a matrix of client libraries, and a benchmark on a reference machine (the figures a nightly benchmark would give come from shared runners) |
 
 Progress is tracked in [the pgsnare epic](https://github.com/guidorugo/pgsnare/issues/2).
 
